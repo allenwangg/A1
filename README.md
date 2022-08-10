@@ -32,4 +32,4 @@ PCA, Isolation Forest
 Collaborative Filtering
 
 12. Netflix - Movie Recommendation
-Collaborative Filtering
+Pearson Correlation, Collaborative Filtering
