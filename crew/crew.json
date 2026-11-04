@@ -1,0 +1,45 @@
+{
+  "planner": {
+    "provider": "claude",
+    "max_tasks": 8
+  },
+  "split": {
+    "mode": "by_role",
+    "metric": "tasks",
+    "target_share": { "claude": 0.5, "codex": 0.5 },
+    "tolerance": 0.15,
+    "window_hours": 168,
+    "fallback_on_error": true,
+    "cooldown_minutes": 60
+  },
+  "providers": {
+    "claude": {
+      "enabled": true,
+      "cmd": "claude",
+      "model": null,
+      "args": ["--permission-mode", "acceptEdits"],
+      "timeout_sec": 1800
+    },
+    "codex": {
+      "enabled": true,
+      "cmd": "codex",
+      "model": null,
+      "args": ["--sandbox", "workspace-write"],
+      "timeout_sec": 1800
+    }
+  },
+  "agents": {
+    "Astra": {
+      "role": "Architect. Designs the approach, makes multi-file or cross-cutting changes, untangles hard bugs.",
+      "prefers": "claude"
+    },
+    "Sol": {
+      "role": "Builder. Implements well-scoped features, scripts, and data pipelines from clear instructions.",
+      "prefers": "codex"
+    },
+    "Luna": {
+      "role": "Verifier. Writes and runs tests, reviews the other agents' changes, fixes small issues, updates docs.",
+      "prefers": "any"
+    }
+  }
+}

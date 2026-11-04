@@ -1,0 +1,4 @@
+crew-plan*.json
+*.json.tmp
+__pycache__/
+.crew/
