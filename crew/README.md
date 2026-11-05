@@ -24,7 +24,7 @@ Roles and preferences are in `crew.json`; edit them freely.
    - **Plan login (no API key):** `claude auth login` and `codex login` (for a ChatGPT plan; add `--device-auth` on a headless machine).
    - **API keys:** set `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` as environment variables, then run `python crew.py codex-login` once. That pipes `OPENAI_API_KEY` into `codex login --with-api-key` without printing it. `CODEX_API_KEY` also works for Codex without the login step.
 
-   Don't commit keys or paste them into chat. In a Claude Code cloud environment, add them as environment variables in the environment settings (environment menu in the session title bar → Edit). New sessions pick them up. Each CLI gets only its own provider's key: OpenAI keys are removed from Claude's environment, and the Anthropic key from Codex's.
+   Don't commit keys or paste them into chat. In a Claude Code cloud environment, add them as environment variables in the environment settings (environment menu in the session title bar → Edit). New sessions pick them up. Each CLI gets only its own provider's credentials: OpenAI/Codex keys are removed from Claude's environment, and Anthropic keys and tokens from Codex's.
 3. Check everything:
    ```
    python crew.py doctor
@@ -41,10 +41,13 @@ python crew.py go "goal"                       # plan + run in one step
 python crew.py usage                           # split over the window, plus cooldowns
 ```
 
-- Planning is read-only: Claude runs in plan mode with its edit tools disabled, and Codex runs with `--sandbox read-only`.
+- Planning is read-only: Claude runs in plan mode with only its Read, Grep and Glob tools, and Codex runs with `--sandbox read-only`.
 - Tasks run one at a time, in dependency order, in `--workdir`. Each agent gets its task, its role, and the summaries of the tasks it depends on.
-- The plan file is updated after every task (`status`, `provider`, `result`), so re-running it picks up where it stopped. Re-running skips tasks that are `done` or `failed`; pass `--retry-failed` to try failed ones again. A task whose prerequisite didn't finish is marked `skipped`.
+- Each agent ends by reporting `done`, `partial` or `blocked` with a summary. Only `done` counts as finished. A task whose prerequisite isn't `done` is marked `skipped`, and a CLI error is marked `failed`.
+- The plan file is updated after every task (`status`, `provider`, `result`), so re-running it picks up where it stopped. A plain re-run leaves `failed`, `partial` and `blocked` tasks alone; `--retry-failed` runs them, and the tasks skipped because of them, again.
+- If every available provider hits its usage limit, the run stops and leaves the current task `pending`. Re-run the plan later to continue. Ctrl-C, SIGTERM and a closed terminal also stop the running agent and leave its task `pending`.
 - If Claude was refused permission for something (for example a shell command), the task records it under `denied` and the run prints a note.
+- If crew itself sits inside the workdir (as in the example above), the run stops when an agent changes `crew.py` or the config. To rule that out entirely, keep crew outside the repo you point it at.
 - Read the plan before you `run` it. Its instructions go straight to agents that can edit files. `go` skips that review step, so use it only for goals and repos you trust.
 - Agents are told not to commit or push unless the task says to. Review the diff yourself.
 

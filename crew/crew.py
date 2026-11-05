@@ -16,6 +16,7 @@ pipes OPENAI_API_KEY into Codex on stdin.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -39,28 +40,47 @@ LIMIT_RE = re.compile(
     re.I,
 )
 # Env vars that count as a login even when the CLI's own status check says no.
-ENV_LOGIN = {"claude": ("ANTHROPIC_API_KEY",), "codex": ("CODEX_API_KEY",)}
+ENV_LOGIN = {"claude": ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"), "codex": ("CODEX_API_KEY",)}
 # Each CLI only gets its own provider's keys.
-FOREIGN_KEYS = {"claude": ("OPENAI_API_KEY", "CODEX_API_KEY"), "codex": ("ANTHROPIC_API_KEY",)}
+FOREIGN_KEYS = {
+    "claude": ("OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN"),
+    "codex": ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"),
+}
 REQUIRED_TASK_FIELDS = ("id", "title", "agent", "instructions", "acceptance")
+# Task states a plain re-run leaves alone; --retry-failed resets them to pending.
+UNFINISHED = ("failed", "partial", "blocked")
+WORKER_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["status", "summary"],
+    "properties": {
+        "status": {"type": "string", "enum": ["done", "partial", "blocked"]},
+        "summary": {"type": "string"},
+    },
+}
 RESULT_KEEP = 4000  # chars of each agent's final message kept in the plan file
 
 
 # --------------------------------------------------------------------------- config
 
 def load_config(path: Path) -> dict:
-    cfg = json.loads(Path(path).read_text())
+    cfg = _read_json(Path(path))
+    if not isinstance(cfg, dict):
+        raise ValueError(f"config {path}: not a JSON object")
+    cfg["_path"] = str(Path(path).resolve())
     agents = cfg.get("agents") or {}
-    if not agents:
-        sys.exit("config: no agents defined")
+    if not isinstance(agents, dict) or not agents:
+        raise ValueError("config: no agents defined")
     for name, a in agents.items():
+        if not isinstance(a, dict) or not isinstance(a.get("role"), str) or not a["role"].strip():
+            raise ValueError(f"config: agent {name}: needs a role")
         if a.get("prefers", "any") not in (*PROVIDERS, "any"):
-            sys.exit(f"config: agent {name}: prefers must be claude, codex or any")
+            raise ValueError(f"config: agent {name}: prefers must be claude, codex or any")
     split = cfg.setdefault("split", {})
     if split.get("mode", "by_role") not in ("by_role", "balanced", "fixed"):
-        sys.exit("config: split.mode must be by_role, balanced or fixed")
+        raise ValueError("config: split.mode must be by_role, balanced or fixed")
     if split.get("metric", "tasks") not in ("tasks", "tokens", "seconds"):
-        sys.exit("config: split.metric must be tasks, tokens or seconds")
+        raise ValueError("config: split.metric must be tasks, tokens or seconds")
     for p in PROVIDERS:
         pc = cfg.setdefault("providers", {}).setdefault(p, {})
         cmd = os.path.expanduser(pc.get("cmd") or p)
@@ -68,6 +88,13 @@ def load_config(path: Path) -> dict:
         # Absolute path, because the CLI is launched with cwd set to the workdir.
         pc["cmd"] = os.path.abspath(found) if found else cmd
     return cfg
+
+
+def _read_json(path: Path):
+    try:
+        return json.loads(path.read_text())
+    except json.JSONDecodeError as e:
+        raise ValueError(f"{path}: invalid JSON ({e})") from None
 
 
 def provider_cfg(cfg: dict, p: str) -> dict:
@@ -266,27 +293,57 @@ def is_git_repo(path: Path) -> bool:
     return r.returncode == 0 and r.stdout.strip() == "true"
 
 
+def _descendants(pid: int) -> list[int]:
+    """Every process below pid, from one `ps` snapshot. Catches tool processes
+    the CLI started in their own session (e.g. Claude's bwrap sandbox)."""
+    try:
+        out = subprocess.run(["ps", "-A", "-o", "pid=", "-o", "ppid="], capture_output=True,
+                             text=True, timeout=10).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    children: dict[int, list[int]] = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+            children.setdefault(int(parts[1]), []).append(int(parts[0]))
+    found, stack = [], [pid]
+    while stack:
+        for c in children.get(stack.pop(), []):
+            if c not in found:
+                found.append(c)
+                stack.append(c)
+    return found
+
+
 def _kill_group(proc: subprocess.Popen) -> None:
-    """Stop the CLI and the tool processes it started. SIGTERM first so the CLI
-    can clean up its own children, then SIGKILL whatever is left."""
-    if not hasattr(os, "killpg"):
-        proc.kill()
+    """Stop the CLI and every process it started: SIGTERM, a grace period so the
+    CLI can clean up, then SIGKILL for whatever is left."""
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True)
+        try:
+            proc.kill()
+        except OSError:
+            pass
         return
-    for sig, wait in ((signal.SIGTERM, 10), (signal.SIGKILL, 5)):
-        try:
-            os.killpg(proc.pid, sig)
-        except (ProcessLookupError, PermissionError):
-            return
-        try:
-            proc.wait(timeout=wait)
-        except subprocess.TimeoutExpired:
-            continue
-        if sig == signal.SIGTERM:
+    try:
+        old_int = signal.signal(signal.SIGINT, signal.SIG_IGN)  # don't abort the cleanup
+    except ValueError:  # not the main thread
+        old_int = None
+    try:
+        tree = _descendants(proc.pid)
+        for sig, wait in ((signal.SIGTERM, 10), (signal.SIGKILL, 5)):
+            for kill in [lambda: os.killpg(proc.pid, sig)] + [lambda p=p: os.kill(p, sig) for p in tree]:
+                try:
+                    kill()
+                except OSError:
+                    pass
             try:
-                os.killpg(proc.pid, signal.SIGKILL)  # stragglers in the group
-            except (ProcessLookupError, PermissionError):
+                proc.wait(timeout=wait)
+            except subprocess.TimeoutExpired:
                 pass
-        return
+    finally:
+        if old_int is not None:
+            signal.signal(signal.SIGINT, old_int)
 
 
 def _exec(cmd: list[str], prompt: str, cwd: Path, timeout: float, env: dict) -> tuple[int, str, str, float]:
@@ -304,7 +361,15 @@ def _exec(cmd: list[str], prompt: str, cwd: Path, timeout: float, env: dict) -> 
         rc = proc.returncode
     except subprocess.TimeoutExpired:
         _kill_group(proc)
-        out, err = proc.communicate()
+        try:
+            out, err = proc.communicate(timeout=15)
+        except subprocess.TimeoutExpired:  # a surviving grandchild still holds the pipes
+            for f in (proc.stdout, proc.stderr):
+                try:
+                    f.close()
+                except OSError:
+                    pass
+            out, err = b"", b""
         rc, err = 124, (err or b"") + f"\ntimed out after {timeout:.0f}s".encode()
     except BaseException:
         _kill_group(proc)  # Ctrl-C does not reach a child in its own session
@@ -339,7 +404,7 @@ def _parse_structured(res: Result) -> None:
         try:
             res.structured = json.loads(res.text)
         except json.JSONDecodeError:
-            res.ok, res.error = False, "planner did not return JSON"
+            pass  # callers decide what a missing JSON answer means
 
 
 def run_claude(cfg: dict, prompt: str, workdir: Path, *, schema: dict | None = None,
@@ -353,7 +418,8 @@ def run_claude(cfg: dict, prompt: str, workdir: Path, *, schema: dict | None = N
     if schema is not None:
         cmd += ["--json-schema", json.dumps(schema)]
     if read_only:
-        cmd += ["--permission-mode", "plan", "--disallowedTools", "Edit,Write,NotebookEdit"]
+        # Read-only tools only: plan mode alone still runs Bash that a user allow rule permits.
+        cmd += ["--permission-mode", "plan", "--tools", "Read,Grep,Glob"]
     else:
         cmd += list(pc.get("args") or [])
     rc, out, err, secs = _exec(cmd, prompt, workdir, pc.get("timeout_sec", 1800), provider_env("claude"))
@@ -428,9 +494,10 @@ def run_codex(cfg: dict, prompt: str, workdir: Path, *, schema: dict | None = No
     ok = rc == 0 and completed and not failures
     res = Result("codex", ok, text=text, tokens=tokens, seconds=secs)
     if not ok:
-        msg = "\n".join(map(str, failures)) or (notices[-1] if notices else "") or err.strip()
-        res.error = (msg or short(out, 500) or f"exit {rc}")[-2000:]
-        res.limited = bool(msg and LIMIT_RE.search(msg))
+        fatal = [n for n in notices if not str(n).startswith("Reconnecting")]
+        msg = "\n".join(map(str, failures)) or (str(fatal[-1]) if fatal else "")
+        res.error = (msg or err.strip() or short(out, 500) or f"exit {rc}")[-2000:]
+        res.limited = bool(msg and LIMIT_RE.search(msg))  # retry notices never count
     if schema is not None:
         _parse_structured(res)
     return res
@@ -609,7 +676,7 @@ def worker_prompt(cfg: dict, plan: dict, task: dict, done: dict[str, dict]) -> s
     agent = task["agent"]
     names = ", ".join(cfg["agents"])
     ctx = "\n".join(
-        f"- {d} ({done[d]['agent']}, {done[d]['title']}): {short(done[d].get('result', ''), 600)}"
+        f"- {d} ({done[d]['agent']}, {done[d]['title']}): {short(str(done[d].get('result') or ''), 600)}"
         for d in task["depends_on"] if d in done
     ) or "- none"
     return f"""You are {agent}, one of the agents on a crew ({names}).
@@ -629,13 +696,18 @@ Results of the tasks this one depends on:
 {ctx}
 
 Work directly in the repository at {plan['workdir']}. Do not commit or push
-unless the instructions say to. Finish with a short summary of what you changed,
-how you checked it, and anything left undone."""
+unless the instructions say to.
+
+When you stop, report status "done" only if the "Done when" criteria are met
+and you checked them; "partial" if some of it is left; "blocked" if you could
+not proceed. In summary, say what you changed, how you checked it, and what is
+left undone or blocking you."""
 
 
 def run_plan(cfg: dict, plan_path: Path, *, dry_run: bool = False, retry_failed: bool = False) -> int:
-    plan = json.loads(plan_path.read_text())
-    if not isinstance(plan, dict) or not plan.get("goal") or not plan.get("workdir"):
+    plan = _read_json(plan_path)
+    if not isinstance(plan, dict) or not isinstance(plan.get("goal"), str) \
+            or not isinstance(plan.get("workdir"), str) or not plan["workdir"]:
         raise ValueError(f"{plan_path}: not a crew plan (needs goal, workdir, tasks)")
     order = validate_plan(cfg, plan)
     workdir = Path(plan["workdir"])
@@ -643,20 +715,23 @@ def run_plan(cfg: dict, plan_path: Path, *, dry_run: bool = False, retry_failed:
     by_id = {t["id"]: t for t in plan["tasks"]}
     if retry_failed:
         for t in plan["tasks"]:
-            if t.get("status") in ("failed", "skipped"):
+            if t.get("status") in (*UNFINISHED, "skipped"):
                 t["status"] = "pending"
     totals, runs = usage_totals(cfg)
     estimate = per_call_estimate(cfg) if dry_run else {}
     wont_run: set[str] = set()  # dry run: tasks a real run would not complete
     failed = 0
     log(f"workdir: {workdir}")
+    guarded = own_files_in(cfg, workdir)
+    if guarded:
+        log("note: crew's own files are inside the workdir; the run stops if an agent changes them")
 
     for task in order:
         tid, status = task["id"], task.get("status", "pending")
         if status == "done":
             continue
-        if status == "failed":
-            log(f"[{tid}] {task['agent']}: failed earlier; use --retry-failed to run it again")
+        if status in UNFINISHED:
+            log(f"[{tid}] {task['agent']}: {status} earlier; use --retry-failed to run it again")
             wont_run.add(tid)
             failed += 1
             continue
@@ -687,21 +762,40 @@ def run_plan(cfg: dict, plan_path: Path, *, dry_run: bool = False, retry_failed:
 
         done = {t["id"]: t for t in plan["tasks"] if t.get("status") == "done"}
         res = call_with_fallback(cfg, provider, worker_prompt(cfg, plan, task, done), workdir,
-                                 agent=task["agent"], task_id=tid)
+                                 agent=task["agent"], task_id=tid, schema=WORKER_SCHEMA)
+        totals, runs = usage_totals(cfg)  # ledger includes failed first attempts
+        if not res.ok and res.limited:
+            # Out of usage everywhere we could try: leave the task pending so a re-run resumes.
+            log(f"  stopped: {res.provider} hit a usage limit; re-run this plan later to continue")
+            failed += 1
+            break
         task["provider"] = res.provider
-        task["status"] = "done" if res.ok else "failed"
-        task["result"] = (res.text if res.ok else res.error)[-RESULT_KEEP:]
+        if res.ok:
+            verdict = res.structured if isinstance(res.structured, dict) else {}
+            outcome = verdict.get("status")
+            if outcome not in ("done", "partial", "blocked"):
+                outcome = "partial"  # no usable verdict: don't claim it finished
+            task["status"] = outcome
+            task["result"] = str(verdict.get("summary") or res.text)[-RESULT_KEEP:]
+        else:
+            task["status"] = "failed"
+            task["result"] = res.error[-RESULT_KEEP:]
+        task.pop("denied", None)
         if res.denied:
             task["denied"] = res.denied
         save_plan(plan_path, plan)
-        totals, runs = usage_totals(cfg)  # ledger includes failed first attempts
-        if res.ok:
+        if task["status"] == "done":
             log(f"  done on {res.provider} in {res.seconds:.0f}s")
         else:
             failed += 1
-            log(f"  failed on {res.provider}: {short(res.error)}")
+            log(f"  {task['status']} on {res.provider}: {short(task['result'])}")
         if res.denied:
             log(f"  note: {res.provider} was refused permission for: {', '.join(res.denied[:5])}")
+        changed = [str(f) for f, h in guarded.items() if _sha(f) != h]
+        if changed:
+            log(f"error: task {tid} changed crew's own files: {', '.join(changed)}. "
+                "Stopping; review that change before running again.")
+            return 2
 
     if dry_run:
         log("dry run: nothing was executed")
@@ -709,6 +803,26 @@ def run_plan(cfg: dict, plan_path: Path, *, dry_run: bool = False, retry_failed:
         log(f"plan saved to {plan_path}")
     print_split(cfg)
     return 1 if failed else 0
+
+
+def _sha(path: Path) -> str:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return ""
+
+
+def own_files_in(cfg: dict, workdir: Path) -> dict[Path, str]:
+    """crew.py and the config file, if they sit inside the workdir, with their hashes."""
+    root = workdir.resolve()
+    out = {}
+    for f in {Path(__file__).resolve(), Path(cfg.get("_path", DEFAULT_CONFIG)).resolve()}:
+        try:
+            f.relative_to(root)
+        except ValueError:
+            continue
+        out[f] = _sha(f)
+    return out
 
 
 def save_plan(path: Path, plan: dict) -> None:
@@ -827,9 +941,13 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--retry-failed", action="store_true", help="also re-run failed and skipped tasks")
 
     args = ap.parse_args(argv)
-    cfg = load_config(args.config)
+    # SIGTERM/SIGHUP become SystemExit, so a running agent CLI is stopped with crew.
+    for name in ("SIGTERM", "SIGHUP"):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), lambda n, f: sys.exit(128 + n))
 
     try:
+        cfg = load_config(args.config)
         if args.cmd == "doctor":
             return doctor(cfg)
         if args.cmd == "codex-login":
@@ -855,9 +973,12 @@ def main(argv: list[str] | None = None) -> int:
             return run_plan(cfg, args.out, dry_run=args.dry_run)
         if args.cmd == "run":
             return run_plan(cfg, args.plan, dry_run=args.dry_run, retry_failed=args.retry_failed)
-    except (ValueError, FileNotFoundError) as e:
+    except (ValueError, OSError) as e:
         log(f"error: {e}")
         return 2
+    except KeyboardInterrupt:
+        log("\ninterrupted; the running task stays pending, so re-running the plan resumes it")
+        return 130
     return 2
 
 
