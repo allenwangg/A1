@@ -973,6 +973,9 @@ def main(argv: list[str] | None = None) -> int:
             return run_plan(cfg, args.out, dry_run=args.dry_run)
         if args.cmd == "run":
             return run_plan(cfg, args.plan, dry_run=args.dry_run, retry_failed=args.retry_failed)
+    except BrokenPipeError:  # output piped into e.g. `head`
+        sys.stderr.close()
+        return 0
     except (ValueError, OSError) as e:
         log(f"error: {e}")
         return 2
