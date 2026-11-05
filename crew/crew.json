@@ -8,6 +8,7 @@
     "metric": "tasks",
     "target_share": { "claude": 0.5, "codex": 0.5 },
     "tolerance": 0.15,
+    "min_runs": 6,
     "window_hours": 168,
     "fallback_on_error": true,
     "cooldown_minutes": 60
@@ -17,7 +18,10 @@
       "enabled": true,
       "cmd": "claude",
       "model": null,
-      "args": ["--permission-mode", "acceptEdits"],
+      "args": [
+        "--permission-mode", "acceptEdits",
+        "--settings", "{\"sandbox\": {\"enabled\": true, \"autoAllowBashIfSandboxed\": true}}"
+      ],
       "timeout_sec": 1800
     },
     "codex": {
