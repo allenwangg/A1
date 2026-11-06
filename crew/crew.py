@@ -131,7 +131,8 @@ MANIFEST_NAMES = {"package.json", "package-lock.json", "npm-shrinkwrap.json", "p
 # New files an agent's tool runs leave behind that never belong in a commit.
 GENERATED_PARTS = {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".ipynb_checkpoints",
                    "node_modules", ".claude", ".codex"}
-SECRET_ENV = re.compile(r"TOKEN|SECRET|PASSW|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|CREDENTIAL", re.I)
+SECRET_ENV = re.compile(r"TOKEN|SECRET|PASSW|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|CREDENTIAL|AUTH|_KEY$|_PAT$|DSN|WEBHOOK",
+                        re.I)
 SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "env", "dist", "build", "__pycache__", ".next",
              "target", ".svelte-kit", ".turbo", "coverage"}
 
@@ -525,6 +526,9 @@ def load_profile(key: str) -> dict | None:
             isinstance(s, dict) and isinstance(s.get("run"), str)
             and isinstance(s.get("unless_exists", ""), str) for s in proj.get("setup", [])):
         raise ValueError(f"{p}: project.setup must be a list of {{\"run\": ..., \"unless_exists\": ...}} steps")
+    for k in ("name", "root"):
+        if k in proj and not (isinstance(proj[k], str) and proj[k]):
+            raise ValueError(f"{p}: project.{k} must be a non-empty string")
     for k in ("stack", "notes", "agent_docs"):
         if not isinstance(proj.get(k, []), list) or not all(isinstance(x, str) for x in proj.get(k, [])):
             raise ValueError(f"{p}: project.{k} must be a list of strings")
@@ -713,8 +717,12 @@ def detect_project(root: Path, name: str) -> dict:
             py = "python3"
         if uses_pytest:
             checks["test"] = f"{py} -m pytest -q"
-        elif test_files or test_dir:
-            checks["test"] = f"{py} -m unittest discover -q" + (f" -s {test_dir}" if test_dir else "")
+        elif test_dir:
+            checks["test"] = f"{py} -m unittest discover -q -s {test_dir}"
+        elif test_files:
+            dirs = sorted({str(f.parent.relative_to(root)) for f in test_files})[:5]
+            checks["test"] = " && ".join(f"{py} -m unittest discover -q" if d == "." else
+                                         f"{py} -m unittest discover -q -s {d} -t {d}" for d in dirs)
         if "[tool.ruff" in meta or has("ruff.toml", ".ruff.toml"):
             checks.setdefault("lint", f"{py} -m ruff check .")
         checks["python-syntax"] = (f"{py} -m compileall -q -x "
@@ -767,12 +775,22 @@ def _path_key(root: Path) -> str:
 def _migrate_key(root: Path, key: str) -> None:
     """A remote was added after `crew init`: move the path-keyed profile and plans to the new key."""
     old = _path_key(root)
-    if old == key or not profile_path(old).exists() or profile_path(key).exists():
+    if old == key or not (profile_path(old).exists() or plans_dir(old).is_dir()):
         return
     with file_lock("profiles"):
-        profile_path(old).replace(profile_path(key))
-        if plans_dir(old).is_dir() and not plans_dir(key).exists():
-            plans_dir(old).replace(plans_dir(key))
+        if profile_path(old).exists():
+            if profile_path(key).exists():  # another checkout already has one: keep both
+                profile_path(old).replace(profile_path(old).with_suffix(".json.moved"))
+            else:
+                profile_path(old).replace(profile_path(key))
+        if plans_dir(old).is_dir():
+            plans_dir(key).mkdir(parents=True, exist_ok=True)
+            for f in plans_dir(old).glob("*.json"):
+                dest = plans_dir(key) / f.name
+                if not dest.exists():
+                    f.replace(dest)
+            with contextlib.suppress(OSError):
+                plans_dir(old).rmdir()
     log(f"note: moved crew's profile and plans for {root} to its new name ({key})")
 
 
@@ -1321,8 +1339,26 @@ def _parse_structured(res: Result) -> None:
             res.structured = json.loads(res.text)
 
 
+def _with_deny_write(args: list[str], paths: list[str]) -> list[str]:
+    """Add paths to the sandbox's denyWrite in the --settings JSON crew passes to Claude."""
+    out = list(args)
+    for i in range(len(out) - 1):
+        if out[i] == "--settings":
+            try:
+                data = json.loads(out[i + 1])
+            except ValueError:
+                return out
+            if isinstance(data, dict) and isinstance(data.get("sandbox"), dict):
+                fs = data["sandbox"].setdefault("filesystem", {})
+                if isinstance(fs, dict):
+                    fs["denyWrite"] = list(dict.fromkeys([*(fs.get("denyWrite") or []), *paths]))
+                    out[i + 1] = json.dumps(data)
+            return out
+    return out
+
+
 def run_claude(cfg: dict, prompt: str, workdir: Path, *, schema: dict | None = None,
-               read_only: bool = False, model: str | None = None) -> Result:
+               read_only: bool = False, model: str | None = None, deny_write: list[str] | None = None) -> Result:
     pc = provider_cfg(cfg, "claude")
     # User-level settings only: project settings in the workdir (hooks, defaultMode, allow
     # rules) could be written by the other agent and would run unsandboxed.
@@ -1335,7 +1371,9 @@ def run_claude(cfg: dict, prompt: str, workdir: Path, *, schema: dict | None = N
         # Read-only tools only: plan mode alone still runs Bash that a user allow rule permits.
         cmd += ["--permission-mode", "plan", "--tools", "Read,Grep,Glob"]
     else:
-        cmd += list(pc.get("args") or [])
+        # Claude's sandbox would otherwise let it write a repo's git directory; crew's copy's .git
+        # and the user's own checkout are made read-only for the agent.
+        cmd += _with_deny_write(list(pc.get("args") or []), deny_write or [])
         if pc.get("sandboxed_bash", True) and claude_sandbox_ready():
             # Every shell command then runs in the sandbox without a prompt (the settings above
             # turn off its escape hatch). Never granted when the sandbox can't start.
@@ -1365,7 +1403,8 @@ def run_claude(cfg: dict, prompt: str, workdir: Path, *, schema: dict | None = N
 
 
 def run_codex(cfg: dict, prompt: str, workdir: Path, *, schema: dict | None = None,
-              read_only: bool = False, model: str | None = None) -> Result:
+              read_only: bool = False, model: str | None = None, deny_write: list[str] | None = None) -> Result:
+    # Codex's workspace-write sandbox already keeps .git and everything outside the workdir read-only.
     pc = provider_cfg(cfg, "codex")
     with tempfile.TemporaryDirectory(prefix="crew-codex-") as tmp:
         last = Path(tmp) / "last.txt"
@@ -1424,12 +1463,13 @@ RUNNERS = {"claude": run_claude, "codex": run_codex}
 
 
 def call(cfg: dict, provider: str, prompt: str, workdir: Path, *, agent: str, task_id: str,
-         project: str = "", schema: dict | None = None, read_only: bool = False) -> Result:
+         project: str = "", schema: dict | None = None, read_only: bool = False,
+         deny_write: list[str] | None = None) -> Result:
     with provider_slot(provider):
         t0 = time.time()
         try:
             res = RUNNERS[provider](cfg, prompt, workdir, schema=schema, read_only=read_only,
-                                    model=model_for(cfg, provider, agent))
+                                    model=model_for(cfg, provider, agent), deny_write=deny_write)
         except KeyboardInterrupt:  # stopped mid-call: still count the usage it burned
             record_usage({"ts": time.time(), "provider": provider, "agent": agent, "task": task_id,
                           "project": project, "ok": False, "limited": False, "interrupted": True,
@@ -1489,7 +1529,7 @@ def roster(cfg: dict) -> str:
 
 def planner_prompt(cfg: dict, project: dict, goal: str, workdir: Path) -> str:
     n = cfg.get("planner", {}).get("max_tasks", 8)
-    return f"""You are the planner for a crew of AI coding agents working in {workdir}.
+    return f"""You are the planner for a crew of AI coding agents working on the repository at {workdir}.
 
 Goal:
 {goal}
@@ -1503,7 +1543,8 @@ Look through the repository as much as you need, but do not change any files.
 Break the goal into at most {n} concrete tasks and assign each one to the crew
 member whose role fits it best. Each task runs in a separate non-interactive
 session that will not see this message, so its instructions must stand on their
-own: name the files, commands and expected outputs. Where a check above applies,
+own: name the files (by paths relative to the repository root, never absolute:
+the agents work in a separate copy), commands and expected outputs. Where a check above applies,
 use its exact command in "acceptance". crew runs those checks itself before and
 after the work and assigns a fix task if one breaks, so do not add a task that only
 runs checks or reviews without changing anything (unless the goal asks for a
@@ -1679,6 +1720,7 @@ def worker_prompt(cfg: dict, plan: dict, project: dict, task: dict, done: dict[s
                   workdir: Path | None = None) -> str:
     workdir = workdir or Path(plan["workdir"])
     agent = task["agent"]
+    remap = (lambda text: text.replace(plan["workdir"], str(workdir)) if str(workdir) != plan["workdir"] else text)
     ctx = "\n".join(
         f"- {d} ({done[d]['agent']}, {done[d]['title']}): {short(str(done[d].get('result') or ''), 600)}"
         for d in task["depends_on"] if d in done
@@ -1693,10 +1735,10 @@ Overall goal: {plan['goal']}
 Your task ({task['id']}): {task['title']}
 
 Instructions:
-{task['instructions']}
+{remap(task['instructions'])}
 
 Done when:
-{task['acceptance']}
+{remap(task['acceptance'])}
 
 Results of the tasks this one depends on:
 {ctx}
@@ -1745,6 +1787,20 @@ def plan_state(plan: dict) -> str:
     if all(s == "done" for s in statuses) and not checks.get("regressions") and not plan.get("setup_failed"):
         return "done"
     return "needs-review"
+
+
+STUB_NAMES = {".bashrc", ".bash_profile", ".zshrc", ".zprofile", ".profile", ".gitconfig", ".gitmodules",
+              ".ripgreprc", ".mcp.json", ".idea", ".vscode"}
+
+
+def is_sandbox_stub(p: Path) -> bool:
+    """An empty, read-only placeholder Claude's sandbox mounts over protected files; it can be
+    left on disk when the CLI is killed."""
+    try:
+        st = p.lstat()
+    except OSError:
+        return False
+    return p.name in STUB_NAMES and st.st_size == 0 and not (st.st_mode & 0o222)
 
 
 def is_generated(path: str) -> bool:
@@ -1802,7 +1858,9 @@ class Run:
             ok = (isinstance(g, dict) and all(isinstance(g.get(k), str) and g[k] for k in ("branch", "base", "worktree"))
                   and re.fullmatch(r"[0-9a-f]{7,64}", g["base"])
                   and Path(g["worktree"]).resolve().is_relative_to(CREW_HOME.resolve() / "worktrees")
-                  and g["branch"] != g.get("start"))
+                  and g["branch"] != g.get("start")
+                  and g["branch"].startswith(tuple({self.cfg["git"].get("branch_prefix") or "crew/",
+                                                    "crew/", "crew-"} - {""})))
             if not ok:
                 raise ValueError(f"{plan_path}: invalid git block (needs a crew branch, base commit and worktree)")
         self.git = g
@@ -1814,6 +1872,7 @@ class Run:
         self.stopped = False
         self.ran_tasks = 0
         self.setup_done_now = False
+        self.recreated = False
         self.guarded: dict[Path, str] = {}
 
     def save(self) -> None:
@@ -1850,8 +1909,57 @@ class Run:
     def _branch_name(self) -> str:
         return f"{self.cfg['git'].get('branch_prefix', 'crew/')}{slugify(self.path.stem, 60)}"
 
+    def _git_files(self) -> list[Path]:
+        gd = self.workdir / ".git"
+        return [gd / "config", gd / "info" / "attributes", gd / "info" / "exclude"]
+
+    def _git_fingerprint(self) -> str:
+        h = hashlib.sha256()
+        for f in self._git_files():
+            h.update(str(f).encode() + b"\0" + (f.read_bytes() if f.is_file() else b"<none>") + b"\0")
+        return h.hexdigest()
+
+    def _check_git_integrity(self) -> None:
+        """Before crew runs git in its clone after agents have been there: the clone's git config
+        must be exactly as crew left it (a filter or fsmonitor there would run code in crew's own
+        unsandboxed git commands). Stale lock files from a killed git are cleared: nothing else
+        uses this clone while crew holds the plan lock."""
+        if not self.git or not (self.workdir / ".git").is_dir():
+            return
+        expected = self.git.get("git_fingerprint")
+        if expected and self._git_fingerprint() != expected:
+            raise ValueError(f"the git configuration of crew's clone {self.workdir} changed since crew set it up "
+                             "(.git/config, info/attributes or info/exclude). crew stopped without running git "
+                             "there. Inspect it; `crew clean --all` and `crew run` start the clone over.")
+        for lock in (self.workdir / ".git" / "index.lock", self.workdir / ".git" / "config.lock"):
+            if lock.exists():
+                with contextlib.suppress(OSError):
+                    lock.unlink()
+                    log(f"note: removed a stale {lock.name} left by an interrupted git command")
+
+    def _publish(self) -> bool:
+        """Update the user's repo's crew branch from crew's clone (fast-forward only)."""
+        g = self.git
+        tip = g.get("tip") or g["base"]
+        if tip == g["base"] and git(self.root, "rev-parse", "--verify", "-q", f"refs/heads/{g['branch']}").returncode:
+            return True  # nothing committed yet: no branch to publish
+        self._check_git_integrity()
+        r = git(self.root, "fetch", "-q", "--no-tags", "--no-write-fetch-head", str(self.workdir),
+                f"refs/heads/{g['branch']}:refs/heads/{g['branch']}", timeout=600)
+        ok = r.returncode == 0
+        if not ok:
+            log(f"  warning: couldn't update {g['branch']} in {self.root}: {short(r.stderr, 200)} "
+                "(if you have it checked out there, switch to another branch; crew retries next run)")
+        g["published"] = tip if ok else g.get("published")
+        self.save()
+        return ok
+
     def _prepare_worktree(self) -> None:
+        """crew's own clone of the repo, under ~/.crew/worktrees. A standalone clone (not a linked
+        worktree), so agents never see the user's .git; both sandboxes keep the clone's .git
+        read-only. Creation and removal are journaled, so a crash in either resumes cleanly."""
         root = self.root
+        tasks = self.plan["tasks"]
         if self.git is None:
             pa = self.plan.get("planned_at") if isinstance(self.plan.get("planned_at"), dict) else {}
             base = pa.get("head") if isinstance(pa.get("head"), str) else ""
@@ -1864,79 +1972,130 @@ class Run:
                 name = f"crew/{time.strftime('%Y%m%d-%H%M%S')}"
             branch, n = name, 2
             while True:
-                taken = git(root, "rev-parse", "--verify", "-q", f"refs/heads/{branch}").returncode == 0
-                blocked = "/" in branch and git(root, "rev-parse", "--verify", "-q",
-                                                f"refs/heads/{branch.split('/')[0]}").returncode == 0
-                if blocked:  # a branch named "crew" makes "crew/..." impossible
-                    branch = branch.replace("/", "-", 1)
+                if "/" in branch and git(root, "rev-parse", "--verify", "-q",
+                                         f"refs/heads/{branch.split('/')[0]}").returncode == 0:
+                    branch = branch.replace("/", "-", 1)  # a branch named "crew" makes "crew/..." impossible
                     continue
-                if not taken:
+                wt = worktrees_dir(self.project["key"]) / branch.replace("/", "-")
+                if git(root, "rev-parse", "--verify", "-q", f"refs/heads/{branch}").returncode != 0 \
+                        and not wt.exists():
                     break
                 branch, n = f"{name}-{n}", n + 1
-            wt = worktrees_dir(self.project["key"]) / f"{self.path.stem}"
-            # Journal first: a crash after this line resumes with the same branch and worktree.
+            # Journal first: a crash from here on resumes with the same branch and clone.
             self.git = self.plan["git"] = {"branch": branch, "base": base, "tip": base, "worktree": str(wt),
-                                           "start": pa.get("branch") or current_branch(root) or base}
+                                           "start": pa.get("branch") or current_branch(root) or base,
+                                           "creating": True}
             self.save()
+            wt.parent.mkdir(parents=True, exist_ok=True)
+            Path(f"{wt}.plan").write_text(str(self.path.resolve()))  # lets `crew clean` find this plan
             crash_point("branch-recorded")
+            if Path(tempfile.gettempdir()).resolve() in root.resolve().parents:
+                log("note: this repo is inside a temp directory, which agents' sandboxes can write to; "
+                    "keep repos elsewhere for full isolation")
         g = self.git
         wt = Path(g["worktree"])
         self.workdir = wt
-        listed = git(root, "worktree", "list", "--porcelain").stdout
-        registered = f"worktree {wt}\n" in listed + "\n" or f"worktree {wt.resolve()}\n" in listed + "\n"
-        if not (registered and wt.is_dir() and (wt / ".git").exists()):
-            git(root, "worktree", "prune")
+        if g.get("removing"):  # a finished run was removing the clone when it stopped
+            g["creating"] = True
+        if g.get("setup_failed") and not any("started" in t for t in tasks):
+            log("setup failed last time and no agent has run since: starting the clone over to retry it")
+            g["creating"] = True
+        if g.get("creating") or not (wt / ".git").is_dir():
+            vanished = not g.get("creating")
+            g["creating"] = True
+            g.pop("removing", None)
+            self.save()
             if wt.exists():
-                shutil.rmtree(wt)  # a leftover dir crew created under ~/.crew/worktrees
+                shutil.rmtree(wt)
             wt.parent.mkdir(parents=True, exist_ok=True)
-            branch_exists = git(root, "rev-parse", "--verify", "-q", f"refs/heads/{g['branch']}").returncode == 0
-            # Always set up from the base commit (trusted), then move to the branch tip.
-            log(f"git: creating a worktree for {g['branch']} at {wt} (from {g['base'][:10]}); "
-                "your checkout is untouched")
-            r = git(root, "worktree", "add", "-q", "--detach", str(wt), g["base"], timeout=600)
+            log(f"git: making crew's own copy of the repo for {g['branch']} at {wt} "
+                f"(from {g['base'][:10]}); your checkout is untouched")
+            r = git(root, "clone", "-q", "--no-checkout", str(root), str(wt), timeout=1800)
             if r.returncode != 0:
-                raise ValueError(f"could not create a worktree at {wt}: {short(r.stderr, 300)}")
+                raise ValueError(f"could not clone {root} into {wt}: {short(r.stderr, 300)}")
+            r = git(wt, "checkout", "-q", "--detach", g["base"], timeout=1800)
+            if r.returncode != 0:
+                raise ValueError(f"could not check out {g['base'][:10]} in {wt}: {short(r.stderr, 300)}")
             if (wt / ".gitmodules").exists():
                 r = git(wt, "submodule", "update", "--init", "--recursive", timeout=1800)
                 if r.returncode != 0:
                     log(f"  warning: submodules didn't initialise: {short(r.stderr, 200)}")
-            self._setup(fresh=True)
-            r = git(wt, "checkout", "-q", g["branch"]) if branch_exists else git(wt, "checkout", "-q", "-b", g["branch"])
+            crash_point("clone-made")
+            self._setup(fresh=True)  # on the base commit: code the user committed
+            tip = g.get("tip") or g["base"]
+            published = git(wt, "rev-parse", "--verify", "-q", f"refs/remotes/origin/{g['branch']}").stdout.strip()
+            if published:
+                start_at = published
+                if tip != g["base"] and published != tip and \
+                        git(wt, "merge-base", "--is-ancestor", tip, published).returncode == 0:
+                    log(f"note: continuing from your own commits on {g['branch']} ({published[:10]})")
+            elif tip == g["base"]:
+                start_at = g["base"]
+            elif git(wt, "cat-file", "-e", f"{tip}^{{commit}}").returncode == 0:
+                start_at = tip
+            else:
+                raise ValueError(f"crew's branch {g['branch']} is gone from {root} and so are its commits; "
+                                 "this plan can't continue. Start a new plan.")
+            r = git(wt, "checkout", "-q", "--no-track", "-b", g["branch"], start_at)
             if r.returncode != 0:
-                raise ValueError(f"could not check out {g['branch']} in {wt}: {short(r.stderr, 300)} "
-                                 "(if it's checked out in your own checkout, switch that to another branch)")
+                raise ValueError(f"could not create {g['branch']} in {wt}: {short(r.stderr, 300)}")
+            g["tip"] = start_at
+            self.recreated = vanished
+            for t in tasks:  # a task counts as done only if its commit is on the branch
+                if t.get("commit") and git(wt, "merge-base", "--is-ancestor", t["commit"], start_at).returncode:
+                    log(f"[{t['id']}] its commit {t['commit'][:10]} never reached {g['branch']}; it runs again")
+                    for k in ("commit", "committing", "untracked_before"):
+                        t.pop(k, None)
+                    t["status"] = "pending"
+            g["git_fingerprint"] = self._git_fingerprint()
+            g.pop("creating", None)
+            self.save()
         else:
-            log(f"git: resuming in {wt} on branch {g['branch']}")
-        cur, head = current_branch(wt), head_sha(wt)
+            log(f"git: resuming in crew's copy {wt} on branch {g['branch']}")
+        self._check_git_integrity()
+        cur, head, busy = current_branch(wt), head_sha(wt), git_busy(wt)
         if cur != g["branch"]:
-            raise ValueError(f"the worktree {wt} is on {cur or 'a detached HEAD'}, not {g['branch']}; "
-                             f"inspect it, then `git -C {wt} checkout {g['branch']}` and re-run")
-        busy = git_busy(wt)
+            raise ValueError(f"crew's copy {wt} is on {cur or 'a detached HEAD'}, not {g['branch']}; inspect it, "
+                             "then `crew clean --all` and `crew run` to start the copy over")
         if busy:
-            raise ValueError(f"the worktree {wt} has an unfinished {busy}; resolve it, then re-run")
+            raise ValueError(f"crew's copy {wt} has an unfinished {busy}; `crew clean --all` and `crew run`")
         tip = g.get("tip") or g["base"]
-        if head != tip:
-            if git(wt, "merge-base", "--is-ancestor", tip, head).returncode == 0:
-                log(f"note: {g['branch']} has commits made outside crew; continuing from {head[:10]}")
-                g["tip"] = head
+        if head != tip and not any("committing" in t for t in tasks):
+            raise ValueError(f"crew's copy {wt} has commits crew didn't make (HEAD {head[:10]}, expected "
+                             f"{tip[:10]}). Inspect them; `crew clean --all` and `crew run` start over from "
+                             f"{g['branch']}.")
+        # The user may have committed on the crew branch in their own checkout: build on that.
+        rb = git(root, "rev-parse", "--verify", "-q", f"refs/heads/{g['branch']}").stdout.strip()
+        if rb and rb != tip and head == tip:
+            if git(root, "merge-base", "--is-ancestor", tip, rb).returncode == 0:
+                r = git(wt, "fetch", "-q", "--no-tags", "origin", f"+refs/heads/{g['branch']}:refs/remotes/origin/{g['branch']}")
+                if r.returncode != 0 or git(wt, "merge", "-q", "--ff-only", f"origin/{g['branch']}").returncode:
+                    raise ValueError(f"could not bring your commits on {g['branch']} into crew's copy")
+                g["tip"] = rb
+                g["git_fingerprint"] = self._git_fingerprint()
                 self.save()
-            elif not any("committing" in t for t in self.plan["tasks"]):
-                raise ValueError(f"{g['branch']} no longer contains crew's last commit {tip[:10]}; "
-                                 "it was rewritten outside crew. Inspect it before running again.")
+                log(f"note: continuing from your own commits on {g['branch']} ({rb[:10]})")
+            elif git(root, "merge-base", "--is-ancestor", rb, tip).returncode != 0:
+                raise ValueError(f"{g['branch']} in {root} and crew's copy have diverged; inspect them, or start "
+                                 "a new plan")
+        if g.get("published") != (g.get("tip") or g["base"]) and (g.get("tip") or g["base"]) != g["base"]:
+            self._publish()
 
     def _snapshot(self) -> dict:
         return {"untracked": sorted(untracked(self.workdir)), "ignored": sorted(ignored_entries(self.workdir))}
 
     def _new_files(self, snap: dict) -> tuple[list[str], list[str]]:
         """Files the task created: (to commit, left out). Never anything that existed before,
-        including files that were ignored then (an agent un-ignoring .env can't get it committed)."""
+        including files that were ignored then (an agent un-ignoring .env can't get it committed),
+        and never the empty read-only placeholders Claude's sandbox can leave behind."""
         before = set(snap.get("untracked") or [])
         ignored = set(snap.get("ignored") or [])
         keep, skipped = [], []
         for f in sorted(untracked(self.workdir) - before):
             parts = f.rstrip("/").split("/")
             prefixes = {"/".join(parts[:i]) + "/" for i in range(1, len(parts))}
-            if f in ignored or f.rstrip("/") in ignored or prefixes & ignored or is_generated(f):
+            if f in ignored or f.rstrip("/") in ignored or prefixes & ignored or is_generated(f) \
+                    or is_sandbox_stub(self.workdir / f):
                 continue
             if f.endswith("/"):  # a nested git repository: git would store only a pointer
                 skipped.append(f)
@@ -1949,8 +2108,11 @@ class Run:
         if not self.git:
             return
         for task in self.plan["tasks"]:
+            if self.recreated and task.get("status") == "running":
+                task.pop("untracked_before", None)  # snapshot of a copy that no longer exists
             if "committing" not in task:
                 continue
+            self.ran_tasks += 1  # the branch changes: verification must run again
             head = head_sha(self.workdir)
             subject = git(self.workdir, "log", "-1", "--format=%s").stdout.strip()
             if head != task["committing"] and subject.startswith(f"crew({task['id']}):"):
@@ -1959,6 +2121,14 @@ class Run:
                 task.pop("committing", None)
                 task.pop("untracked_before", None)
                 log(f"[{task['id']}] recovered its commit {head[:10]} after an interruption")
+                self.save()
+                self._publish()
+            elif self.recreated:
+                for k in ("committing", "untracked_before", "commit"):
+                    task.pop(k, None)
+                task["status"] = "pending"
+                task["result"] = "[crew] its uncommitted work was lost with crew's copy of the repo; it runs again"
+                log(f"[{task['id']}] its uncommitted work was lost with crew's copy of the repo; it runs again")
                 self.save()
             else:
                 log(f"[{task['id']}] committing work an interrupted run left behind")
@@ -1986,30 +2156,24 @@ class Run:
             return
         self.setup_done_now = True
         if self.git and not fresh:
-            # Existing worktree: setup already ran when it was created. Re-run only if it failed
-            # then and no agent has touched the tree since.
-            if self.git.get("setup_ok") or self.git.get("setup_failed") is None:
-                return
-            pristine = (head_sha(self.workdir) == self.git["base"]
-                        and git(self.workdir, "diff", "--quiet", self.git["base"]).returncode == 0
-                        and not (untracked(self.workdir) - set(self.git.get("untracked_base") or [])))
-            if not pristine:
-                log("setup: failed earlier and agents have changed the branch since, so crew won't retry it "
-                    "outside the sandbox; `crew clean` the worktree to start over")
-                return
+            return  # setup runs only when crew's copy is created (a failed one is retried by re-creating it)
         stamps_path = CREW_HOME / "setup" / f"{self.project['key']}-{hashlib.sha1(str(self.workdir).encode()).hexdigest()[:8]}.json"
         if not self.git:
-            if any(t.get("status", "pending") != "pending" for t in self.plan["tasks"]):
+            if any("started" in t or t.get("status", "pending") != "pending" for t in self.plan["tasks"]):
                 return  # in place: agents have run, so their edits could be in what setup would execute
         stamps = {}
         with contextlib.suppress(ValueError, OSError):
-            stamps = _read_json(stamps_path) if stamps_path.exists() else {}
+            stamps = _read_json(stamps_path) if stamps_path.exists() and not fresh else {}
         stamps = stamps if isinstance(stamps, dict) else {}
         fp = self._manifest_fingerprint()
         failed = None
         for step in steps:
             marker = step.get("unless_exists")
             if stamps.get(step["run"]) == fp and (not marker or (self.workdir / marker).exists()):
+                continue
+            if not self.git and step["run"] in stamps:
+                log(f"setup: dependency files changed since crew last installed here; run `{step['run']}` "
+                    "yourself after reviewing them (crew only installs in place the first time)")
                 continue
             log(f"setup: {step['run']}")
             rc, out, secs = run_shell(self.cfg, step["run"], self.workdir,
@@ -2021,8 +2185,7 @@ class Run:
                 stamps.pop(step["run"], None)
                 log(f"  setup failed (exit {rc}) after {secs:.0f}s; checks that need it will fail:\n{tail(out, 800)}")
             if marker and self.use_git and (self.workdir / marker).exists():
-                with file_lock(f"exclude-{self.project['key']}"):
-                    exclude_locally(self.workdir, marker.rstrip("/") + "/")
+                exclude_locally(self.workdir, marker.rstrip("/") + "/")  # crew's own copy, not the user's repo
         with contextlib.suppress(OSError):
             _write_json(stamps_path, stamps)
         if self.use_git and tracked_dirty(self.workdir):
@@ -2096,8 +2259,9 @@ class Run:
         if resumed:
             prompt += ("\n\nNote: an earlier attempt at this task was interrupted. Its partial changes may "
                        "already be in the working tree; check `git status` and `git diff` first and build on them.")
+        deny = [str(self.workdir / ".git"), str(self.root)] if self.git else []
         res = call_with_fallback(self.cfg, provider, prompt, self.workdir, agent=task["agent"], task_id=tid,
-                                 project=self.project.get("name", ""), schema=WORKER_SCHEMA)
+                                 project=self.project.get("name", ""), schema=WORKER_SCHEMA, deny_write=deny)
         self.totals, self.runs = usage_totals(self.cfg)
         if not res.ok and res.limited:
             task["status"] = "pending"  # keep untracked_before: the next attempt continues this one
@@ -2119,6 +2283,7 @@ class Run:
         if res.denied:
             task["denied"] = res.denied
         if self.git:
+            self._check_git_integrity()
             task["committing"] = self.git.get("tip") or self.git["base"]
             self.save()
             crash_point("before-commit")
@@ -2164,6 +2329,7 @@ class Run:
         if sha:
             task["commit"] = sha
             g["tip"] = sha
+            g["git_fingerprint"] = self._git_fingerprint()
         left = ([f"nested git repository {n}" for n in nested] + ([problem] if problem else [])
                 + (["uncommitted changes to tracked files"] if tracked_dirty(wt) else []))
         if left:
@@ -2175,6 +2341,8 @@ class Run:
         task.pop("committing", None)
         task.pop("untracked_before", None)
         self.save()
+        if sha:
+            self._publish()
 
     def run_tasks(self) -> None:
         for task in self.order:
@@ -2212,8 +2380,9 @@ class Run:
         baseline = checks.get("baseline")
         if self.dry_run or not isinstance(baseline, dict):
             return
-        if not self.ran_tasks and isinstance(checks.get("final"), dict):
-            return  # nothing changed since the last verification
+        tip = (self.git.get("tip") or self.git["base"]) if self.git else None
+        if not self.ran_tasks and isinstance(checks.get("final"), dict) and checks.get("final_tip") == tip:
+            return  # this exact commit was already verified
         rounds = sum(1 for t in self.plan["tasks"] if t.get("origin") == "verify")
         while True:
             final = self._run_checks("after")
@@ -2222,6 +2391,7 @@ class Run:
             regs = [n for n, r in final.items()
                     if not r["ok"] and (not isinstance(baseline.get(n), dict) or baseline[n].get("ok", True))]
             checks["final"], checks["regressions"] = final, regs
+            checks["final_tip"] = (self.git.get("tip") or self.git["base"]) if self.git else None
             self.save()
             known = [n for n, r in final.items() if not r["ok"] and n not in regs]
             if known:
@@ -2259,28 +2429,67 @@ class Run:
                                 "blocked, explaining why.\n\n" + detail,
                 "acceptance": "These commands exit 0: " + "; ".join(f"`{checks.get(r, r)}`" for r in regs)}
 
+    def nothing_to_do(self) -> bool:
+        """True when a re-run would change nothing: no task can run and the tip is verified."""
+        tasks = self.plan["tasks"]
+        if any(t.get("status", "pending") in ("pending", "running") or "committing" in t for t in tasks):
+            return False
+        if any(t.get("status") == "skipped" and all(self.by_id[d].get("status") == "done" for d in t["depends_on"])
+               for t in tasks):
+            return False
+        if self.git and self.git.get("published") != (self.git.get("tip") or self.git["base"]) \
+                and (self.git.get("tip") or self.git["base"]) != self.git["base"]:
+            return False
+        checks = self.plan["checks"]
+        tip = (self.git.get("tip") or self.git["base"]) if self.git else None
+        return not (self.project.get("checks") and self.cfg["verify"].get("enabled", True)
+                    and "baseline" in checks and checks.get("final_tip") != tip)
+
+    def finish_pending_removal(self) -> None:
+        """A finished run was removing crew's copy when it stopped: complete that."""
+        g = self.git
+        if g and g.get("removing"):
+            shutil.rmtree(g["worktree"], ignore_errors=True)
+            if not Path(g["worktree"]).exists():
+                g.pop("removing", None)
+                self.save()
+
     def finish(self) -> None:
         if self.dry_run:
             log("dry run: nothing was executed")
             return
         g = self.git
         if g:
-            stat = git(self.root, "diff", "--shortstat", g["base"], g.get("tip") or g["base"]).stdout.strip()
+            tip = g.get("tip") or g["base"]
+            if tip != g["base"] and g.get("published") != tip:
+                self._publish()
+            stat = git(self.root, "diff", "--shortstat", g["base"], tip).stdout.strip() if g.get("published") == tip \
+                else git(self.workdir, "diff", "--shortstat", g["base"], tip).stdout.strip()
             log(f"git: {g['branch']} has {stat or 'no changes'} since {g['base'][:10]}")
-            log(f"     review: git -C {self.root} log --stat {g['base'][:10]}..{g['branch']}   "
-                f"merge: git -C {self.root} merge {g['branch']}")
-            leftovers = tracked_dirty(self.workdir) or any(
-                not is_generated(f) for f in untracked(self.workdir) - set(g.get("untracked_base") or []))
+            if g.get("published") == tip:
+                log(f"     review: git -C {self.root} log --stat {g['base'][:10]}..{g['branch']}   "
+                    f"merge: git -C {self.root} merge {g['branch']}")
+            wt = self.workdir
+            leftovers = wt.is_dir() and (tracked_dirty(wt) or any(
+                not is_generated(f) and not is_sandbox_stub(wt / f)
+                for f in untracked(wt) - set(g.get("untracked_base") or [])))
             state = plan_state(self.plan)
-            if state == "paused" or leftovers:
-                why = "uncommitted changes are left in it" if leftovers else "the plan isn't finished"
-                log(f"git: keeping the worktree {self.workdir} ({why}); `crew run` continues there")
-            else:
-                r = git(self.root, "worktree", "remove", "--force", str(self.workdir))
-                if r.returncode == 0:
-                    log("git: removed the worktree (the branch keeps the work)")
-                else:
-                    log(f"git: couldn't remove the worktree {self.workdir}: {short(r.stderr, 200)}")
+            unpublished = tip != g["base"] and g.get("published") != tip
+            if state == "paused" or leftovers or unpublished:
+                why = ("uncommitted changes are left in it" if leftovers else
+                       "its commits aren't in your repo yet" if unpublished else "the plan isn't finished")
+                log(f"git: keeping crew's copy {wt} ({why}); `crew run` continues there")
+            elif wt.exists():
+                g["removing"] = True  # journaled: an interrupted removal starts the copy over next time
+                self.save()
+                crash_point("removing")
+                shutil.rmtree(wt, ignore_errors=True)
+                if not wt.exists():
+                    with contextlib.suppress(OSError):
+                        Path(f"{wt}.plan").unlink()
+                    g.pop("removing", None)
+                    self.save()
+                    log("git: removed crew's copy (the branch in your repo keeps the work)")
         log(f"plan saved to {self.path}")
 
 
@@ -2302,6 +2511,13 @@ def run_plan(cfg: dict, plan_path: Path, *, dry_run: bool = False, retry_failed:
             try:
                 run = Run(cfg, plan_path, dry_run=False, retry_failed=retry_failed, use_git=use_git)
                 try:
+                    run.finish_pending_removal()
+                    if run.nothing_to_do():
+                        log(f"nothing to do: this plan is {plan_state(run.plan)}"
+                            + (f"; its work is on {run.git['branch']}" if run.git else ""))
+                        if show_split:
+                            print_split(cfg)
+                        return 0 if plan_state(run.plan) == "done" else 1
                     run.prepare()
                     run.run_tasks()
                     if not run.stopped:
@@ -2317,7 +2533,7 @@ def run_plan(cfg: dict, plan_path: Path, *, dry_run: bool = False, retry_failed:
         raise ProjectBusy(f"this plan is already running ({e}); wait for it to finish or stop it first") from None
     if show_split:
         print_split(cfg)
-    return 1 if run.failed else 0
+    return 0 if plan_state(run.plan) == "done" else 1
 
 
 # --------------------------------------------------------------------------- queue
@@ -2476,28 +2692,54 @@ def _queue_run(explicit: Path | None, jobs: int, use_git: bool, retry_failed: bo
     return 0 if all(i.get("status") == "done" for i in load_queue() if i["id"] in ids) else 1
 
 
+def _plan_or_none(path: Path) -> dict | None:
+    try:
+        plan = _read_json(path)
+    except (ValueError, OSError, RecursionError):
+        return None
+    if isinstance(plan, dict) and isinstance(plan.get("tasks"), list) and all(isinstance(t, dict) for t in plan["tasks"]):
+        return plan
+    return None
+
+
 def clean(all_: bool) -> int:
-    """Remove worktrees of plans that aren't paused (or all), and prune git's records of them."""
+    """Remove crew's copies of finished plans (with --all, also paused ones and copies no plan claims)."""
+    owners: dict[Path, Path] = {}
+    for f in (CREW_HOME / "plans").glob("*/*.json"):
+        plan = _plan_or_none(f)
+        g = plan.get("git") if plan else None
+        if isinstance(g, dict) and isinstance(g.get("worktree"), str):
+            owners[Path(g["worktree"]).resolve()] = f
     removed = 0
-    for wt in sorted((CREW_HOME / "worktrees").glob("*/*")):
-        plan_file = plans_dir(wt.parent.name) / f"{wt.name}.json"
-        state = "missing"
-        with contextlib.suppress(ValueError, OSError):
-            state = plan_state(_read_json(plan_file)) if plan_file.exists() else "missing"
-        if state == "paused" and not all_:
-            log(f"kept {wt} (its plan is paused; `crew run` continues it)")
+    for wt in sorted(d for d in (CREW_HOME / "worktrees").glob("*/*") if d.is_dir()):
+        plan_file = owners.get(wt.resolve())
+        pointer = Path(f"{wt}.plan")
+        if plan_file is None and pointer.is_file():  # plans saved with --out live elsewhere
+            with contextlib.suppress(OSError):
+                candidate = Path(pointer.read_text().strip())
+                plan = _plan_or_none(candidate) if candidate.is_file() else None
+                g = plan.get("git") if plan else None
+                if isinstance(g, dict) and isinstance(g.get("worktree"), str) and Path(g["worktree"]).resolve() == wt.resolve():
+                    plan_file = candidate
+        if plan_file is None and not all_:
+            log(f"kept {wt} (no plan claims it; `crew clean --all` removes it)")
             continue
-        root = None
-        with contextlib.suppress(ValueError, OSError):
-            root = Path(_read_json(plan_file)["workdir"]) if plan_file.exists() else None
-        if root and root.is_dir():
-            git(root, "worktree", "remove", "--force", str(wt))
-            git(root, "worktree", "prune")
-        if wt.exists():
-            shutil.rmtree(wt, ignore_errors=True)
+        lock = f"plan-{hashlib.sha1(str(plan_file.resolve()).encode()).hexdigest()[:12]}" if plan_file else "orphan"
+        try:
+            with file_lock(lock, blocking=False):
+                plan = _plan_or_none(plan_file) if plan_file else None
+                if plan and plan_state(plan) == "paused" and not all_:
+                    log(f"kept {wt} (its plan is paused; `crew run` continues it)")
+                    continue
+                shutil.rmtree(wt, ignore_errors=True)
+                with contextlib.suppress(OSError):
+                    pointer.unlink()
+        except LockBusy:
+            log(f"kept {wt} (its plan is running)")
+            continue
         log(f"removed {wt}")
         removed += 1
-    log(f"removed {removed} worktree(s); crew's branches are kept")
+    log(f"removed {removed} copy(ies); crew's branches in your repos are kept")
     return 0
 
 
@@ -2546,9 +2788,9 @@ def list_projects() -> None:
         p = prof["project"]
         last = latest_plan(f.stem)
         state = ""
-        if last:
-            with contextlib.suppress(ValueError, OSError, KeyError):
-                state = f"; last plan {plan_state(_read_json(last))} ({last.name[:15]})"
+        plan = _plan_or_none(last) if last else None
+        if plan:
+            state = f"; last plan {plan_state(plan)} ({last.name[:15]})"
         log(f"{p.get('name'):<34} {', '.join(p.get('stack') or []) or '-'}")
         log(f"    {p.get('root')}; checks: {', '.join(p.get('checks') or {}) or 'none'}{state}")
 
@@ -2558,13 +2800,16 @@ def list_plans(key: str | None, root: Path | None = None) -> None:
     shown = 0
     for d in dirs:
         for f in (plans_for(d.name, root) if key else sorted(d.glob("*.json"))):
-            with contextlib.suppress(ValueError, OSError):
-                plan = _read_json(f)
-                counts = Counter(t.get("status", "pending") for t in plan.get("tasks", []))
-                log(f"{plan_state(plan):<13} {(plan.get('project') or {}).get('name', d.name):<30} "
-                    f"{short(plan.get('goal', ''), 50):<50} {f}")
-                log(f"              {', '.join(f'{v} {k}' for k, v in sorted(counts.items()))}")
-                shown += 1
+            plan = _plan_or_none(f)
+            if plan is None:
+                log(f"unreadable  {f}")
+                continue
+            counts = Counter(str(t.get("status", "pending")) for t in plan["tasks"])
+            proj = plan.get("project") if isinstance(plan.get("project"), dict) else {}
+            log(f"{plan_state(plan):<13} {str(proj.get('name', d.name)):<30} "
+                f"{short(str(plan.get('goal', '')), 50):<50} {f}")
+            log(f"              {', '.join(f'{v} {k}' for k, v in sorted(counts.items()))}")
+            shown += 1
     if not shown:
         log("no plans yet")
 
@@ -2820,9 +3065,13 @@ def main(argv: list[str] | None = None) -> int:
                 roots = [resolve_workdir(w) for w in args.workdir or []]
                 if args.all:
                     for f in sorted((CREW_HOME / "projects").glob("*.json")):
-                        root = Path(load_profile(f.stem)["project"].get("root") or "")
-                        if root.is_dir() and root not in roots:
-                            roots.append(root)
+                        try:
+                            r = load_profile(f.stem)["project"].get("root")
+                        except ValueError as e:
+                            log(f"skipping {f.name}: {e}")
+                            continue
+                        if isinstance(r, str) and Path(r).is_dir() and Path(r) not in roots:
+                            roots.append(Path(r))
                 if not roots:
                     roots = [resolve_workdir(None)]
                 queue_add(args.goal, roots, direct=args.direct, agent=args.agent)

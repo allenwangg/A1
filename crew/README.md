@@ -40,7 +40,7 @@ crew run                     # resume this checkout's latest plan
 crew run --retry-failed      # also re-run failed, partial, blocked and skipped tasks
 crew go "..." --dry-run      # plan, then only show who would get each task
 crew plans                   # this checkout's plans (crew plans --all for every project)
-crew clean                   # remove worktrees of finished plans
+crew clean                   # remove crew's copies of finished plans
 ```
 
 When the run ends, crew prints the commands to review and merge:
@@ -52,19 +52,19 @@ git merge crew/<date>-<goal>
 
 What a run does, in order:
 
-1. **Worktree.** crew creates a separate git worktree under `~/.crew/worktrees/` on a new branch, `crew/<date>-<goal>`. It starts from the commit you were on when the plan was made. Your own checkout is never switched, stashed or written to, so you can keep working while crew runs. Uncommitted changes in your checkout aren't part of the run (crew says so when it plans). Nothing is ever pushed. `--no-git` works in place instead.
-2. **Setup.** crew installs dependencies in the new worktree (`npm ci`, `pnpm install`, a `.venv` with `pip install`...), because agents have no network. Setup runs outside any sandbox, so crew only runs it on the base commit, before any agent has touched the tree. If setup changes tracked files (a lockfile), crew restores them.
-3. **Baseline checks.** crew runs the project's checks (tests, typecheck, lint, build...) inside Codex's sandbox: no network, and no writes outside the worktree.
+1. **Its own copy.** crew makes a local clone of your repo under `~/.crew/worktrees/` and works there on a new branch, `crew/<date>-<goal>`. It starts from the commit you were on when the plan was made. Your own checkout is never switched, stashed or written to, so you can keep working while crew runs. Uncommitted changes in your checkout aren't part of the run (crew says so when it plans). After each commit, crew copies the branch into your repo (a fast-forward `git fetch`, so it only ever adds commits to its own `crew/...` branch). Nothing is ever pushed anywhere. `--no-git` works in place instead.
+2. **Setup.** crew installs dependencies in its copy (`npm ci`, `pnpm install`, a `.venv` with `pip install`...), because agents have no network. Setup runs outside any sandbox, so crew only runs it on the base commit, before any agent has touched the copy. If setup fails, the copy is rebuilt and setup retried on the next run, as long as no agent has worked in it yet. If setup changes tracked files (a lockfile), crew restores them.
+3. **Baseline checks.** crew runs the project's checks (tests, typecheck, lint, build...) inside Codex's sandbox: no network, and no writes outside crew's copy.
 4. **Tasks.** Tasks run one at a time, in dependency order. Each agent gets:
    - its role and the task;
    - a short project brief: stack, check commands, notes, and `CLAUDE.md`/`AGENTS.md` if present;
    - the summaries of the tasks it depends on.
 
-   It ends by reporting `done`, `partial` or `blocked`; only `done` lets dependent tasks run. After each task crew commits that task's work as one commit (`crew(t1): ...`), without running your git hooks or signing. First it checks that the agent left the worktree on crew's branch, at crew's last commit, with no merge or rebase in progress. If not, crew stops without committing.
-5. **Checks again.** A check that passed before and fails now is a regression, and crew gives Luna a fix task with the failing output (`verify.fix_rounds`, default 1). Checks that already failed before are reported, not counted.
-6. **Finish.** If the plan is done, or needs your review, the worktree is removed (unless uncommitted changes are left in it); the branch keeps the work. If the plan is paused (usage limit, interrupt), the worktree stays so `crew run` can continue in it.
+   It ends by reporting `done`, `partial` or `blocked`; only `done` lets dependent tasks run. After each task crew commits that task's work as one commit (`crew(t1): ...`), without running git hooks or signing. First it checks that the copy's git configuration is unchanged and that it is still on crew's branch, at crew's last commit, with no merge or rebase in progress. If not, crew stops without running git there.
+5. **Checks again.** A check that passed before and fails now is a regression, and crew gives Luna a fix task with the failing output (`verify.fix_rounds`, default 1). Checks that already failed before are reported, not counted. Results are tied to the commit they checked, so a resumed run re-checks anything new.
+6. **Finish.** If the plan is done, or needs your review, crew's copy is removed (unless uncommitted changes are left in it, or the branch couldn't be copied into your repo); your repo's branch keeps the work. If the plan is paused (usage limit, interrupt), the copy stays so `crew run` can continue in it. Re-running a finished plan does nothing and exits 0 if it's done, 1 if it needs review.
 
-A plain re-run leaves `failed`, `partial` and `blocked` tasks alone. If every available provider hits its usage limit, the run stops with the current task `pending`; re-run later.
+A plain re-run leaves `failed`, `partial` and `blocked` tasks alone. If every available provider hits its usage limit, the run stops with the current task `pending`; re-run later. If you commit on a `crew/...` branch yourself, the next run builds on your commits.
 
 To add a dependency, install and commit it on your own branch, then start a new plan. crew never installs from a branch that agents have changed.
 
@@ -93,15 +93,15 @@ Only one `crew queue run` can work at a time.
 
 No tool driving language models can promise correct code. What crew does promise, and its test suite checks:
 
-- **Your work is safe.** crew never modifies your checkout, your branches or your uncommitted files, and never pushes. Agents work in a separate worktree. They can't commit or switch its branch: its git metadata lives outside their sandbox.
-- **Crashes don't lose or repeat work.** Every step that changes the repo is written to the plan file first. A crash, kill or power cut at any point resumes without repeating a committed task or losing an agent's files. Crash points tested: after the branch is recorded, before the commit, and after the commit. Agent processes left running by a crew that was killed are stopped before the next run continues.
-- **One run per plan.** A second `crew run` of the same plan, or a second `crew queue run`, is refused. The queue, usage log and state files are locked between processes and written atomically.
+- **Your work is safe.** crew never modifies your checkout, your branches or your uncommitted files, and never pushes. The only change it makes to your repo is adding commits to its own `crew/...` branches. Agents work in crew's own clone. Your checkout and the clone's `.git` are read-only to them: Codex's sandbox does this by itself, and crew tells Claude's sandbox to deny writes to both, because otherwise Claude can write a repo's git directory. Before running git in the clone after an agent, crew checks that the clone's git configuration is unchanged.
+- **Crashes don't lose or repeat work.** Every step that changes anything is written to the plan file first: making the copy, each commit, removing the copy. A crash, kill or power cut at any point resumes without repeating a committed task or losing an agent's files. Crash points tested: while making the copy, after the branch is recorded, before a commit, after a commit, while removing the copy, and SIGKILL mid-task. Agent processes left running by a crew that was killed are stopped before the next run continues. If crew's copy is deleted while a task's work is uncommitted, that task runs again instead of being counted as done.
+- **One run per plan.** A second `crew run` of the same plan, or a second `crew queue run`, is refused, and `crew clean` never removes the copy of a running plan. The queue, usage log and state files are locked between processes and written atomically.
 - **Agent-modified code never runs outside a sandbox.** Setup only runs on the base commit. Checks run in Codex's sandbox, and are skipped, never run unsandboxed, if that sandbox doesn't work (unless you set `verify.unsandboxed`). Claude's shell access is granted only after its sandbox is confirmed to work.
 - **Nothing is called done without evidence.** A task is `done` only if its agent says so in a structured reply. A plan is `done` only if every task is, no check regressed, and setup succeeded. Exit codes and queue states follow from that.
-- **Commits contain only the task's work.** Generated files (`__pycache__`, caches, CLI state) are left out. So are files that existed before the task, even if an agent un-ignores them, and nested git repositories.
+- **Commits contain only the task's work.** Generated files (`__pycache__`, caches, CLI state, the empty placeholders Claude's sandbox can leave) are left out. So are files that existed before the task, even if an agent un-ignores them, and nested git repositories.
 - **Bad input gives an error, not a mess.** Malformed CLI replies, plans, profiles, config or state files produce a clear error or a failed attempt, never a traceback or a wrong `done`. CLI updates that remove a flag crew relies on are caught up front by `crew doctor` and by every run.
 
-What it can't promise: that the agents' code is right (that's what the checks and your review are for), that checks catch everything (they're only as good as the project's tests), or that the sandboxes of the two CLIs have no holes of their own.
+What it can't promise: that the agents' code is right (that's what the checks and your review are for), that checks catch everything (they're only as good as the project's tests), or that the sandboxes of the two CLIs have no holes of their own. Both sandboxes let agents write to temp directories, so keep your repos outside `/tmp`.
 
 ## Profiles: per-project settings
 
@@ -132,9 +132,9 @@ What gets detected:
   - Checks come from the `test`, `lint`, `build` and typecheck scripts. Without a typecheck script, TypeScript projects get `tsc --noEmit`: with `-p tsconfig.app.json` for Vite templates, and `tsc -b` for solution-style configs.
   - In monorepos, scripts that live only in the packages run across all workspaces.
   - npm's "no test specified" placeholder is ignored. If `test` runs Playwright or Cypress and a `test:unit` script exists, `test:unit` is used instead, because checks have no network or localhost.
-- **Python:** `uv sync`, `poetry install`, or a `.venv` from `requirements*.txt`/`pyproject.toml` (kept out of git through `.git/info/exclude`):
+- **Python:** `uv sync`, `poetry install`, or a `.venv` from `requirements*.txt`/`pyproject.toml`, kept out of commits through the clone's own `.git/info/exclude`:
   - dev and test requirements files and extras are installed;
-  - plain `def test_...` files get pytest installed and used, otherwise unittest runs on the `tests` folder;
+  - plain `def test_...` files get pytest installed and used, otherwise unittest runs on the `tests` folder, or on each folder that holds test files;
   - ruff runs if configured, plus a syntax check.
 - **Notebooks:** a check that every `.ipynb` is valid JSON, plus a note telling agents to edit notebooks with nbformat, never as raw text.
 - **Static sites:** a check that every relative `href`/`src` points at a file that exists. Flask/Django `templates/` folders don't count as a static site.
@@ -164,10 +164,10 @@ The `cost_usd` Claude reports is the API list-price equivalent; on a plan it's o
 
 ## Sandboxing
 
-- **Codex workers:** `--sandbox workspace-write`, so writes stay in the worktree and there's no network.
-- **Claude workers:** `acceptEdits` plus Claude Code's sandbox, with its escape hatch turned off (`allowUnsandboxedCommands: false`). Writes stay in the worktree and temp directories, and there's no network. crew first checks that the sandbox can actually start (built in on macOS; bubblewrap and socat on Linux, tested once). Only then does it let Claude run shell commands without prompts (`--allowedTools Bash`). If the sandbox isn't available, Claude can still edit files, but its shell commands are refused rather than run unsandboxed.
+- **Codex workers:** `--sandbox workspace-write`, so writes stay in crew's copy (minus its `.git`) and temp directories, and there's no network.
+- **Claude workers:** `acceptEdits` plus Claude Code's sandbox, with its escape hatch turned off (`allowUnsandboxedCommands: false`) and writes denied to the copy's `.git` and to your checkout. Writes stay in crew's copy and temp directories, and there's no network. crew first checks that the sandbox can actually start (built in on macOS; bubblewrap and socat on Linux, tested once). Only then does it let Claude run shell commands without prompts (`--allowedTools Bash`). If the sandbox isn't available, Claude can still edit files, but its shell commands are refused rather than run unsandboxed.
 - **Checks:** run by crew inside `codex sandbox`, with credentials removed from the environment. That needs only the `codex` binary, not a Codex login. crew probes once that the sandbox really runs commands. If it doesn't, checks are skipped, never run unsandboxed, unless you set `verify.unsandboxed`.
-- **Planner:** read-only. Claude runs in plan mode with Read, Grep and Glob only; Codex runs `--sandbox read-only`. It reads your checkout as it is.
+- **Planner:** read-only. Claude runs in plan mode with Read, Grep and Glob only; Codex runs `--sandbox read-only`. It reads your checkout as it is and is told to give paths relative to the repo; any absolute path into your checkout is rewritten to point at crew's copy.
 - **Repo settings ignored:** Claude calls load only your user-level settings, so a `.claude/settings.json` in the repo can't add hooks or loosen permissions. crew's own git commands never run repo hooks or an fsmonitor.
 
 Read a plan before you `run` it. Its instructions go to agents that can edit files. `go`, `do` and `queue run` skip that review, so use them for goals and repos you trust.
@@ -184,8 +184,8 @@ Read a plan before you `run` it. Its instructions go to agents that can edit fil
 | `providers.<p>.enabled` | `false` takes a provider out of rotation |
 | `split.*` | See "How usage is divided" |
 | `verify.enabled` / `.fix_rounds` / `.fixer` / `.timeout_sec` / `.unsandboxed` | Checks and the fix loop |
-| `setup.enabled` / `.timeout_sec` | Dependency install in each new worktree |
-| `git.enabled` / `.branch_prefix` | Worktree-and-branch per plan |
+| `setup.enabled` / `.timeout_sec` | Dependency install in each new copy |
+| `git.enabled` / `.branch_prefix` | Separate copy and branch per plan |
 
 ## Tests
 
@@ -197,8 +197,9 @@ They use fake `claude`/`codex` executables and never call a model. They cover:
 
 - stack detection;
 - config layering;
-- worktree isolation of your checkout;
+- isolation of your checkout and your `.git`;
 - crash recovery at each journaled point, including SIGKILL with an orphaned agent;
+- tampered git configuration in crew's copy;
 - the setup and `.gitignore` attacks;
 - locking;
 - hostile CLI replies and plans;

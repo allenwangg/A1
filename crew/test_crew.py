@@ -58,6 +58,10 @@ def work(prompt):
     if os.environ.get("FAKE_PYC") == tid:
         Path("__pycache__").mkdir(exist_ok=True)
         Path("__pycache__/m.cpython-313.pyc").write_bytes(b"x")
+    Path(".claude").mkdir(exist_ok=True)  # the real CLI leaves this behind
+    if os.environ.get("FAKE_TAMPER") == tid:
+        with open(".git/config", "a") as f:
+            f.write("[core]\n\tfsmonitor = touch /tmp/crew-test-pwned\n")
     if os.environ.get("FAKE_SWITCH") == tid:
         import subprocess
         subprocess.run(["git", "checkout", "-q", "-b", "rogue"], check=False)
@@ -77,7 +81,7 @@ if a[:2] == ["auth", "status"]:
 if a and a[0] == "--version":
     print("fake-claude"); sys.exit(0)
 prompt = sys.stdin.read()
-record(p="claude", argv=a, planner="plan" in a, resumed="earlier attempt" in prompt,
+record(p="claude", argv=a, planner="plan" in a, resumed="earlier attempt" in prompt, prompt=prompt[-3000:],
        lean="only\nruns checks" in prompt or "only runs checks" in prompt)
 if os.environ.get("FAKE_CLAUDE_GARBAGE") and "plan" not in a:
     print(json.dumps({"type": "result", "is_error": False, "result": {"oops": 1}, "usage": [1, 2],
@@ -486,7 +490,8 @@ class TestHardening(CrewTest):
         self.assertIn("switched the worktree to rogue", r.stdout)
         plan = self.latest_plan(root)
         self.assertEqual(plan["tasks"][0]["status"], "failed")
-        self.assertEqual(sh(root, "git", "log", "--format=%s", "rogue").splitlines(), ["init"])
+        self.assertNotIn("rogue", sh(root, "git", "branch", "--list"))  # only ever in crew's own copy
+        self.assertEqual(sh(root, "git", "log", "--format=%s", "main").splitlines(), ["init"])
         self.assertEqual(len([c for c in self.calls() if "argv" in c and not c.get("planner")]), 1)
 
     def test_commit_signing_config_does_not_break_commits(self):
@@ -689,7 +694,159 @@ class TestFailSafe(CrewTest):
         self.assertTrue(wt.exists())  # paused plan: kept
         self.crew("clean", "--all")
         self.assertFalse(wt.exists())
-        self.assertNotIn(str(wt), sh(root, "git", "worktree", "list"))
+
+
+class TestCopyEngine(CrewTest):
+    """crew's own clone: journaled creation and removal, publishing, and the isolation of the user's repo."""
+
+    def plan_of(self, root):
+        return self.latest_plan(root)
+
+    def test_crash_while_making_the_copy_or_removing_it_resumes(self):
+        for point in ("clone-made", "removing"):
+            with self.subTest(point=point):
+                root = self.repo(f"c-{point}")
+                log = self.tmp / f"setup-{point}.log"
+                self.set_profile(root, setup=[{"run": f"echo ran >> {log}", "unless_exists": "deps"}], checks={})
+                r = self.crew("go", "x", "--workdir", str(root), env={"CREW_CRASH_AT": point}, check=False)
+                self.assertEqual(r.returncode, -9, r.stdout)
+                r = self.crew("run", "--workdir", str(root))
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                plan = self.plan_of(root)
+                self.assertEqual([t["status"] for t in plan["tasks"]], ["done", "done"])
+                self.assertNotIn("creating", plan["git"])
+                self.assertNotIn("removing", plan["git"])
+                self.assertFalse(Path(plan["git"]["worktree"]).exists())
+                files = sh(root, "git", "ls-tree", "-r", "--name-only", plan["git"]["branch"]).split()
+                self.assertEqual(sorted(files), ["README.md", "t1.txt", "t2.txt"])
+                self.assertGreaterEqual(log.read_text().count("ran"), 1)
+
+    def test_recovered_commit_is_verified_again(self):
+        root = self.repo()
+        self.set_profile(root, checks={"guard": "test ! -f broken"}, setup=[])
+        r = self.crew("go", "x", "--workdir", str(root), env={"FAKE_BREAK": "t2", "CREW_CRASH_AT": "after-commit"},
+                      check=False)
+        self.assertEqual(r.returncode, -9)
+        r = self.crew("run", "--workdir", str(root), env={"FAKE_BREAK": "t2"})
+        plan = self.plan_of(root)
+        self.assertIn("checks (after", r.stdout)
+        self.assertTrue(any(t["id"].startswith("fix") for t in plan["tasks"]))  # the regression was caught
+        self.assertEqual(plan["checks"]["regressions"], [])
+
+    def test_needs_review_rerun_exits_nonzero_and_does_nothing(self):
+        root = self.repo()
+        self.set_profile(root, checks={"guard": "test ! -f t1.txt"}, setup=[])  # unfixable on purpose
+        r = self.crew("go", "x", "--workdir", str(root))
+        self.assertEqual(r.returncode, 1)
+        n = len(self.calls())
+        r = self.crew("run", "--workdir", str(root))
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("nothing to do", r.stdout)
+        self.assertEqual(len(self.calls()), n)  # no copy rebuilt, no setup, no model calls
+
+    def test_copy_removed_with_uncommitted_work_reruns_the_task(self):
+        root = self.repo()
+        self.crew("go", "x", "--workdir", str(root), env={"CREW_CRASH_AT": "before-commit"}, check=False)
+        self.crew("clean", "--all")
+        r = self.crew("run", "--workdir", str(root))
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn("runs again", r.stdout)
+        files = sh(root, "git", "ls-tree", "-r", "--name-only", self.plan_of(root)["git"]["branch"]).split()
+        self.assertIn("t1.txt", files)
+
+    def test_clean_leaves_running_and_out_of_tree_plans_alone(self):
+        root = self.repo()
+        out = self.tmp / "myplans" / "p.json"
+        self.crew("go", "x", "--workdir", str(root), "--out", str(out), env={"CREW_CRASH_AT": "before-commit"},
+                  check=False)
+        wt = Path(json.loads(out.read_text())["git"]["worktree"])
+        self.crew("clean")
+        self.assertTrue(wt.exists())  # paused --out plan: kept
+        run = subprocess.Popen([sys.executable, str(HERE / "crew.py"), "--config", str(self.cfg), "run", str(out)],
+                               env={**self.env, "FAKE_SLEEP": "3"}, stdout=subprocess.PIPE, text=True)
+        time.sleep(1.5)
+        r = self.crew("clean", "--all")
+        self.assertIn("its plan is running", r.stdout)
+        run.communicate(timeout=60)
+        self.assertEqual(run.returncode, 0)
+
+    def test_users_repo_gets_no_crew_or_cli_files(self):
+        root = self.repo()
+        excl = root / ".git" / "info" / "exclude"
+        before = excl.read_text() if excl.exists() else ""
+        self.set_profile(root, setup=[{"run": "mkdir -p deps", "unless_exists": "deps"}], checks={})
+        self.crew("go", "x", "--workdir", str(root))
+        self.assertFalse((root / ".claude").exists())
+        self.assertEqual(excl.read_text() if excl.exists() else "", before)
+        self.assertEqual(sh(root, "git", "status", "--porcelain"), "")
+        self.assertEqual(sh(root, "git", "worktree", "list").count("\n"), 1)
+
+    def test_claude_gets_write_denied_on_crew_git_and_users_checkout(self):
+        root = self.repo()
+        self.write_cfg({"providers": {"codex": {"enabled": False}}})
+        self.crew("go", "x", "--workdir", str(root))
+        worker = [c for c in self.calls() if c.get("p") == "claude" and "argv" in c and not c.get("planner")][0]
+        settings = json.loads(worker["argv"][worker["argv"].index("--settings") + 1])
+        deny = settings["sandbox"]["filesystem"]["denyWrite"]
+        self.assertIn(str(root), deny)
+        self.assertTrue(any(d.endswith("/.git") and "worktrees" in d for d in deny))
+        self.assertNotIn(str(root), worker["prompt"])  # paths point at crew's copy
+
+    def test_tampered_git_config_stops_crew_before_it_runs_git(self):
+        root = self.repo()
+        pwned = Path("/tmp/crew-test-pwned")
+        pwned.unlink(missing_ok=True)
+        r = self.crew("go", "x", "--workdir", str(root), env={"FAKE_TAMPER": "t1"}, check=False)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("git configuration of crew's clone", r.stdout)
+        self.assertFalse(pwned.exists())
+
+    def test_your_commits_on_the_crew_branch_are_built_on(self):
+        root = self.repo()
+        r = self.crew("go", "x", "--workdir", str(root), env={"FAKE_STATUS": json.dumps({"t2": "partial"})})
+        branch = self.plan_of(root)["git"]["branch"]
+        sh(root, "git", "checkout", "-q", branch)
+        (root / "mine.txt").write_text("by hand\n")
+        sh(root, "git", "add", "mine.txt")
+        sh(root, "git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "my fix")
+        sh(root, "git", "checkout", "-q", "main")
+        r = self.crew("run", "--workdir", str(root), "--retry-failed")
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn("continuing from your own commits", r.stdout)
+        log = sh(root, "git", "log", "--format=%s", f"main..{branch}").splitlines()
+        self.assertEqual(log[0], "my fix")  # t2's retry found nothing new to commit; your commit is kept on top
+        self.assertEqual(self.plan_of(root)["git"]["tip"], sh(root, "git", "rev-parse", branch).strip())
+
+    def test_plan_git_block_must_name_a_crew_branch(self):
+        root = self.repo()
+        self.crew("plan", "x", "--workdir", str(root))
+        key, _ = crew.project_identity(root)
+        path = sorted((self.home / "plans" / key).glob("*.json"))[-1]
+        plan = json.loads(path.read_text())
+        plan["git"] = {"branch": "main", "base": sh(root, "git", "rev-parse", "HEAD").strip(), "start": "dev",
+                       "worktree": str(self.home / "worktrees" / key / "x")}
+        path.write_text(json.dumps(plan))
+        r = self.crew("run", str(path), check=False)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("invalid git block", r.stdout)
+
+    def test_unittest_discovery_per_folder(self):
+        root = self.repo(files={"crew/tool.py": "x = 1\n",
+                                "crew/test_tool.py": "import unittest\nclass T(unittest.TestCase):\n"
+                                                     "    def test_a(self): pass\n"})
+        p = crew.detect_project(root, "x")
+        self.assertEqual(p["checks"]["test"], "python3 -m unittest discover -q -s crew -t crew")
+        self.assertEqual(subprocess.run(["sh", "-c", p["checks"]["test"]], cwd=root).returncode, 0)
+
+    def test_in_place_setup_never_reruns_after_agents(self):
+        root = self.repo(files={"package.json": "{}"})
+        log = self.tmp / "setup.log"
+        self.set_profile(root, setup=[{"run": f"cat package.json >> {log}"}], checks={})
+        self.crew("go", "x", "--workdir", str(root), "--no-git",
+                  env={"FAKE_STATUS": json.dumps({"t1": "partial"}), "FAKE_EDIT": json.dumps({"package.json": "EVIL"})})
+        self.crew("run", "--workdir", str(root), "--no-git", "--retry-failed")
+        self.crew("do", "y", "--workdir", str(root), "--no-git")
+        self.assertNotIn("EVIL", log.read_text())
 
 
 class TestQueue(CrewTest):
