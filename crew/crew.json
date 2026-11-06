@@ -71,7 +71,6 @@
   },
   "git": {
     "enabled": true,
-    "branch_prefix": "crew/",
-    "return_to_start": true
+    "branch_prefix": "crew/"
   }
 }
