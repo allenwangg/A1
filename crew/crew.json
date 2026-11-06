@@ -1,12 +1,16 @@
 {
   "planner": {
     "provider": "claude",
-    "max_tasks": 8
+    "max_tasks": 8,
+    "model": {}
   },
   "split": {
     "mode": "by_role",
     "metric": "tasks",
-    "target_share": { "claude": 0.5, "codex": 0.5 },
+    "target_share": {
+      "claude": 0.5,
+      "codex": 0.5
+    },
     "tolerance": 0.15,
     "min_runs": 6,
     "window_hours": 168,
@@ -19,17 +23,25 @@
       "cmd": "claude",
       "model": null,
       "args": [
-        "--permission-mode", "acceptEdits",
-        "--settings", "{\"sandbox\": {\"enabled\": true, \"autoAllowBashIfSandboxed\": true}}"
+        "--permission-mode",
+        "acceptEdits",
+        "--settings",
+        "{\"sandbox\": {\"enabled\": true, \"autoAllowBashIfSandboxed\": true, \"allowUnsandboxedCommands\": false}}"
       ],
-      "timeout_sec": 1800
+      "sandboxed_bash": true,
+      "timeout_sec": 1800,
+      "max_parallel": 1
     },
     "codex": {
       "enabled": true,
       "cmd": "codex",
       "model": null,
-      "args": ["--sandbox", "workspace-write"],
-      "timeout_sec": 1800
+      "args": [
+        "--sandbox",
+        "workspace-write"
+      ],
+      "timeout_sec": 1800,
+      "max_parallel": 1
     }
   },
   "agents": {
@@ -45,5 +57,21 @@
       "role": "Verifier. Writes and runs tests, reviews the other agents' changes, fixes small issues, updates docs.",
       "prefers": "any"
     }
+  },
+  "verify": {
+    "enabled": true,
+    "fixer": "Luna",
+    "fix_rounds": 1,
+    "timeout_sec": 900,
+    "unsandboxed": false
+  },
+  "setup": {
+    "enabled": true,
+    "timeout_sec": 1800
+  },
+  "git": {
+    "enabled": true,
+    "branch_prefix": "crew/",
+    "return_to_start": true
   }
 }
