@@ -32,6 +32,15 @@ found and fixed. Do not relax them for convenience. `ASSURANCE.md` holds the evi
    crew's own git calls pass `-c core.hooksPath=/dev/null -c core.fsmonitor=false`, commits use
    `--no-verify -c commit.gpgsign=false`, and the clone's `.git/config`, `info/attributes` and
    `info/exclude` are fingerprinted and checked before crew runs git there after an agent.
+   So is what stands at every submodule's `.git` (`_gitlinks()`, recorded as `git.gitlinks`):
+   that file is in the working tree, an agent can swap it for a repository, and `git status`,
+   `git add -u` and `git submodule update` obey a submodule's own configuration. The check runs
+   wherever agent-controlled code has run since crew last looked. The sandboxed checks count:
+   `finish()` checks again before its `git status`.
+   `providers.<p>.args` only adds flags. `_claude_worker_args()` and `run_codex()` put back the
+   permission mode, sandbox settings and write denials that a custom `args` leaves out, keep a
+   value the config sets itself, and give Claude Bash only when the resulting settings have the
+   sandbox on and its escape hatch off.
    The planner is read-only: Claude `--permission-mode plan --tools Read,Grep,Glob`, Codex
    `--sandbox read-only`. Every Claude call uses `--setting-sources user` so repo settings
    (hooks, `defaultMode`, allow rules) are ignored.
@@ -121,7 +130,7 @@ found and fixed. Do not relax them for convenience. `ASSURANCE.md` holds the evi
 - SIGKILL cannot be held off. One that lands in the few milliseconds between a tracked git
   command starting and its pid being recorded leaves that git running unrecorded; the next run
   fails once ("another process may still be writing there") and succeeds when repeated.
-- Submodules: only an update the user commits on a crew branch is tested. The Codex sandbox
-  lets a worker replace a submodule's `.git` file in the clone (probed); crew's git commands
-  there recurse into submodules, and the fingerprint does not cover those files yet.
+- Submodules have two tests: an update the user commits on a crew branch, and an agent swapping
+  a submodule's `.git`. Nested submodules and a submodule the user adds mid-plan are handled in
+  `_gitlinks()` but untested, and no real sandboxed worker was used to make the swap.
 - The `tokens` metric is approximate: the two CLIs count differently.

@@ -70,6 +70,10 @@ def work(prompt):
         subprocess.run(["git", "checkout", "-q", "-b", "rogue"], check=False)
     if os.environ.get("FAKE_BREAK") == tid:
         Path("broken").write_text("x")
+    if os.environ.get("FAKE_SUBGIT") == tid:
+        import subprocess
+        os.remove("lib/.git")  # the submodule's one-line git file ...
+        subprocess.run(["git", "init", "-q", "lib"], check=False)  # ... replaced by a repository of the agent's own
     status = json.loads(os.environ.get("FAKE_STATUS", "{}")).get(tid, "done")
     return status, f"{tid} {status}"
 '''
@@ -1451,6 +1455,62 @@ class TestThreeThree(CrewTest):
         r = self.crew("usage", check=False)
         self.assertNotIn("Traceback", r.stderr)
         self.assertIn(r.returncode, (0, 1))
+
+
+class TestContainment(CrewTest):
+    """What keeps a worker contained can't be dropped by accident or swapped out by an agent (crew 3.4)."""
+
+    def workers(self):
+        return [c for c in self.calls() if "argv" in c and not c.get("planner")]
+
+    def test_extra_worker_flags_keep_the_sandbox(self):
+        root = self.repo()
+        self.write_cfg({"providers": {"claude": {"args": ["--verbose"]}, "codex": {"args": ["--color", "never"]}}})
+        r = self.crew("go", "x", "--workdir", str(root))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        claude = [c["argv"] for c in self.workers() if c["p"] == "claude"]
+        codex = [c["argv"] for c in self.workers() if c["p"] == "codex"]
+        self.assertTrue(claude and codex)
+        for a in claude:
+            self.assertIn("--verbose", a)
+            self.assertEqual(a[a.index("--permission-mode") + 1], "acceptEdits")
+            sandbox = json.loads(a[a.index("--settings") + 1])["sandbox"]
+            self.assertIs(sandbox["enabled"], True)
+            self.assertIs(sandbox["allowUnsandboxedCommands"], False)
+            deny = sandbox["filesystem"]["denyWrite"]
+            self.assertIn(str(root), deny)  # your checkout
+            self.assertTrue(any(d.endswith("/.git") for d in deny))  # the copy's git directory
+        for a in codex:
+            self.assertIn("--color", a)
+            self.assertEqual(a[a.index("--sandbox") + 1], "workspace-write")
+
+    def test_a_sandbox_you_turn_off_yourself_gets_no_shell(self):
+        root = self.repo()
+        self.write_cfg({"providers": {"codex": {"enabled": False},
+                                      "claude": {"args": ["--settings", '{"sandbox": {"enabled": false}}']}}})
+        r = self.crew("do", "x", "--workdir", str(root))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        for c in self.workers():
+            settings = json.loads(c["argv"][c["argv"].index("--settings") + 1])
+            self.assertIs(settings["sandbox"]["enabled"], False)  # your explicit choice is kept
+            self.assertNotIn("--allowedTools", c["argv"])  # but then no unprompted shell
+
+    def test_a_submodule_git_file_replaced_by_an_agent_stops_crew(self):
+        super_, s1, s2 = TestThreeThree.submodule_repo(self)
+        fileenv = {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "protocol.file.allow",
+                   "GIT_CONFIG_VALUE_0": "always"}
+        r = self.crew("go", "x", "--workdir", str(super_), env={**fileenv, "FAKE_SUBGIT": "t1"}, check=False)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("submodule `lib`", r.stdout)
+        self.assertIn("stopped without running git there", r.stdout)
+        plan = self.latest_plan(super_)
+        self.assertFalse(plan["tasks"][0].get("commit"))  # nothing was committed after the swap
+        self.assertEqual(sh(super_, "git", "branch", "--list", "crew*").strip(), "")  # nothing was delivered
+        n = len(self.workers())
+        r = self.crew("run", "--workdir", str(super_), env=fileenv, check=False)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)  # still refused on the next run
+        self.assertIn("submodule `lib`", r.stdout)
+        self.assertEqual(len(self.workers()), n)  # and before any agent starts
 
 
 class TestQueue(CrewTest):

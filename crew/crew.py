@@ -46,7 +46,7 @@ except ImportError:  # Windows: thread locks only
 if sys.version_info < (3, 9):
     sys.exit("crew needs Python 3.9 or newer")
 
-VERSION = "3.3"
+VERSION = "3.4"
 HERE = Path(__file__).resolve().parent
 CREW_HOME = Path(os.path.expanduser(os.environ.get("CREW_HOME") or "~/.crew"))
 PROVIDERS = ("claude", "codex")
@@ -1426,22 +1426,43 @@ def _parse_structured(res: Result) -> None:
             res.structured = json.loads(res.text)
 
 
-def _with_deny_write(args: list[str], paths: list[str]) -> list[str]:
-    """Add paths to the sandbox's denyWrite in the --settings JSON crew passes to Claude."""
-    out = list(args)
-    for i in range(len(out) - 1):
-        if out[i] == "--settings":
-            try:
-                data = json.loads(out[i + 1])
-            except ValueError:
-                return out
-            if isinstance(data, dict) and isinstance(data.get("sandbox"), dict):
-                fs = data["sandbox"].setdefault("filesystem", {})
-                if isinstance(fs, dict):
-                    fs["denyWrite"] = list(dict.fromkeys([*(fs.get("denyWrite") or []), *paths]))
-                    out[i + 1] = json.dumps(data)
-            return out
-    return out
+CLAUDE_SANDBOX = {"enabled": True, "autoAllowBashIfSandboxed": True, "allowUnsandboxedCommands": False}
+CODEX_SANDBOX_FLAGS = ("--sandbox", "-s", "--dangerously-bypass-approvals-and-sandbox")
+
+
+def _claude_worker_args(args: list[str], deny: list[str]) -> tuple[list[str], bool]:
+    """The worker flags for Claude: the configured `args`, plus whatever they leave out of what
+    keeps a worker contained. `args` exists to add flags, so a config that sets it must not lose
+    the permission mode, the sandbox or the write denials by leaving them out; a key the config
+    does set is kept. Returns (flags, is the sandbox on with its escape hatch off?)."""
+    out: list[str] = []
+    for a in args:  # --settings=x becomes --settings x
+        out += ["--settings", a.split("=", 1)[1]] if a.startswith("--settings=") else [a]
+    if "--permission-mode" not in out and "--dangerously-skip-permissions" not in out:
+        out = ["--permission-mode", "acceptEdits", *out]
+    data: dict = {}
+    at = next((i for i in range(len(out) - 1) if out[i] == "--settings"), -1)
+    if at >= 0:
+        raw = out[at + 1]
+        try:
+            data = json.loads(raw) if raw.lstrip().startswith("{") else _read_json(Path(raw).expanduser())
+        except (OSError, ValueError) as e:
+            raise ValueError(f"providers.claude.args: crew can't read the --settings value ({short(str(e), 120)}). "
+                             "Give JSON or a JSON file, so crew can add its sandbox rules to it.") from None
+    sb = data.setdefault("sandbox", {}) if isinstance(data, dict) else None
+    fs = sb.setdefault("filesystem", {}) if isinstance(sb, dict) else None
+    if not isinstance(fs, dict):
+        raise ValueError("providers.claude.args: --settings must be a JSON object whose `sandbox` and "
+                         "`sandbox.filesystem`, if present, are objects")
+    for k, v in CLAUDE_SANDBOX.items():
+        sb.setdefault(k, v)
+    kept = fs.get("denyWrite") if isinstance(fs.get("denyWrite"), list) else []
+    fs["denyWrite"] = list(dict.fromkeys([*kept, *deny]))
+    if at >= 0:
+        out[at + 1] = json.dumps(data)
+    else:
+        out += ["--settings", json.dumps(data)]
+    return out, sb.get("enabled") is True and sb.get("allowUnsandboxedCommands") is False
 
 
 def run_claude(cfg: dict, prompt: str, workdir: Path, *, schema: dict | None = None,
@@ -1460,8 +1481,9 @@ def run_claude(cfg: dict, prompt: str, workdir: Path, *, schema: dict | None = N
     else:
         # Claude's sandbox would otherwise let it write a repo's git directory; crew's copy's .git
         # and the user's own checkout are made read-only for the agent.
-        cmd += _with_deny_write(list(pc.get("args") or []), deny_write or [])
-        if pc.get("sandboxed_bash", True) and claude_sandbox_ready():
+        args, contained = _claude_worker_args(list(pc.get("args") or []), deny_write or [])
+        cmd += args
+        if pc.get("sandboxed_bash", True) and contained and claude_sandbox_ready():
             # Every shell command then runs in the sandbox without a prompt (the settings above
             # turn off its escape hatch). Never granted when the sandbox can't start.
             cmd += ["--allowedTools", "Bash"]
@@ -1504,7 +1526,13 @@ def run_codex(cfg: dict, prompt: str, workdir: Path, *, schema: dict | None = No
             sf = Path(tmp) / "schema.json"
             sf.write_text(json.dumps(schema))
             cmd += ["--output-schema", str(sf)]
-        cmd += ["--sandbox", "read-only"] if read_only else list(pc.get("args") or [])
+        if read_only:
+            cmd += ["--sandbox", "read-only"]
+        else:
+            args = list(pc.get("args") or [])
+            if not any(a in CODEX_SANDBOX_FLAGS or a.startswith("--sandbox=") for a in args):
+                args = ["--sandbox", "workspace-write", *args]  # `args` adds flags; it never drops the sandbox
+            cmd += args
         cmd += ["-"]  # prompt on stdin
         rc, out, err, secs = _exec(cmd, prompt, workdir, pc.get("timeout_sec", 1800), provider_env("codex"))
         text = last.read_text(errors="replace").strip() if last.exists() else ""
@@ -2108,6 +2136,51 @@ class Run:
                 with contextlib.suppress(OSError):
                     lock.unlink()
                     log(f"note: removed a stale {lock.name} left by an interrupted git command")
+        if isinstance(self.git.get("gitlinks"), dict) and self.git["gitlinks"]:
+            self._gitlinks(self.git["gitlinks"])
+
+    def _gitlinks(self, expected: dict | None = None) -> dict:
+        """{submodule path: what stands at its `.git`} in crew's copy, nested submodules included.
+        A submodule's `.git` is a one-line file pointing into the copy's own .git, which no sandbox
+        can write. The file itself sits in the working tree, where an agent can replace it with a
+        repository of its own, and crew's git commands (status, add, submodule update) would then
+        obey that repository's configuration, outside any sandbox. With `expected`, each path must
+        be as recorded (or gone; a path that is new must have nothing there yet), and that is
+        checked before git is run inside it. Raises ValueError otherwise."""
+        found: dict[str, str] = {}
+
+        def walk(repo: Path, prefix: str, depth: int) -> None:
+            r = git(repo, "ls-files", "-s", "-z")  # reads the index only
+            if r.returncode != 0:
+                raise ValueError(f"could not list the submodules of {repo}: {short(r.stderr, 200)}")
+            for entry in r.stdout.split("\0"):
+                meta, _, path = entry.partition("\t")
+                if not meta.startswith("160000 ") or not path:
+                    continue
+                name, dot = prefix + path, repo / path / ".git"
+                if dot.is_symlink():
+                    state = "a symbolic link"
+                elif dot.is_file():
+                    state = "file " + dot.read_text(errors="replace").strip()[:400]
+                elif dot.exists():
+                    state = "a directory"
+                else:
+                    state = "none"
+                if expected is not None and state != "none" and state != expected.get(name, "none"):
+                    was = expected.get(name, "none")
+                    raise ValueError(
+                        f"the submodule `{name}` in crew's copy {self.workdir} has a different `.git` than when "
+                        f"crew last looked (it was {'absent' if was == 'none' else 'a git file'}, it is now "
+                        f"{state if not state.startswith('file ') else 'a git file with other contents'}). A "
+                        "repository placed there would have its configuration obeyed by crew's own git "
+                        "commands, so crew stopped without running git there. Inspect it; `crew clean --all` "
+                        f"and `crew run {self.path}` start the copy over.")
+                found[name] = state
+                if state.startswith("file ") and depth < 10:
+                    walk(repo / path, name + "/", depth + 1)
+
+        walk(self.workdir, "", 0)
+        return found
 
     def _publish(self) -> bool:
         """Update the user's repo's crew branch from crew's clone (fast-forward only)."""
@@ -2242,6 +2315,7 @@ class Run:
                         t.pop(k, None)
                     t["status"] = "pending"
             g["git_fingerprint"] = self._git_fingerprint()
+            g["gitlinks"] = self._gitlinks()  # nothing but crew and setup has been in this copy yet
             g.pop("creating", None)
             self.save()
         else:
@@ -2310,6 +2384,12 @@ class Run:
         if g.get("sync_submodules"):  # journaled by _adopted(): repeated here until it has worked
             self._sync_submodules()
             g.pop("sync_submodules", None)
+            self.save()
+        # Checked above against the record; taken again because your commits can add or drop a
+        # submodule. A new one must have nothing at its `.git` yet (no --init is ever run here).
+        links = self._gitlinks(g.get("gitlinks") if isinstance(g.get("gitlinks"), dict) else None)
+        if links != g.get("gitlinks"):
+            g["gitlinks"] = links
             self.save()
         if g.get("published") != (g.get("tip") or g["base"]) and (g.get("tip") or g["base"]) != g["base"]:
             self._publish()
@@ -2584,6 +2664,8 @@ class Run:
             task["commit"] = sha
             g["tip"] = sha
             g["git_fingerprint"] = self._git_fingerprint()
+            if isinstance(g.get("gitlinks"), dict):
+                g["gitlinks"] = self._gitlinks(g["gitlinks"])  # the commit may have dropped a submodule
         left = ([f"nested git repository {n}" for n in nested] + ([problem] if problem else [])
                 + (["uncommitted changes to tracked files"] if tracked_dirty(wt) else []))
         if left:
@@ -2726,6 +2808,7 @@ class Run:
                 log(f"     review: git -C {self.root} log --stat {g['base'][:10]}..{g['branch']}   "
                     f"merge: git -C {self.root} merge {g['branch']}")
             wt = self.workdir
+            self._check_git_integrity()  # the checks ran the agents' code in this copy since crew last looked
             leftovers = wt.is_dir() and (tracked_dirty(wt) or any(
                 not is_generated(f) and not is_sandbox_stub(wt / f)
                 for f in untracked(wt) - set(g.get("untracked_base") or [])))
