@@ -14,6 +14,10 @@ found and fixed. Do not relax them for convenience. `ASSURANCE.md` holds the evi
    checkout and never in a linked worktree: Claude's sandbox can write a linked worktree's
    shared `.git`. Claude workers get `sandbox.filesystem.denyWrite` for the clone's `.git` and
    the user's repo root; Codex's `workspace-write` keeps `.git` read-only on its own.
+   The branch in the user's repo is the user's to move or delete: read it fresh on every run
+   (`rb`), correct `git.published` from it, and compare ancestry inside the clone, which holds
+   both sides once fetched. The user's repo doesn't have crew's commits until they are published.
+   Commits that were refused stay in the clone; `clean` keeps such a clone unless `--all`.
 2. **Agent-modified code never runs outside a sandbox.** Setup (network, unsandboxed) runs only
    on the base commit in a fresh clone, before any agent has run there; in place (`--no-git`)
    only before the first task ever runs. Checks run inside `codex sandbox -P :workspace`, or
@@ -25,9 +29,17 @@ found and fixed. Do not relax them for convenience. `ASSURANCE.md` holds the evi
    The planner is read-only: Claude `--permission-mode plan --tools Read,Grep,Glob`, Codex
    `--sandbox read-only`. Every Claude call uses `--setting-sources user` so repo settings
    (hooks, `defaultMode`, allow rules) are ignored.
+   crew's own state drives unsandboxed execution (the config names the CLIs and their flags,
+   profiles hold setup commands), so it must sit where no sandbox can write:
+   `require_safe_home()` refuses to run agents with `CREW_HOME` or the config file in a temp
+   directory unless `CREW_ALLOW_TEMP_HOME` is set. `$HOME` (global git config, `~/.claude`,
+   `~/.codex`, `~/.crew`) is trusted; do not neutralise global git config, which would break
+   `safe.directory` and hosted git settings.
 3. **Journal before you act.** Any step that changes a repo or a clone is written to the plan
    file first: `git.creating`, `task.untracked_before`, `task.status = running`,
    `task.committing`, `git.removing`. `_reconcile()` finishes or undoes what a crash cut off.
+   Long git commands (clone, checkout, fetch) run with `git(..., track=True)`, so they are in
+   the pid file and `reap_orphans()` stops them before a resume touches the clone.
    A task counts as done only if its `crew(<id>):` commit is on the branch. Never add a
    mutating step without a journal key and a resume path, and add a `crash_point()` for it.
 4. **Commits hold only the task's work.** New files are `untracked() - untracked_before`, minus
@@ -42,7 +54,10 @@ found and fixed. Do not relax them for convenience. `ASSURANCE.md` holds the evi
 6. **One writer at a time.** `file_lock()` (fcntl + thread lock) guards each plan run, `queue
    run`, the queue, state, ledger, profiles and pid files. Writes go through `_write_json`
    (tmp + fsync + rename). `reap_orphans()` kills CLIs a dead crew left behind, matched by pid
-   and start time.
+   and start time. Each clone belongs to one plan file, named by `<clone>.plan`:
+   `_claim_copy()` writes it on every run and refuses a clone another live plan owns; `clean`
+   uses it to find plans saved with `--out`. Plans outside `~/.crew/plans` get a path hash in
+   their branch name (`_branch_name`).
 7. **Nothing read from disk or a CLI is trusted.** Validate types (`num()`, `load_config`,
    `load_profile`, `validate_plan`, the plan `git` block), reject control characters in task
    fields, decode subprocess output with `errors="surrogateescape"` (git) or `"replace"`, treat
@@ -81,5 +96,7 @@ found and fixed. Do not relax them for convenience. `ASSURANCE.md` holds the evi
 - Nothing has been run on macOS or Windows. On Windows `fcntl` is absent, so locks are
   per-process only, and `codex sandbox` is unavailable, so checks are skipped.
 - Both CLI sandboxes allow writes under the temp directory. Repos kept under `/tmp` lose
-  isolation; crew warns.
+  isolation; crew warns. (crew's own home there is refused, see law 2.)
+- Two plan files written before 3.2 that already name the same branch are refused only while
+  one of them has a live clone; after that they share the branch.
 - The `tokens` metric is approximate: the two CLIs count differently.

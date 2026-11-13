@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -151,7 +152,7 @@ class CrewTest(unittest.TestCase):
         self.log = self.tmp / "calls.jsonl"
         self.cfg = self.tmp / "cfg.json"
         self.write_cfg({})
-        self.env = dict(os.environ, CREW_HOME=str(self.home), FAKE_LOG=str(self.log),
+        self.env = dict(os.environ, CREW_HOME=str(self.home), FAKE_LOG=str(self.log), CREW_ALLOW_TEMP_HOME="1",
                         GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t",
                         GIT_COMMITTER_EMAIL="t@t")
         for k in ("ANTHROPIC_API_KEY", "CODEX_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"):
@@ -847,6 +848,229 @@ class TestCopyEngine(CrewTest):
         self.crew("run", "--workdir", str(root), "--no-git", "--retry-failed")
         self.crew("do", "y", "--workdir", str(root), "--no-git")
         self.assertNotIn("EVIL", log.read_text())
+
+
+class TestPublishAndOwnership(CrewTest):
+    """Getting crew's commits into the user's repo when git refuses at first, and keeping each
+    copy with the one plan that owns it (the 3.1 review's findings)."""
+
+    def plan_of(self, root):
+        return self.latest_plan(root)
+
+    def workers(self):
+        return [c for c in self.calls() if "argv" in c and not c.get("planner")]
+
+    def files_on(self, root, branch):
+        return sh(root, "git", "ls-tree", "-r", "--name-only", branch).split()
+
+    def refused_publish(self, name="proj"):
+        """t1 done and published, the clone gone; then the user checks the crew branch out and
+        retries t2, which commits a new file that git refuses to copy into a checked-out branch."""
+        root = self.repo(name)
+        self.crew("go", "x", "--workdir", str(root), env={"FAKE_STATUS": json.dumps({"t2": "partial"})})
+        plan = self.plan_of(root)
+        branch, wt = plan["git"]["branch"], Path(plan["git"]["worktree"])
+        self.assertFalse(wt.exists())
+        sh(root, "git", "checkout", "-q", branch)  # reviewing crew's branch
+        r = self.crew("run", "--workdir", str(root), "--retry-failed",
+                      env={"FAKE_EDIT": json.dumps({"extra.txt": "more\n"})})
+        return root, branch, wt, r
+
+    def test_refused_publish_is_kept_and_delivered_on_the_next_run(self):
+        root, branch, wt, r = self.refused_publish()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)  # the copy was rebuilt with the branch checked out
+        self.assertIn(f"you have {branch} checked out", r.stdout)
+        self.assertIn("couldn't update", r.stdout)
+        self.assertIn("refusing to fetch", r.stdout)  # git's own reason, not an empty one
+        self.assertTrue(wt.exists())  # the only place the new commit lives
+        self.assertNotIn("extra.txt", self.files_on(root, branch))
+        self.assertEqual(sh(root, "git", "status", "--porcelain"), "")  # the checkout itself was left alone
+        self.assertIn("only in crew's copy", self.crew("plans", "--workdir", str(root)).stdout)
+        r = self.crew("clean")
+        self.assertIn("aren't in your repo yet", r.stdout)
+        self.assertTrue(wt.exists())  # plain `clean` never discards commits
+        sh(root, "git", "checkout", "-q", "main")
+        n = len(self.workers())
+        r = self.crew("run", "--workdir", str(root))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("diverged", r.stdout)
+        self.assertIn("extra.txt", self.files_on(root, branch))
+        self.assertEqual(self.plan_of(root)["git"]["published"], sh(root, "git", "rev-parse", branch).strip())
+        self.assertFalse(wt.exists())
+        self.assertFalse(Path(f"{wt}.plan").exists())
+        self.assertEqual(len(self.workers()), n)  # nothing ran again
+
+    def test_clean_all_says_when_it_discards_commits(self):
+        root, branch, wt, r = self.refused_publish()
+        r = self.crew("clean", "--all")
+        self.assertIn("never reached your repo", r.stdout)
+        self.assertFalse(wt.exists())
+
+    def test_deleted_crew_branch_is_put_back(self):
+        root = self.repo()
+        self.crew("go", "x", "--workdir", str(root), env={"FAKE_STATUS": json.dumps({"t2": "partial"})})
+        branch = self.plan_of(root)["git"]["branch"]
+        sh(root, "git", "branch", "-q", "-D", branch)
+        r = self.crew("run", "--workdir", str(root), "--retry-failed")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(sh(root, "git", "log", "--format=%s", f"main..{branch}").splitlines(),
+                         ["crew(t2): second", "crew(t1): first"])  # done means the branch is really there
+        self.assertEqual(self.plan_of(root)["git"]["published"], sh(root, "git", "rev-parse", branch).strip())
+        sh(root, "git", "branch", "-q", "-D", branch)  # e.g. merged and deleted
+        r = self.crew("run", "--workdir", str(root))
+        self.assertIn("no longer in your repo", r.stdout)
+        self.assertNotIn("its work is on", r.stdout)
+
+    def test_rebuilt_copy_of_an_out_of_tree_plan_is_safe_from_clean(self):
+        root = self.repo()
+        out = self.tmp / "myplans" / "p.json"
+        self.crew("go", "x", "--workdir", str(root), "--out", str(out), env={"CREW_CRASH_AT": "before-commit"},
+                  check=False)
+        wt = Path(json.loads(out.read_text())["git"]["worktree"])
+        self.crew("clean", "--all")
+        self.assertFalse(wt.exists())
+        self.assertFalse(Path(f"{wt}.plan").exists())
+        run = subprocess.Popen([sys.executable, str(HERE / "crew.py"), "--config", str(self.cfg), "run", str(out)],
+                               env={**self.env, "FAKE_SLEEP": "3"}, stdout=subprocess.PIPE, text=True)
+        for _ in range(100):  # until the copy has been rebuilt and an agent is working in it
+            if self.workers() and (wt / ".git").is_dir():
+                break
+            time.sleep(0.1)
+        self.assertEqual(Path(f"{wt}.plan").read_text(), str(out.resolve()))  # written again on the rebuild
+        r = self.crew("clean", "--all")
+        self.assertIn("its plan is running", r.stdout)
+        self.assertTrue(wt.exists())
+        run.communicate(timeout=60)
+        self.assertEqual(run.returncode, 0)
+
+    def test_plans_with_the_same_file_name_never_share_a_copy(self):
+        root = self.repo()
+        a, c = self.tmp / "a" / "p.json", self.tmp / "c" / "p.json"
+        crash = {"CREW_CRASH_AT": "before-commit"}
+        self.crew("go", "x", "--workdir", str(root), "--out", str(a), env=crash, check=False)
+        self.crew("clean", "--all")  # a's copy and pointer are gone; only its plan file names the branch
+        self.crew("go", "x", "--workdir", str(root), "--out", str(c), env=crash, check=False)
+        ga, gc = (json.loads(p.read_text())["git"] for p in (a, c))
+        self.assertNotEqual(ga["branch"], gc["branch"])
+        self.assertNotEqual(ga["worktree"], gc["worktree"])
+        r = self.crew("run", str(a))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue((Path(gc["worktree"]) / "t1.txt").exists())  # c's unfinished work is still there
+        r = self.crew("run", str(c))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("runs again", r.stdout)
+        for g in (ga, gc):
+            self.assertEqual(sorted(self.files_on(root, g["branch"])), ["README.md", "t1.txt", "t2.txt"])
+
+    def test_a_copy_that_belongs_to_another_plan_is_refused(self):
+        root = self.repo()
+        a, b = self.tmp / "a" / "p.json", self.tmp / "b" / "q.json"
+        self.crew("go", "x", "--workdir", str(root), "--out", str(a), env={"CREW_CRASH_AT": "before-commit"},
+                  check=False)
+        b.parent.mkdir()
+        shutil.copy(a, b)  # a second plan file that names the same branch and copy
+        r = self.crew("run", str(b), check=False)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("belongs to another plan", r.stdout)
+        self.assertEqual(len(self.workers()), 1)  # no agent ran for the intruder
+        r = self.crew("run", str(a))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_non_fast_forward_refusal_gives_the_reason_then_reports_divergence(self):
+        root = self.repo()
+        self.crew("go", "x", "--workdir", str(root), env={"CREW_CRASH_AT": "after-commit"}, check=False)
+        branch = self.plan_of(root)["git"]["branch"]
+        tree = sh(root, "git", "rev-parse", "main^{tree}").strip()
+        mine = sh(root, "git", "-c", "user.name=t", "-c", "user.email=t@t", "commit-tree", tree, "-p", "main",
+                  "-m", "mine").strip()
+        sh(root, "git", "update-ref", f"refs/heads/{branch}", mine)  # a commit crew's copy doesn't have
+        r = self.crew("run", "--workdir", str(root))
+        self.assertIn("couldn't update", r.stdout)
+        self.assertIn("non-fast-forward", r.stdout)
+        self.assertTrue(Path(self.plan_of(root)["git"]["worktree"]).exists())
+        self.assertEqual(sh(root, "git", "rev-parse", branch).strip(), mine)  # your branch was not overwritten
+        r = self.crew("run", "--workdir", str(root), check=False)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("have diverged", r.stdout)
+        # the way out crew names: merge crew's commits into your branch, then run again
+        wt = self.plan_of(root)["git"]["worktree"]
+        sh(root, "git", "checkout", "-q", branch)
+        sh(root, "git", "fetch", "-q", wt, branch)
+        sh(root, "git", "-c", "user.name=t", "-c", "user.email=t@t", "merge", "-q", "-m", "both", "FETCH_HEAD")
+        sh(root, "git", "checkout", "-q", "main")
+        r = self.crew("run", "--workdir", str(root))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("continuing from your own commits", r.stdout)
+        self.assertFalse(Path(wt).exists())
+        self.assertEqual(sorted(self.files_on(root, branch)), ["README.md", "t1.txt", "t2.txt"])
+
+    def test_long_git_commands_are_recorded_and_reaped(self):
+        root = self.repo()
+        pids = self.tmp / "run.pids"
+        got = {}
+
+        def tracked():
+            crew._TL.pidfile = pids
+            got["r"] = crew.git(root, "-c", "alias.slow=!sleep 60", "slow", track=True, timeout=120)
+
+        old = crew.CREW_HOME
+        crew.CREW_HOME = self.home
+        try:
+            t = threading.Thread(target=tracked)
+            t.start()
+            for _ in range(100):
+                if pids.exists() and pids.read_text().strip():
+                    break
+                time.sleep(0.1)
+            self.assertTrue(pids.read_text().strip())  # a crew killed now would leave a record of this git
+            crew.reap_orphans(pids)  # what the next run does first
+            t.join(30)
+            self.assertFalse(t.is_alive())
+            self.assertNotEqual(got["r"].returncode, 0)
+        finally:
+            crew.CREW_HOME = old
+
+    def test_home_in_a_temp_directory_is_refused_without_the_opt_in(self):
+        root = self.repo()
+        self.assertTrue(crew.in_temp_dir(Path(tempfile.gettempdir()) / "x" / "y"))
+        self.assertFalse(crew.in_temp_dir(Path("/usr/lib")))
+        for cmd in ("do", "go"):
+            r = self.crew(cmd, "x", "--workdir", str(root), env={"CREW_ALLOW_TEMP_HOME": ""}, check=False)
+            self.assertEqual(r.returncode, 2, r.stdout)
+            self.assertIn("inside a temp directory", r.stdout)
+            self.assertIn("CREW_ALLOW_TEMP_HOME", r.stdout)
+        self.assertEqual(self.calls(), [])  # refused before the planner or any agent was called
+        self.crew("plan", "x", "--workdir", str(root), env={"CREW_ALLOW_TEMP_HOME": ""})
+        r = self.crew("run", "--workdir", str(root), env={"CREW_ALLOW_TEMP_HOME": ""}, check=False)
+        self.assertEqual(r.returncode, 2)
+        self.assertEqual(self.workers(), [])
+        self.assertEqual(sh(root, "git", "branch", "--list").split(), ["*", "main"])
+        self.crew("queue", "add", "g", "--workdir", str(root))
+        n = len(self.calls())
+        r = self.crew("queue", "run", env={"CREW_ALLOW_TEMP_HOME": ""}, check=False)
+        self.assertEqual(r.returncode, 2)
+        self.assertEqual(len(self.calls()), n)  # not even a planner call
+        self.assertIn(self.crew("usage", env={"CREW_ALLOW_TEMP_HOME": ""}).returncode, (0, 1))  # reading is fine
+
+    def test_profile_without_a_name_is_a_clear_error(self):
+        root = self.repo()
+        self.crew("init", "--workdir", str(root))
+        key, _ = crew.project_identity(root)
+        path = self.home / "projects" / f"{key}.json"
+        prof = json.loads(path.read_text())
+        del prof["project"]["name"]
+        path.write_text(json.dumps(prof))
+        r = self.crew("projects")
+        self.assertIn("project.name must be", r.stdout)
+        self.assertNotIn("Traceback", r.stderr)
+        for args in (("queue", "add", "g", "--workdir", str(root)), ("queue", "add", "g", "--all")):
+            r = self.crew(*args, check=False)
+            self.assertEqual(r.returncode, 2, r.stdout)
+            self.assertNotIn("Traceback", r.stderr)
+            self.assertIn("project.name must be", r.stdout)
+        self.assertIn("queue is empty", self.crew("queue", "list").stdout)  # --all didn't queue the current folder
+        self.crew("init", "--workdir", str(root), "--force")
+        self.assertNotIn("project.name must be", self.crew("projects").stdout)
 
 
 class TestQueue(CrewTest):

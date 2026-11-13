@@ -1,7 +1,7 @@
 # crew: rules applied to facts
 
 A record of what crew promises, what was established while building it, and whether each
-promise holds on the evidence. Written on 2026-11-13 for crew 3.1. `CLAUDE.md` states the rules
+promise holds on the evidence. Written on 2026-11-13 for crew 3.1 and updated the same day for 3.2. `CLAUDE.md` states the rules
 for changing crew; `README.md` states the promises to users. This file joins them to the facts.
 
 ## 1. Facts
@@ -38,10 +38,11 @@ and the test fixtures were built around these shapes.
 | 2.0 | Global install, per-project profiles, detected setup/checks, branch per run, queue across projects | 4 + 4 | 21 confirmed, all fixed |
 | 2.1 | Locks, CLI contract check, journaled task state, `crew do` | fault-injection hunt, 4 + 4 | 30 confirmed, all fixed |
 | 3.0 | Separate worktree per plan, journaled commits, orphan reaping, setup only on base commit | 4 + 4 | about 25 confirmed, all fixed |
-| 3.1 | Standalone clone instead of linked worktree, sandbox denies git writes, journaled clone lifecycle, checks tied to the verified commit | 3 hunters | **did not run**: weekly usage limit; relaunched 2026-11-13 |
+| 3.1 | Standalone clone instead of linked worktree, sandbox denies git writes, journaled clone lifecycle, checks tied to the verified commit | 3 hunters + 3 verifiers (the first attempt, 2026-11-06, died on the weekly usage limit; rerun 2026-11-13) | 11 confirmed (10 distinct), 2 refuted; all confirmed fixed in 3.2 |
+| 3.2 | Refused commits delivered on the next run, the user's branch re-read every run, one plan per clone, hashed branch names for `--out` plans, tracked git processes, refusal to run with crew's home in a temp directory | none yet; the 3.1 reviewers' 11 reproduction scripts were rerun on 3.2 | all 11 behave as fixed |
 
 Counts are the confirmed findings reported at the end of each round; some defects were found
-by more than one reviewer, so the distinct total is somewhat lower than their sum (about 100). Every finding a verifier confirmed was fixed and got
+by more than one reviewer, so the distinct total is somewhat lower than their sum (about 110). Every finding a verifier confirmed was fixed and got
 a test. Findings the verifiers refuted were left alone, and are listed in section 4.
 
 ### Real runs (Claude haiku workers, Codex sandbox for checks)
@@ -54,6 +55,10 @@ a test. Findings the verifiers refuted were left alone, and are listed in sectio
   `crew/` branch, and the worktree was removed.
 - 3.1: the same bot and a static HTML site; both finished `done`. The user checkouts changed
   only in `.git` (the new `crew/...` ref). The static-site link check ran before and after.
+- 3.2: a small Python project with a modified tracked file and an untracked file, through
+  `crew do`. The checkout's files, HEAD and `git status` were identical afterwards, both checks
+  passed in the sandbox before and after, one commit landed on the `crew/` branch, and the
+  clone was removed.
 
 ### Direct probes of the two sandboxes (this machine)
 
@@ -74,6 +79,18 @@ a test. Findings the verifiers refuted were left alone, and are listed in sectio
   standalone clone plus `denyWrite`.
 - Codex `sandbox -P :workspace`: writes inside the workspace allowed, `.git` read-only,
   `/root` read-only, network refused, `/tmp` allowed, exit codes passed through.
+- Codex `sandbox -P :workspace` with crew's home under `/tmp` (reviewer-confirmed, 3.1): crew's
+  `config.json`, a project profile, another plan's clone and the `.plan` pointer were all
+  writable, and a setup command written into the profile from inside the sandbox ran
+  unsandboxed as root on the next run. The same layout under `/root` was read-only on every
+  target. This is why 3.2 refuses a home in a temp directory.
+- Real Claude worker (haiku) and the real Codex sandbox against the 3.1 clone, home outside
+  `/tmp` (reviewer, 3.1): neither could write the clone's `.git`, the user's repo, crew's home,
+  a sibling clone or `$HOME`.
+- `git clone --no-checkout` of a repo whose HEAD is on `crew/x` gives the clone a local branch
+  `crew/x`, so `checkout -b crew/x` fails there (reviewer-confirmed). `git fetch -q` prints
+  nothing when it rejects a non-fast-forward. A local clone copies unreachable objects too, so
+  a deleted branch's commits still exist in a fresh clone.
 - Codex `exec --json`: emits `{"type":"error","message":"Reconnecting..."}` on transient
   failures and then succeeds; `codex login status` exits 1 even when `CODEX_API_KEY` is set
   although `exec` authenticates with it.
@@ -94,13 +111,13 @@ independent reviewer reproduced the defect on the old code and confirmed the fix
 
 | Rule | Evidence | Gaps |
 |---|---|---|
-| R1 Your work is safe | T: `test_users_checkout_is_never_touched`, `test_users_repo_gets_no_crew_or_cli_files`, `test_claude_gets_write_denied_on_crew_git_and_users_checkout`, `test_agent_switching_branch_stops_without_committing`, `test_plan_git_block_must_name_a_crew_branch`, `test_your_commits_on_the_crew_branch_are_built_on`. R: 3.0 and 3.1 runs with dirty checkouts, file hashes unchanged. P: `denyWrite` probe. V: the linked-worktree escape (3.0) was the reason for the clone; the clone itself has not been independently attacked yet. | Codex worker never run with a real login (its sandbox was probed directly). Repos under `/tmp` are writable by both sandboxes. 3.1 security hunt pending. |
-| R2 Crashes don't lose or repeat work | T: `test_crash_points_resume_without_losing_or_repeating_work` (branch-recorded, before-commit, after-commit), `test_crash_while_making_the_copy_or_removing_it_resumes` (clone-made, removing), `test_sigkill_mid_task_kills_the_orphan_and_keeps_its_files`, `test_copy_removed_with_uncommitted_work_reruns_the_task`, `test_recovered_commit_is_verified_again`, `test_interrupted_task_resumes_with_a_note`, `test_usage_limit_pauses_with_task_pending`, `test_atomic_write_leaves_no_temp_files`. V: reviewers killed 3.0 with real SIGKILL at each of these points and confirmed the fixes on patched copies; the 3.1 clone lifecycle has not been independently killed yet. | Kill during `git clone` or during publish (fetch into the user's repo) is journaled but not covered by a test. Disk-full during a plan save was reproduced by a reviewer on 2.x and fixed (`_write_json` cleans up; `record_usage` is best effort) without a test. |
-| R3 One run per plan | T: `test_second_run_of_the_same_plan_is_refused`, `test_clean_leaves_running_and_out_of_tree_plans_alone`, `test_two_projects_run_in_parallel_on_both_providers`. V: reviewers ran two `crew run`s and two `queue run`s concurrently on 2.x (double execution, commits on `main`) and confirmed the lock fix. | Locks use `fcntl`; on Windows they are per-process only. 4 simultaneous `queue add` processes lost items on 2.x; fixed with `file_lock("queue")`, covered only by review, not a test. |
-| R4 Agent-modified code never runs outside a sandbox | T: `test_setup_runs_in_the_worktree_at_the_base_commit` (agent writes a `postinstall`, deletes `node_modules`; setup never runs on it), `test_in_place_setup_never_reruns_after_agents`, `test_tampered_git_config_stops_crew_before_it_runs_git`, `test_broken_codex_sandbox_skips_checks_instead_of_passing_them`, `test_incompatible_cli_is_taken_out_of_rotation`. P: both sandboxes, the no-bubblewrap case, plan-mode Bash, repo settings. V: nested-manifest and `.pth`-in-venv attacks reproduced on 2.x/3.0 and the fixes confirmed. | `~/.gitconfig` is under `/root` here, which both sandboxes keep read-only; on a machine where `HOME` is writable to a sandbox, a global git config could affect crew's own git calls. Not probed. Pending in the 3.1 security hunt. |
-| R5 Nothing is called done without evidence | T: `test_partial_blocks_dependents_until_retry`, `test_verify_regression_triggers_fix_task`, `test_preexisting_failure_is_not_a_regression`, `test_needs_review_rerun_exits_nonzero_and_does_nothing`, `test_recovered_commit_is_verified_again`, `test_queue_planning_limit_pauses_the_item`. R: 3.1 runs reported `done` only after both check passes. | Verdicts come from the model; an agent can claim `done` falsely. The checks are the backstop, and they are only as strong as the project's tests. |
+| R1 Your work is safe | T: `test_users_checkout_is_never_touched`, `test_users_repo_gets_no_crew_or_cli_files`, `test_claude_gets_write_denied_on_crew_git_and_users_checkout`, `test_agent_switching_branch_stops_without_committing`, `test_plan_git_block_must_name_a_crew_branch`, `test_your_commits_on_the_crew_branch_are_built_on`. R: 3.0 and 3.1 runs with dirty checkouts, file hashes unchanged. P: `denyWrite` probe. `test_refused_publish_is_kept_and_delivered_on_the_next_run`, `test_deleted_crew_branch_is_put_back`, `test_non_fast_forward_refusal_gives_the_reason_then_reports_divergence`. V: the linked-worktree escape (3.0) was the reason for the clone; the 3.1 round attacked the clone with a real Claude worker and the real Codex sandbox and neither wrote outside it, and every lifecycle scenario left the user's index, working tree and other refs unchanged. | Codex worker never run with a real login (its sandbox was probed directly). Repos under `/tmp` are writable by both sandboxes. 3.2 has not been independently attacked. |
+| R2 Crashes don't lose or repeat work | T: `test_crash_points_resume_without_losing_or_repeating_work` (branch-recorded, before-commit, after-commit), `test_crash_while_making_the_copy_or_removing_it_resumes` (clone-made, removing), `test_sigkill_mid_task_kills_the_orphan_and_keeps_its_files`, `test_copy_removed_with_uncommitted_work_reruns_the_task`, `test_recovered_commit_is_verified_again`, `test_interrupted_task_resumes_with_a_note`, `test_usage_limit_pauses_with_task_pending`, `test_atomic_write_leaves_no_temp_files`. V: reviewers killed 3.0 with real SIGKILL at each of these points and confirmed the fixes on patched copies; the 3.1 round killed crew at 13 points of the clone lifecycle, during setup and during `git clone`, and every resume finished without repeating a task, except that an orphaned `git clone` raced the next run (fixed in 3.2: `test_long_git_commands_are_recorded_and_reaped`). 3.2 also adds `test_refused_publish_is_kept_and_delivered_on_the_next_run` and `test_clean_all_says_when_it_discards_commits`. | A kill during the publish fetch has no test of its own; the fetch is tracked and retried. Disk-full during a plan save was reproduced by a reviewer on 2.x and fixed (`_write_json` cleans up; `record_usage` is best effort) without a test. |
+| R3 One run per plan | T: `test_second_run_of_the_same_plan_is_refused`, `test_clean_leaves_running_and_out_of_tree_plans_alone`, `test_two_projects_run_in_parallel_on_both_providers`. `test_rebuilt_copy_of_an_out_of_tree_plan_is_safe_from_clean`, `test_plans_with_the_same_file_name_never_share_a_copy`, `test_a_copy_that_belongs_to_another_plan_is_refused`. V: reviewers ran two `crew run`s and two `queue run`s concurrently on 2.x (double execution, commits on `main`) and confirmed the lock fix; on 3.1 they removed a running `--out` plan's clone with `clean --all` and made two same-named plans share a clone, both fixed in 3.2. | Locks use `fcntl`; on Windows they are per-process only. 4 simultaneous `queue add` processes lost items on 2.x; fixed with `file_lock("queue")`, covered only by review, not a test. Two plan files from before 3.2 that already name the same branch are refused only while one has a live clone. |
+| R4 Agent-modified code never runs outside a sandbox | T: `test_setup_runs_in_the_worktree_at_the_base_commit` (agent writes a `postinstall`, deletes `node_modules`; setup never runs on it), `test_in_place_setup_never_reruns_after_agents`, `test_tampered_git_config_stops_crew_before_it_runs_git`, `test_broken_codex_sandbox_skips_checks_instead_of_passing_them`, `test_incompatible_cli_is_taken_out_of_rotation`. P: both sandboxes, the no-bubblewrap case, plan-mode Bash, repo settings. `test_home_in_a_temp_directory_is_refused_without_the_opt_in`. V: nested-manifest and `.pth`-in-venv attacks reproduced on 2.x/3.0 and the fixes confirmed; on 3.1 a Codex sandbox with crew's home under `/tmp` rewrote a profile's setup command and crew ran it unsandboxed, which 3.2 refuses. | `$HOME` is trusted: the global git config, `~/.claude`, `~/.codex` and `~/.crew` live there and both sandboxes keep it read-only (probed on 3.1). A machine whose `HOME` a sandbox can write has no protection crew could add. With `CREW_ALLOW_TEMP_HOME=1` the temp-directory protection is off by the user's choice. |
+| R5 Nothing is called done without evidence | T: `test_partial_blocks_dependents_until_retry`, `test_verify_regression_triggers_fix_task`, `test_preexisting_failure_is_not_a_regression`, `test_needs_review_rerun_exits_nonzero_and_does_nothing`, `test_recovered_commit_is_verified_again`, `test_queue_planning_limit_pauses_the_item`. `test_deleted_crew_branch_is_put_back` (3.1 called a plan done and removed the clone while the user's repo had no branch at all). R: 3.1 runs reported `done` only after both check passes. | Verdicts come from the model; an agent can claim `done` falsely. The checks are the backstop, and they are only as strong as the project's tests. |
 | R6 Commits contain only the task's work | T: `test_generated_and_previously_ignored_files_are_never_committed` (agent un-ignores `.gitignore`, writes `__pycache__`), `test_go_branch_commits_and_return` (one commit per task, work only on the branch), `test_commit_signing_config_does_not_break_commits`, `test_existing_crew_branch_name_falls_back`. V: `__pycache__` and sandbox-stub commits reproduced on 3.0 with real Claude and fixed. | Nested git repositories an agent creates are reported, not committed; the user has to handle them. |
-| R7 Bad input gives an error, not a mess | T: `test_garbled_cli_reply_is_a_failed_attempt_not_a_crash`, `test_hostile_plans_and_goals_are_refused_before_any_agent_runs`, `test_bad_inputs_give_clean_errors`, `test_shipped_template_matches_defaults`, `test_layers_and_agent_replacement`, `test_two_checkouts_of_one_repo_keep_their_own_plans`, `test_adding_a_remote_keeps_the_profile_and_plans`. V: reviewers fed non-UTF-8 file names, NUL in task ids, 50 MB replies, wrong-typed state files, `CREW_HOME='~'`, a workdir with a trailing space, Python 3.8; each was fixed and confirmed. | Not every hostile input has its own test; the fixes for state-file typing and non-UTF-8 names are covered by review only. |
+| R7 Bad input gives an error, not a mess | T: `test_garbled_cli_reply_is_a_failed_attempt_not_a_crash`, `test_hostile_plans_and_goals_are_refused_before_any_agent_runs`, `test_bad_inputs_give_clean_errors`, `test_shipped_template_matches_defaults`, `test_layers_and_agent_replacement`, `test_two_checkouts_of_one_repo_keep_their_own_plans`, `test_adding_a_remote_keeps_the_profile_and_plans`, `test_profile_without_a_name_is_a_clear_error`. V: reviewers fed non-UTF-8 file names, NUL in task ids, 50 MB replies, wrong-typed state files, `CREW_HOME='~'`, a workdir with a trailing space, Python 3.8; each was fixed and confirmed. | Not every hostile input has its own test; the fixes for state-file typing and non-UTF-8 names are covered by review only. |
 
 Stack detection (not a guarantee, but it decides what the checks are): 12 tests cover Vite +
 TypeScript, pnpm + Svelte monorepos, Lovable's double lockfile, Python with pytest, unittest and
@@ -111,13 +128,17 @@ the detected commands for real inside `codex sandbox` on fixtures of each stack.
 
 - **R1, R2, R3, R6, R7 hold on Linux on the evidence above**, with the gaps listed. Each has
   tests that reproduce the defect that once broke it, and real runs on 3.1 behaved as promised.
-- **R4 holds on this machine.** The one unprobed path is a writable global git config, which
-  would need a `HOME` the sandboxes can write; here they cannot.
+- **R4 holds on this machine**, and since 3.2 crew refuses the one layout where a reviewer broke
+  it (its own home in a temp directory). `$HOME` is inside the trust boundary by design.
 - **R5 holds as stated**, and the statement is deliberately narrow: it is a promise about
   bookkeeping, not about correctness of the agents' code.
-- **3.1 has not been independently attacked.** The sixth review round died on the weekly usage
-  limit and was relaunched on 2026-11-13; its findings, if any, go into the next version and
-  into this file.
+- **3.1 was independently attacked on 2026-11-13**: three hunters, and a verifier that re-tested
+  each finding. 11 findings were confirmed (10 distinct) and 2 refuted. Every confirmed one is
+  fixed in 3.2 with a test that fails on 3.1, and the reviewers' own reproduction scripts,
+  rerun on 3.2, all behave as fixed. Three of the eleven broke R2 or R5 outright (commits that
+  could never be delivered, `clean` deleting undelivered commits, `done` with no branch).
+- **3.2 has not been independently attacked.** Its evidence is the 68 tests and the rerun
+  scripts. Each of the six rounds so far found defects in the version before it.
 - **Untested platforms:** macOS and Windows. Untested provider path: Codex as a worker with a
   real login.
 - **Refuted claims, left as they are:** that `acceptEdits` understates what Claude can do
@@ -126,7 +147,11 @@ the detected commands for real inside `codex sandbox` on fixtures of each stack.
   (agents already read the repo); that `reap_orphans` can kill unrelated processes (pid plus
   start time, and the pid file is outside both sandboxes); that a non-exhaustive secret-name
   denylist leaks secrets (checks have no network and no writes outside the clone; the list was
-  widened anyway).
+  widened anyway); that exit 0 and
+  `done` while the last commits are still only in crew's copy breaks R5 (`done` is defined by
+  tasks, checks and setup; the copy is kept, the next run delivers, and `crew plans` now says
+  so); that crew's git should ignore global git config (no sandbox can write `$HOME`, and
+  ignoring it would break `safe.directory` and hosted git settings).
 
 ## 5. What the facts taught, in one line each
 
@@ -140,3 +165,10 @@ the detected commands for real inside `codex sandbox` on fixtures of each stack.
 - Locks, atomic writes and start-time pid matching are what make SIGKILL survivable.
 - Every value read from JSON is untrusted, including crew's own files.
 - Each fixed defect gets a test, or it comes back.
+- A branch in the user's repo is the user's to move or delete: read it every run, never trust
+  a recorded copy of where it was.
+- Compare commits where both sides exist. The clone has the user's commits once fetched; the
+  user's repo lacks crew's until they are published.
+- State that drives unsandboxed execution must live where no sandbox can write, and crew has
+  to check that instead of assuming it.
+- Everything long-running that crew starts needs a pid record, git included.
