@@ -26,6 +26,9 @@ from pathlib import Path
 if os.environ.get("FAKE_IGNORE_TERM"):
     _signal.signal(_signal.SIGTERM, _signal.SIG_IGN)  # an agent that won't stop on a polite signal
 LOG = os.environ["FAKE_LOG"]
+if os.environ.get("FAKE_PROBE_SLEEP") and (sys.argv[1:] in (["--help"], ["exec", "--help"], ["sandbox", "--help"])
+                                            or sys.argv[1:3] in (["auth", "status"], ["login", "status"])):
+    time.sleep(float(os.environ["FAKE_PROBE_SLEEP"]))  # a CLI whose login check or --help hangs
 def record(**kw):
     kw.update(t=time.time(), pid=os.getpid(), cwd=os.getcwd())
     with open(LOG, "a") as f:
@@ -39,6 +42,12 @@ def plan():
          "depends_on": []},
         {"id": "t2", "title": "second", "agent": "Luna", "instructions": "make t2.txt", "acceptance": "exists",
          "depends_on": ["t1"]}]}
+def probe(p, what):
+    """A call that is not a task: which credentials did it come with? (Only on request: tests count calls.)"""
+    if os.environ.get("FAKE_RECORD_PROBES"):
+        record(p=p, probe=what, keys=sorted(k for k in os.environ if k in (
+            "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
+            "OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN")))
 def help_text(flags):
     drop = os.environ.get("FAKE_HELP_MISSING", "")
     print("\n".join(f for f in flags.split() if f != drop))
@@ -54,6 +63,7 @@ def work(prompt):
         return "done", "fixed"
     Path(f"{tid}.txt").write_text("work\n")
     for name, text in json.loads(os.environ.get("FAKE_EDIT", "{}")).items():
+        Path(name).parent.mkdir(parents=True, exist_ok=True)
         Path(name).write_text(text)
     if os.environ.get("FAKE_DELETE"):
         import shutil as _sh
@@ -80,6 +90,8 @@ def work(prompt):
         os.remove("lib/.git")  # the submodule's one-line git file ...
         subprocess.run(["git", "init", "-q", "lib"], check=False)  # ... replaced by a repository of the agent's own
     status = json.loads(os.environ.get("FAKE_STATUS", "{}")).get(tid, "done")
+    if os.environ.get("FAKE_SUMMARY"):  # JSON, so that it can hold what only a JSON escape can: "\\ud83d"
+        return status, json.loads(os.environ["FAKE_SUMMARY"])
     return status, f"{tid} {status}"
 '''
 
@@ -89,10 +101,11 @@ if os.environ.get("FAKE_PROBE_READS_TERMINAL") and (a == ["--help"] or a[:2] == 
     sys.stdin.read(1)  # the real CLI touches the terminal it is given, even for these two
 if a == ["--help"]:
     help_text("--print --output-format --json-schema --setting-sources --permission-mode --tools "
-              "--allowedTools --settings --model"); sys.exit(0)
+              "--allowedTools --disallowedTools --settings --model"); sys.exit(0)
 if a[:2] == ["auth", "status"]:
     sys.exit(0)
 if a and a[0] == "--version":
+    probe("claude", "version")
     print("fake-claude"); sys.exit(0)
 prompt = sys.stdin.read()
 record(p="claude", argv=a, planner="plan" in a, resumed="earlier attempt" in prompt, prompt=prompt[-3000:],
@@ -120,21 +133,37 @@ FAKE_CODEX = FAKE_COMMON + r'''
 import subprocess
 a = sys.argv[1:]
 if a == ["exec", "--help"]:
-    help_text("--json --output-schema --output-last-message --sandbox --skip-git-repo-check --cd --model")
+    help_text("--json --output-schema --output-last-message --sandbox --skip-git-repo-check --cd --model "
+              "--ignore-rules --config")
     sys.exit(0)
 if a == ["sandbox", "--help"]:
-    help_text("--permission-profile"); sys.exit(0)
+    help_text("--permission-profile --config"); sys.exit(0)
 if a[:2] == ["login", "status"]:
     sys.exit(0)
+if a[:2] == ["login", "--with-api-key"]:
+    record(p="codex", login=a, key_on_stdin=sys.stdin.read())
+    probe("codex", "login")
+    print("Successfully logged in"); sys.exit(0)
 if a and a[0] == "--version":
+    probe("codex", "version")
     print("fake-codex"); sys.exit(0)
+def untrusted(d):
+    """Was this call told, as the real CLI must be, not to trust directory d? (-c projects={"<d>"={...}})"""
+    return any(x.startswith("projects={") and json.dumps(d) + '={trust_level="untrusted"}' in x
+               for x, flag in zip(a[1:], a) if flag in ("-c", "--config"))
 if a and a[0] == "sandbox":
     i = a.index("--")
     d = a[a.index("-C") + 1]
-    record(p="codex", sandbox=True, cmd=a[i + 1:])
+    record(p="codex", sandbox=True, cmd=a[i + 1:], flags=a[1:i], reads_project_config=not untrusted(d))
     sys.exit(subprocess.run(a[i + 1:], cwd=d).returncode)
 prompt = sys.stdin.read()
-record(p="codex", argv=a, planner="read-only" in a, resumed="earlier attempt" in prompt)
+# What the real CLI (0.166) obeys from the directory it works in unless it is told not to: execpolicy rules
+# (an `allow` rule runs the command outside the sandbox) and, in a directory it trusts, .codex/config.toml
+# (tool servers started unsandboxed, sandbox settings, environment policy). `codex exec` trusts its own.
+obeys = [n for n, on in ((".codex/rules/default.rules", "--ignore-rules" not in a),
+                         (".codex/config.toml", not untrusted(os.getcwd()))) if on and Path(n).exists()]
+record(p="codex", argv=a, planner="read-only" in a, resumed="earlier attempt" in prompt, obeys=obeys,
+       reads_owner_rules="--ignore-rules" not in a)
 out = Path(a[a.index("-o") + 1])
 print(json.dumps({"type": "thread.started"}))
 if "read-only" in a:
@@ -165,9 +194,10 @@ class CrewTest(unittest.TestCase):
         self.log = self.tmp / "calls.jsonl"
         self.cfg = self.tmp / "cfg.json"
         self.write_cfg({})
+        self.claude_home = self.tmp / "claude-home"  # the suite never reads the real ~/.claude/settings.json
         self.env = dict(os.environ, CREW_HOME=str(self.home), FAKE_LOG=str(self.log), CREW_ALLOW_TEMP_HOME="1",
                         GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t",
-                        GIT_COMMITTER_EMAIL="t@t")
+                        GIT_COMMITTER_EMAIL="t@t", CLAUDE_CONFIG_DIR=str(self.claude_home))
         for k in ("ANTHROPIC_API_KEY", "CODEX_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "CREW_TASK"):
             self.env.pop(k, None)  # CREW_TASK: this suite may itself be running as a check inside a crew task
 
@@ -1794,7 +1824,7 @@ class TestThreeSeven(CrewTest):
         starts = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
                   and isinstance(n.func.value, ast.Name) and n.func.value.id == "subprocess"
                   and n.func.attr in ("run", "Popen", "call", "check_call", "check_output")]
-        self.assertGreater(len(starts), 8)
+        self.assertGreater(len(starts), 4)  # git (twice), ps (twice), taskkill and _exec's Popen; probes use _exec
         bare = [n.lineno for n in starts if not {"stdin", "input"} & {k.arg for k in n.keywords}]
         self.assertEqual(bare, [], "crew.py starts a process at these lines without stdin= or input=")
         self.assertNotIn("os.system(", (HERE / "crew.py").read_text())
@@ -1971,6 +2001,1172 @@ class TestThreeSeven(CrewTest):
             self.assertEqual(os.listdir(started_in), [], workdir)  # nothing was done where crew happened to start
 
 
+class TestOnlyTheOwnersOwnSettings(CrewTest):
+    """What the 3.7 review found (crew 3.8): a worker obeyed settings an earlier agent left in crew's copy,
+    and settings of the owner's own that take a command out of the sandbox."""
+
+    def workers(self, p=None):
+        return [c for c in self.calls() if "argv" in c and not c.get("planner") and p in (None, c["p"])]
+
+    def two_step_plan(self):
+        """t1 for Astra (Claude), t2 for Sol (Codex)."""
+        plan = self.tmp / "fake-plan.json"
+        plan.write_text(json.dumps({"summary": "two", "tasks": [
+            {"id": "t1", "title": "first", "agent": "Astra", "instructions": "a", "acceptance": "b", "depends_on": []},
+            {"id": "t2", "title": "second", "agent": "Sol", "instructions": "a", "acceptance": "b",
+             "depends_on": ["t1"]}]}))
+        return str(plan)
+
+    def claude_then_codex(self, root, planted=None, cfg=None):
+        """Plan with Codex, then t1 on Claude and t2 on Codex in crew's copy; the fake agents leave the
+        `planted` files in the copy as they work. Returns (the two Codex calls, the checks' sandbox calls)."""
+        self.set_profile(root, checks={"ok": "true"}, setup=[])
+        self.write_cfg(crew.deep_merge({"split": {"mode": "fixed"}, "planner": {"provider": "codex"}}, cfg or {}))
+        r = self.crew("go", "x", "--workdir", str(root),
+                      env={"FAKE_PLAN": self.two_step_plan(), "FAKE_EDIT": json.dumps(planted or {})})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual([c["p"] for c in self.workers()], ["claude", "codex"])
+        codex = [c for c in self.calls() if c["p"] == "codex" and "argv" in c]
+        self.assertEqual([c["planner"] for c in codex], [True, False])  # the planner, then the second task
+        self.assertNotEqual(Path(codex[1]["cwd"]), root)  # which worked in crew's copy, after Claude
+        checks = [c for c in self.calls() if c.get("sandbox") and c["cmd"][-1] == "true"]
+        self.assertTrue(checks)
+        return codex, checks
+
+    def test_codex_is_started_without_execpolicy_rules(self):
+        """An `allow` rule in a Codex rules file runs the matching command outside the sandbox. The real CLI
+        obeyed the owner's own rules in every worker and in the read-only planner (the README suggests one
+        that allows `crew`), and a rules file an earlier agent left in crew's copy."""
+        root = self.repo()
+        rules = {".codex/rules/default.rules": 'prefix_rule(pattern = ["sh"], decision = "allow")\n'}
+        codex, _ = self.claude_then_codex(root, rules)
+        for c in codex:
+            self.assertFalse(c["reads_owner_rules"], c["argv"])
+            self.assertEqual(c["obeys"], [], c["argv"])  # nor the file Claude's task left in the copy
+            self.assertEqual(c["argv"].count("--ignore-rules"), 1)
+            self.assertEqual(c["argv"][-1], "-")  # the prompt still comes on stdin, after every flag
+        # a flag the owner already passes is not given twice (the real CLI refuses a repeated --ignore-rules)
+        self.write_cfg({"providers": {"claude": {"enabled": False}, "codex": {"args": ["--ignore-rules"]}}})
+        self.crew("do", "y", "--workdir", str(root))
+        a = self.workers("codex")[-1]["argv"]
+        self.assertEqual(a.count("--ignore-rules"), 1)
+        self.assertEqual(a[a.index("--sandbox") + 1], "workspace-write")
+
+    def test_codex_reads_no_settings_an_earlier_agent_left_in_the_copy(self):
+        """A Claude worker can write `.codex/config.toml` in crew's copy; crew never commits or shows it. The
+        real Codex CLI trusts the directory it is started in and obeyed that file in the next task: it started
+        the tool server the file named, outside any sandbox, and widened its own sandbox from it."""
+        root = self.repo()
+        planted = {".codex/config.toml": '[mcp_servers.x]\ncommand = "sh"\n[sandbox_workspace_write]\n'
+                                         'writable_roots = ["/"]\n'}
+        codex, checks = self.claude_then_codex(root, planted)
+        self.assertEqual(codex[1]["obeys"], [], codex[1]["argv"])
+        for c in checks:  # the sandbox that runs the checks reads that file too, once the copy is trusted
+            self.assertFalse(c["reads_project_config"], c["flags"])
+        self.assertEqual(sh(root, "git", "status", "--porcelain").strip(), "")  # none of it is in your checkout
+        self.assertNotIn(".codex", sh(root, "git", "ls-tree", "-r", "--name-only",
+                                      self.latest_plan(root)["git"]["branch"]))  # nor on the branch you review
+
+    def test_the_task_guard_variable_reaches_a_codex_workers_shell(self):
+        """crew refuses to start inside its own task by a variable in the worker's environment. Codex hands
+        its commands only what the owner's `shell_environment_policy` lets through: with `inherit = "core"`
+        the variable never reached a worker's shell, or a check."""
+        root = self.repo()
+        codex, checks = self.claude_then_codex(root)
+        for flags in [c["argv"] for c in codex] + [c["flags"] for c in checks]:
+            at = [i for i, x in enumerate(flags) if x == 'shell_environment_policy.set.CREW_TASK="1"']
+            self.assertEqual(len(at), 1, flags)
+            self.assertEqual(flags[at[0] - 1], "-c")
+
+    def test_codex_sandbox_written_as_one_word_is_kept(self):
+        """`-sread-only` and `-s=read-only` are the same flag as `-s read-only`. crew didn't see them, added
+        its own --sandbox, and the real CLI refused every Codex task ("cannot be used multiple times")."""
+        root = self.repo()
+        for own in ("-sread-only", "-s=read-only"):
+            self.write_cfg({"providers": {"claude": {"enabled": False}, "codex": {"args": [own]}}})
+            self.crew("do", "x", "--workdir", str(root))
+            a = self.workers("codex")[-1]["argv"]
+            self.assertIn(own, a)
+            self.assertNotIn("--sandbox", a)
+
+    def claude_argv(self, root, settings=None, cfg=None, env=None):
+        self.write_cfg({"providers": {"codex": {"enabled": False}, **({"claude": cfg} if cfg else {})}})
+        if settings is not None:
+            self.claude_home.mkdir(exist_ok=True)
+            (self.claude_home / "settings.json").write_text(settings)
+        n = len(self.workers("claude"))
+        r = self.crew("do", "x", "--workdir", str(root), env=env)
+        new = self.workers("claude")[n:]
+        self.assertEqual(len(new), 1, r.stdout + r.stderr)
+        return new[0]["argv"], r.stdout
+
+    def path_without_bubblewrap(self):
+        """The same PATH with no bwrap and no socat on it: Claude's sandbox can't start."""
+        d = self.tmp / "bin-no-sandbox"
+        d.mkdir(exist_ok=True)
+        for folder in reversed(os.environ.get("PATH", "").split(os.pathsep)):
+            for f in (os.listdir(folder) if os.path.isdir(folder) else []):
+                if f not in ("bwrap", "socat"):
+                    (d / f).unlink(missing_ok=True)
+                    (d / f).symlink_to(os.path.join(folder, f))
+        return str(d)
+
+    def assert_no_shell(self, argv):
+        self.assertNotIn("--allowedTools", argv)
+        self.assertIn("--disallowedTools", argv)  # not offered at all, so nothing of the owner's can allow it
+        self.assertEqual(argv[argv.index("--disallowedTools") + 1], "Bash")
+
+    def test_commands_your_claude_settings_take_out_of_the_sandbox_cost_the_shell(self):
+        """crew allows Claude every shell command because each one runs in the sandbox. Not the ones in
+        `sandbox.excludedCommands`: Claude merges that list from the owner's own settings into crew's, such
+        a command asks before it runs unsandboxed, and crew's blanket permission was the answer."""
+        root = self.repo()
+        a, out = self.claude_argv(root, settings="{}")
+        self.assertEqual(a[a.index("--allowedTools") + 1], "Bash")  # the ordinary case keeps its shell
+        self.assertNotIn("--disallowedTools", a)
+        self.assertNotIn("no shell", out)
+
+        a, out = self.claude_argv(root, settings='{"sandbox": {"excludedCommands": ["docker"]}}')
+        self.assert_no_shell(a)
+        self.assertIn("Claude workers get no shell", out)
+        self.assertIn(str(self.claude_home / "settings.json"), out)  # and says which file to look in
+        self.assertIn("Claude workers get no shell", self.crew("doctor", check=False).stdout)
+
+        a, out = self.claude_argv(root, settings="{not json")  # crew can't tell what it holds
+        self.assert_no_shell(a)
+        self.assertIn("can't read", out)
+
+        a, _ = self.claude_argv(root, settings="{}", cfg={"args": [
+            "--settings", '{"sandbox": {"excludedCommands": ["docker"]}}']})
+        self.assert_no_shell(a)  # the same key in your own worker flags
+
+    def test_without_a_sandbox_claude_has_no_shell_at_all(self):
+        """When Claude's sandbox can't start crew left out its permission for Bash and said shell commands
+        were refused. The owner's own allow rules still ran them, with no sandbox: `Bash(crew *)`, which the
+        README suggests, let a worker put a goal into the owner's queue."""
+        root = self.repo()
+        no_sandbox = {"PATH": self.path_without_bubblewrap()}
+        a, out = self.claude_argv(root, settings='{"permissions": {"allow": ["Bash(crew *)"]}}', env=no_sandbox)
+        self.assert_no_shell(a)
+        self.assertIn("Claude workers get no shell", out)
+        r = self.crew("doctor", env=no_sandbox, check=False)
+        self.assertIn("claude sandbox: NOT available, so Claude workers get no shell", r.stdout)
+
+    def test_sandboxed_bash_false_means_no_shell(self):
+        """`providers.claude.sandboxed_bash: false` only left out crew's permission; the settings crew passes
+        still allowed every sandboxed command, so the real CLI ran them as before."""
+        root = self.repo()
+        a, _ = self.claude_argv(root, settings="{}", cfg={"sandboxed_bash": False})
+        self.assert_no_shell(a)
+
+    @staticmethod
+    def as_claude_reads_it(argv):
+        """{flag: value} the way the real CLI pairs them: a flag that takes a value takes the next token,
+        whatever it is; --allowedTools and --disallowedTools take every token up to the next flag."""
+        takes_one = {"--output-format", "--setting-sources", "--model", "--json-schema", "--permission-mode",
+                     "--settings", "--append-system-prompt", "--system-prompt", "--tools"}
+        read, i = {}, 0
+        while i < len(argv):
+            flag = argv[i]
+            if flag in takes_one and i + 1 < len(argv):
+                read[flag] = argv[i + 1]
+                i += 2
+            elif flag in ("--allowedTools", "--disallowedTools"):
+                j = i + 1
+                while j < len(argv) and not argv[j].startswith("-"):
+                    j += 1
+                read[flag] = argv[i + 1:j]
+                i = j
+            else:
+                read[flag] = True
+                i += 1
+        return read
+
+    def test_a_flag_without_its_value_cannot_swallow_the_sandbox(self):
+        """crew put its --settings and --allowedTools after the configured flags. A flag there that lacked
+        its value (`--append-system-prompt` at the end) took crew's `--settings` for it: the worker ran with
+        no sandbox settings at all and with Bash allowed, and wrote outside its copy and into .git. A
+        `--settings` with no value made the CLI load a file named `--settings` from the working tree."""
+        root = self.repo()
+        a, _ = self.claude_argv(root, settings="{}", cfg={"args": ["--verbose", "--append-system-prompt"]})
+        read = self.as_claude_reads_it(a)
+        self.assertIsInstance(read.get("--settings"), str, a)  # not taken as the other flag's value
+        sandbox = json.loads(read["--settings"])["sandbox"]  # still the settings the CLI reads
+        self.assertIs(sandbox["enabled"], True)
+        self.assertIs(sandbox["allowUnsandboxedCommands"], False)
+        self.assertTrue(any(d.endswith("/.git") for d in sandbox["filesystem"]["denyWrite"]))
+        self.assertEqual(read["--permission-mode"], "acceptEdits")
+        self.assertEqual(read["--allowedTools"], ["Bash"])
+        self.assertEqual(a[-1], "--append-system-prompt")  # left without a value: the CLI's own error, not crew's flags
+
+        for dangling in (["--settings"], ["--settings", "--verbose"]):
+            n = len(self.workers())
+            self.write_cfg({"providers": {"codex": {"enabled": False}, "claude": {"args": dangling}}})
+            r = self.crew("do", "x", "--workdir", str(root), check=False)
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("--settings has no value", r.stdout)
+            self.assertEqual(len(self.workers()), n, dangling)  # no worker was started with it
+
+    def test_a_switch_in_quotes_is_an_error_not_true(self):
+        """`"unsandboxed": "false"` is a string, and a string is true: with Codex's sandbox unusable the checks,
+        which run code the agents edited, were run with no sandbox. The other switches read the same way."""
+        root = self.repo()
+        marker = self.tmp / "check-ran"
+        self.set_profile(root, checks={"guard": f"touch {marker}"}, setup=[])
+        self.write_cfg({"verify": {"unsandboxed": "false"}})
+        r = self.crew("do", "x", "--workdir", str(root), env={"FAKE_HELP_MISSING": "--permission-profile"},
+                      check=False)
+        self.assertFalse(marker.exists(), r.stdout)  # the check never ran unsandboxed
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("verify.unsandboxed must be true or false", r.stdout)
+        self.assertEqual(self.workers(), [])
+        for sec, key in (("verify", "enabled"), ("setup", "enabled"), ("git", "enabled"),
+                         ("split", "fallback_on_error")):
+            self.write_cfg({sec: {key: "false"}})
+            r = self.crew("config", "--workdir", str(root), check=False)
+            self.assertEqual(r.returncode, 2, (sec, key))
+            self.assertIn(f"{sec}.{key} must be true or false", r.stdout)
+        for prov, key in (("codex", "enabled"), ("claude", "sandboxed_bash")):
+            self.write_cfg({"providers": {prov: {key: "false"}}})
+            r = self.crew("config", "--workdir", str(root), check=False)
+            self.assertEqual(r.returncode, 2, (prov, key))
+            self.assertIn(f"providers.{prov}.{key} must be true or false", r.stdout)
+        self.write_cfg({"verify": {"unsandboxed": True}, "providers": {"codex": {"enabled": False}}})
+        self.assertEqual(self.crew("config", "--workdir", str(root)).returncode, 0)  # real booleans still load
+
+    def test_a_misspelt_setting_one_level_down_is_reported(self):
+        """Every setting but a section's name sits one level down, and crew only looked at the top:
+        `"sandbox_bash": false` under providers.claude left Claude its shell without a word."""
+        root = self.repo()
+        self.write_cfg({"verify": {"unsandboxd": True}, "setup": {"enable": False},
+                        "providers": {"claude": {"sandbox_bash": False}, "claud": {"enabled": False},
+                                      "codex": {"sandboxed_bash": False}},
+                        "agents": {"Sol": {"role": "Builder.", "prefer": "codex"}}, "split": {"_note": "mine"}})
+        r = self.crew("usage")
+        for name in ("verify.unsandboxd", "setup.enable", "providers.claude.sandbox_bash", "providers.claud",
+                     "providers.codex.sandboxed_bash", "agents.Sol.prefer"):
+            self.assertIn(f"no setting named {name!r}", r.stdout)
+        self.assertNotIn("_note", r.stdout)
+        self.cfg.write_text(json.dumps(crew.deep_merge(crew.DEFAULTS, {"providers": {
+            "claude": {"cmd": str(self.bin / "claude")}, "codex": {"cmd": str(self.bin / "codex")}}})))
+        self.assertNotIn("no setting named", self.crew("usage").stdout)  # every real setting passes
+        self.crew("init", "--workdir", str(root))
+        key, _ = crew.project_identity(root)
+        path = self.home / "projects" / f"{key}.json"
+        prof = json.loads(path.read_text())
+        prof["override"] = {"verify": {"fix_rounds": 2}}  # singular: not read
+        prof["project"]["check"] = {"test": "false"}
+        path.write_text(json.dumps(prof))
+        r = self.crew("config", "--workdir", str(root))
+        self.assertIn("no setting named 'override'", r.stdout)
+        self.assertIn("no setting named 'project.check'", r.stdout)
+        self.assertNotIn("'project.checks'", r.stdout)
+
+    def test_doctor_and_codex_login_hand_each_cli_only_its_own_keys(self):
+        """`crew doctor` asked each CLI for its version, and `crew codex-login` logged Codex in, with the
+        other provider's keys in the environment."""
+        keys = {"ANTHROPIC_API_KEY": "a", "ANTHROPIC_AUTH_TOKEN": "b", "CLAUDE_CODE_OAUTH_TOKEN": "c",
+                "OPENAI_API_KEY": "d", "CODEX_API_KEY": "e", "CODEX_ACCESS_TOKEN": "f", "FAKE_RECORD_PROBES": "1"}
+        self.crew("doctor", env=keys, check=False)
+        r = self.crew("codex-login", env=keys)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        probes = [c for c in self.calls() if c.get("probe")]
+        self.assertEqual(sorted((c["p"], c["probe"]) for c in probes),
+                         [("claude", "version"), ("codex", "login"), ("codex", "version")])
+        for c in probes:
+            other = crew.FOREIGN_KEYS[c["p"]]
+            self.assertEqual([k for k in c["keys"] if k in other], [], (c["p"], c["probe"]))
+            self.assertTrue([k for k in c["keys"] if k not in other])  # its own are still there
+
+    def test_a_claude_worker_cannot_read_the_codex_login(self):
+        """A sandbox limits writes, not reads: a Claude worker's shell could read ~/.codex/auth.json, and
+        what a worker reads goes to its own model provider."""
+        root = self.repo()
+        codex_home = self.tmp / "codex-home"
+        a, _ = self.claude_argv(root, settings="{}", env={"CODEX_HOME": str(codex_home)},
+                                cfg={"args": ["--settings", '{"sandbox": {"filesystem": {"denyRead": ["/mine"]}}}']})
+        fs = json.loads(a[a.index("--settings") + 1])["sandbox"]["filesystem"]
+        self.assertEqual(fs.get("denyRead"), ["/mine", str(codex_home)])  # yours kept, Codex's login store added
+
+    def test_the_skill_tells_a_tool_what_crew_really_does(self):
+        """The skill said crew never touches the checkout (a folder that is no git repository is edited in
+        place), and told the tool to continue a paused plan with a bare `crew run --workdir`, which resumes
+        the newest plan: after a later plan had finished, that printed "nothing to do" and exited 0."""
+        root = self.repo()
+        self.write_cfg({"providers": {"codex": {"enabled": False}}})
+        self.crew("do", "first goal", "--workdir", str(root), env={"FAKE_CLAUDE_LIMIT": "1"}, check=False)
+        key, _ = crew.project_identity(root)
+        paused = sorted((self.home / "plans" / key).glob("*.json"))[0]
+        self.crew("usage", "--clear-cooldowns")
+        time.sleep(1.1)  # plan files are named to the second
+        self.assertEqual(self.crew("do", "second goal", "--workdir", str(root)).returncode, 0)
+        r = self.crew("run", "--workdir", str(root))  # what the skill used to say continues a paused plan
+        self.assertIn("nothing to do", r.stdout)
+        self.assertEqual(crew.plan_state(json.loads(paused.read_text())), "paused")  # it did not
+        self.assertNotIn("crew run --workdir", crew.SKILL_MD)
+        self.assertIn("crew run <plan file>", crew.SKILL_MD)
+        listed = self.crew("plans", "--workdir", str(root)).stdout
+        self.assertIn(str(paused), listed)  # where the skill sends the tool for that file
+        self.assertEqual(self.crew("run", str(paused)).returncode, 0)
+        self.assertEqual(crew.plan_state(json.loads(paused.read_text())), "done")
+        folder = self.repo("notes", git=False)
+        r = self.crew("do", "x", "--workdir", str(folder))
+        self.assertIn("working in place", r.stdout)  # no copy, no branch: the folder itself is edited
+        self.assertTrue((folder / "t1.txt").exists())
+        self.assertIn("edits it in place", crew.SKILL_MD)
+
+
+class TestLookupOwnershipInputs(CrewTest):
+    """The 3.7 review's confirmed findings about whose plans and profile a checkout gets, one run per plan,
+    and what crew reads from its own files. Each test fails on 3.7, except the ones named test_guard_*,
+    which pass there and hold a part of an earlier fix that no test held."""
+
+    workers = TestThreeSeven.workers
+    plan_file = TestThreeSeven.plan_file
+    paused = TestThreeSeven.paused
+    files_on = TestThreeSeven.files_on
+    planners = TestThreeThree.planners
+
+    def profile_file(self, root) -> Path:
+        return self.home / "projects" / f"{crew.project_identity(root)[0]}.json"
+
+    def edit_profile(self, checkout, /, **project_fields):
+        path = self.profile_file(checkout)
+        prof = json.loads(path.read_text())
+        for k, v in project_fields.items():
+            if v is None:
+                prof["project"].pop(k, None)
+            else:
+                prof["project"][k] = v
+        path.write_text(json.dumps(prof))
+
+    def effective(self, root) -> dict:
+        out = self.crew("config", "--workdir", str(root)).stdout
+        return json.loads(out[out.index("\n{") if not out.startswith("{") else 0:])
+
+    def branches(self, root):
+        return sh(root, "git", "for-each-ref", "--format=%(refname:short)", "refs/heads").split()
+
+    def crew_in(self, cwd, *args, env=None) -> subprocess.CompletedProcess:
+        return subprocess.run([sys.executable, str(HERE / "crew.py"), "--config", str(self.cfg), *args], cwd=cwd,
+                              capture_output=True, text=True, env={**self.env, **(env or {})}, timeout=120)
+
+    # ---------------------------------------------------------------- whose plans, whose profile
+
+    def test_another_repository_at_a_known_path_inherits_neither_plans_nor_profile(self):
+        ran = self.tmp / "setup-ran.txt"
+
+        def first_project(name, origin):
+            root = self.repo(name, files={"old.txt": "the first project\n"})
+            sh(root, "git", "remote", "add", "origin", origin)
+            self.crew("init", "--workdir", str(root))
+            self.edit_profile(root, setup=[{"run": f"echo ran >> {ran}"}], checks={"first": "test -f old.txt"})
+            return root
+
+        def replaced_by_another(name, origin):
+            shutil.rmtree(self.tmp / name)  # the folder goes, and an unrelated repository takes its place
+            root = self.repo(name, files={"new.txt": "an unrelated project\n"})
+            sh(root, "git", "remote", "add", "origin", origin)
+            return root
+
+        # A paused plan and a profile written before crew recorded a repository's first commit.
+        old = first_project("site", "git@github.com:acme/first.git")
+        self.edit_profile(old, first_commit=None)
+        plan = self.paused(old)
+        self.assertEqual(ran.read_text(), "ran\n")  # the first project's setup, in its own copy
+        n0 = len(self.workers())
+        new = replaced_by_another("site", "git@github.com:acme/second.git")
+        self.assertNotIn(str(plan), self.crew("plans", "--workdir", str(new)).stdout)  # 3.7 lists it as this checkout's
+        r = self.crew("run", "--workdir", str(new), check=False)
+        # 3.7: exit 0; t2 runs in the first project's copy and that project's history lands on a crew branch here
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("no plans for", r.stdout)
+        self.assertIn("is not used for it", r.stdout)  # and says why the profile of that path was left alone
+        self.assertEqual(len(self.workers()), n0)
+        self.assertEqual(self.branches(new), ["main"])
+        self.assertEqual(sh(new, "git", "rev-list", "--all", "--count").strip(), "1")
+        r = self.crew("do", "second goal", "--workdir", str(new))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(ran.read_text(), "ran\n")  # 3.7 runs the first project's setup command in the new one's copy
+        self.assertEqual(self.effective(new)["project"]["checks"], {})
+        self.assertIn(str(plan), self.crew("plans", "--all").stdout)  # the old plan is still there, under its own name
+        ran.unlink()
+
+        # No plan at all: the first commit recorded in the profile tells the two repositories apart.
+        first_project("shop", "git@github.com:acme/shop.git")
+        new = replaced_by_another("shop", "git@github.com:acme/other.git")
+        r = self.crew("do", "second goal", "--workdir", str(new))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("is not used for it", r.stdout)
+        self.assertFalse(ran.exists())
+        self.assertEqual(self.effective(new)["project"]["checks"], {})
+
+    def test_a_second_checkout_keeps_the_shared_profile_when_its_origin_changes(self):
+        a = self.repo("a")
+        sh(a, "git", "remote", "add", "origin", "https://github.com/me/app.git")
+        b = self.tmp / "b"
+        sh(self.tmp, "git", "clone", "-q", str(a), str(b))
+        sh(b, "git", "remote", "set-url", "origin", "https://github.com/me/app.git")
+        self.crew("init", "--workdir", str(a))
+        self.edit_profile(a, notes=["MY EDIT"], checks={"mine": "true"})
+        self.assertEqual(self.effective(b)["project"]["notes"], ["MY EDIT"])  # one profile for both checkouts
+        sh(b, "git", "remote", "set-url", "origin", "https://github.com/me/renamed.git")
+        r = self.crew("config", "--workdir", str(b))
+        self.assertIn("was known to crew as me/app", r.stdout)  # 3.7 says nothing ...
+        shown = self.effective(b)["project"]
+        self.assertEqual((shown["name"], shown["notes"], shown["checks"]), ("me/renamed", ["MY EDIT"], {"mine": "true"}))
+        self.assertEqual(shown["root"], str(b))  # ... and starts b again with no notes and no checks
+        still = self.effective(a)["project"]
+        self.assertEqual((still["name"], still["notes"], still["root"]), ("me/app", ["MY EDIT"], str(a)))
+
+    def test_origin_removed_and_added_back_keeps_the_profile_edited_in_between(self):
+        root = self.repo()
+        sh(root, "git", "remote", "add", "origin", "https://github.com/me/proj.git")
+        self.crew("init", "--workdir", str(root))
+        # A profile from before crew recorded a repository's first commit: the folder's plan vouches for it.
+        self.edit_profile(root, notes=["edit 1"], first_commit=None)
+        self.crew("plan", "x", "--workdir", str(root))
+        sh(root, "git", "remote", "remove", "origin")
+        self.assertEqual(self.effective(root)["project"]["notes"], ["edit 1"])  # carried to the path's name
+        self.edit_profile(root, notes=["edit 2"])  # the profile in effect now, edited while there was no origin
+        sh(root, "git", "remote", "add", "origin", "https://github.com/me/proj.git")
+        shown = self.effective(root)["project"]
+        self.assertEqual(shown["notes"], ["edit 2"])  # 3.7: ["edit 1"], and "moved crew's profile" printed
+        self.assertEqual(shown["name"], "me/proj")
+        self.assertEqual(sorted(f.name for f in (self.home / "projects").iterdir()), ["me__proj.json"])
+
+        # When the profile at the new name is another checkout's, both are kept, and crew says which is used.
+        other = self.repo("other")
+        self.crew("init", "--workdir", str(other))
+        self.edit_profile(other, notes=["other's own"])
+        sh(other, "git", "remote", "add", "origin", "https://github.com/me/proj.git")
+        r = self.crew("config", "--workdir", str(other))
+        self.assertIn("was set aside as", r.stdout)
+        self.assertNotIn("moved crew's profile", r.stdout)  # 3.7 reports a move that did not happen
+        self.assertEqual(self.effective(other)["project"]["notes"], ["edit 2"])
+        self.assertEqual(len(list((self.home / "projects").glob("*.json.moved"))), 1)
+
+    # ---------------------------------------------------------------- one run per plan
+
+    def test_a_plan_run_through_a_symbolic_link_is_locked_like_the_file_itself(self):
+        root = self.repo()
+        self.crew("plan", "x", "--workdir", str(root))
+        plan = self.plan_file()
+        link = self.tmp / "todo.json"
+        link.symlink_to(plan)
+        first = subprocess.Popen([sys.executable, str(HERE / "crew.py"), "--config", str(self.cfg), "run", str(link)],
+                                 env={**self.env, "FAKE_SLEEP": "4"}, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                 text=True)
+        try:
+            for _ in range(200):
+                if self.workers():
+                    break
+                time.sleep(0.1)
+            else:
+                self.fail("no worker started")
+            r = self.crew("run", str(link), check=False)
+            # 3.7: exit 0. crew's first save replaced the link with a file, whose path names another lock:
+            # this second run does both tasks in the first run's copy and removes it.
+            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+            self.assertIn("already running", r.stdout)
+            self.assertIn("its plan is running", self.crew("clean", "--all").stdout)
+            out, _ = first.communicate(timeout=90)
+        finally:
+            if first.poll() is None:
+                first.kill()
+        self.assertEqual(first.returncode, 0, out)
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(crew.plan_state(json.loads(plan.read_text())), "done")  # recorded in the file itself
+        self.assertEqual(len(self.workers()), 2)
+        self.assertIn("nothing to do", self.crew("run", "--workdir", str(root)).stdout)  # 3.7 does both tasks again
+
+    def test_a_plan_whose_folder_was_moved_and_linked_back_is_not_a_copy_of_itself(self):
+        root = self.repo()
+        (self.tmp / "myplans").mkdir()
+        plan = self.tmp / "myplans" / "job.json"
+        self.crew("go", "x", "--workdir", str(root), "--out", str(plan), env={"CREW_CRASH_AT": "before-commit"},
+                  check=False)  # paused: t1's work is in the copy, not yet committed
+        hard, stale = self.tmp / "hard.json", self.tmp / "stale.json"
+        os.link(plan, hard)
+        shutil.copy(plan, stale)
+        (self.tmp / "archive").mkdir()
+        shutil.move(str(self.tmp / "myplans"), str(self.tmp / "archive" / "myplans"))
+        (self.tmp / "myplans").symlink_to(self.tmp / "archive" / "myplans")
+        n0 = len(self.workers())
+        r = self.crew("run", str(hard), check=False)  # another file is still another plan, a hard link too
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("belongs to another plan", r.stdout)
+        r = self.crew("run", str(plan), check=False)
+        # 3.7: exit 2 for good, "belongs to another plan, <this file>, which this file is a copy of"
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(len(self.workers()), n0 + 1)  # t2 only
+        done = json.loads(plan.read_text())
+        self.assertEqual([t["status"] for t in done["tasks"]], ["done", "done"])
+        self.assertEqual(sorted(self.files_on(root, done["git"]["branch"])), ["README.md", "t1.txt", "t2.txt"])
+        self.crew("clean", "--all")
+        tip = sh(root, "git", "rev-parse", done["git"]["branch"])
+        for copy in (stale, hard):  # guard: what was a copy before the move is one after it, the plan finished or not
+            r = self.crew("run", str(copy), check=False)
+            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+            self.assertIn("which this file is a copy of", r.stdout)
+        self.assertEqual(len(self.workers()), n0 + 1)
+        self.assertEqual(sh(root, "git", "rev-parse", done["git"]["branch"]), tip)
+
+    def test_a_paused_queue_item_is_not_planned_again_after_origin_changed_twice(self):
+        root = self.repo()
+        self.crew("queue", "add", "the goal", "--workdir", str(root))
+        r = self.crew("queue", "run", env={"CREW_CRASH_AT": "before-commit"}, check=False)
+        self.assertEqual(r.returncode, -9, r.stdout + r.stderr)
+        sh(root, "git", "remote", "add", "origin", "git@github.com:me/proj.git")
+        self.crew("config", "--workdir", str(root))  # any command: the plan moves to the remote's name
+        sh(root, "git", "remote", "set-url", "origin", "git@github.com:org/proj.git")
+        r = self.crew("queue", "run")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(len(self.planners()), 1)  # 3.7: 2, and t1 is done a second time
+        self.assertEqual(len(self.workers()), 2)
+        plans = list((self.home / "plans").glob("*/*.json"))
+        self.assertEqual(len(plans), 1, plans)  # 3.7 leaves the real plan paused beside a second one
+        item = json.loads((self.home / "queue.json").read_text())["items"][0]
+        self.assertEqual((item["status"], item["plan"]), ("done", str(plans[0])))
+
+    def test_queue_items_for_one_checkout_run_in_order_whatever_it_was_called_when_queued(self):
+        root = self.repo()
+        sh(root, "git", "remote", "add", "origin", "git@github.com:me/proj.git")
+        self.crew("queue", "add", "first goal", "--direct", "--agent", "Sol", "--workdir", str(root))
+        sh(root, "git", "remote", "set-url", "origin", "git@github.com:me/renamed.git")
+        self.crew("queue", "add", "second goal", "--direct", "--agent", "Astra", "--workdir", str(root))
+        r = self.crew("queue", "run", env={"FAKE_SLEEP": "1.5"})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("across 1 project(s)", r.stdout)  # 3.7: 2 projects, one for each name
+        starts = sorted(c["t"] for c in self.workers())
+        self.assertGreater(starts[1] - starts[0], 1.4)  # 3.7: both at once
+
+    # ---------------------------------------------------------------- what crew reads
+
+    def test_a_switch_must_be_true_or_false(self):
+        root = self.repo()
+        self.set_profile(root, checks={"always": "true"})
+        for extra in ({"verify": {"unsandboxed": "false"}}, {"verify": {"enabled": "off"}},
+                      {"setup": {"enabled": "false"}}, {"git": {"enabled": "no"}},
+                      {"split": {"fallback_on_error": 0}}, {"providers": {"codex": {"enabled": "false"}}},
+                      {"providers": {"claude": {"sandboxed_bash": "false"}}}, {"planner": {"provider": "gemini"}}):
+            self.write_cfg(extra)
+            r = self.crew("usage", check=False)
+            self.assertEqual(r.returncode, 2, f"{extra}\n{r.stdout}{r.stderr}")  # 3.7: taken as true, no word said
+            self.assertIn("error: config: ", r.stdout, extra)
+        self.write_cfg({"verify": {"unsandboxed": "false"}})  # in quotes: a string, and every string is true
+        r = self.crew("do", "x", "--workdir", str(root), env={"FAKE_HELP_MISSING": "--permission-profile"}, check=False)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertNotIn("unsandboxed):", r.stdout)  # 3.7: "checks (baseline, unsandboxed):" with no codex sandbox
+        self.assertEqual(self.workers(), [])
+
+    def test_an_empty_branch_prefix_is_refused_before_it_makes_a_plan_that_cannot_be_resumed(self):
+        root = self.repo()
+        self.write_cfg({"git": {"branch_prefix": ""}})
+        r = self.crew("go", "x", "--workdir", str(root), env={"CREW_CRASH_AT": "before-commit"}, check=False)
+        # 3.7 starts (killed here after t1), on a branch without a prefix; every later `crew run` of that plan
+        # is then "invalid git block", also after the config is put right
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("git.branch_prefix must be a non-empty string", r.stdout)
+        self.assertEqual(self.calls(), [])
+        self.write_cfg({"git": {"branch_prefix": "wip/"}})  # a prefix of your own still works, and resumes
+        plan = self.paused(root)
+        r = self.crew("run", str(plan))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue(json.loads(plan.read_text())["git"]["branch"].startswith("wip/"))
+
+    def test_a_plan_with_a_relative_workdir_is_not_run_where_crew_was_started(self):
+        one, two = self.repo("one"), self.repo("two")
+        for r in (one, two):
+            sh(r, "git", "remote", "add", "origin", f"git@github.com:me/{r.name}.git")
+        (self.tmp / "mine").mkdir()
+        plan = self.tmp / "mine" / "job.json"
+        for workdir in (".", "one"):
+            plan.write_text(json.dumps({"goal": "g", "workdir": workdir, "tasks": [
+                {"id": "t1", "title": "first", "agent": "Sol", "instructions": "i", "acceptance": "a"}]}))
+            for started_in in (one, two, self.tmp):
+                r = self.crew_in(started_in, "run", str(plan))
+                # 3.7 runs "." in whichever repository the command is typed in, and a paused plan continued
+                # from another one delivers the first repository's history into that one. In a repository
+                # without a remote it writes a profile with an empty name instead, which crew then rejects.
+                self.assertEqual(r.returncode, 2, f"{workdir!r} in {started_in}\n{r.stdout}{r.stderr}")
+                self.assertIn("workdir must be an absolute path", r.stdout)
+        self.assertEqual(self.calls(), [])
+        self.assertEqual((self.branches(one), self.branches(two)), (["main"], ["main"]))
+        self.assertFalse((self.home / "projects").exists())  # and no project was made of the folder crew started in
+
+    def test_a_recorded_baseline_of_the_wrong_type_is_an_error_not_a_plan_called_done(self):
+        root = self.repo()
+        self.set_profile(root, checks={"nobroken": "test ! -f broken"})
+        self.write_cfg({"verify": {"fix_rounds": 0}})
+        plan = self.paused(root)  # the baseline is recorded and t1's work waits in the copy
+        good = plan.read_text()
+        self.assertIs(json.loads(good)["checks"]["baseline"]["nobroken"]["ok"], True)
+        n0 = len(self.workers())
+        edits = {"baseline = true": lambda c: c.update(baseline=True),
+                 "baseline = []": lambda c: c.update(baseline=[]),
+                 "baseline = null": lambda c: c.update(baseline=None),
+                 "baseline.nobroken = 'passed'": lambda c: c["baseline"].update(nobroken="passed"),
+                 "baseline.nobroken.ok = 0": lambda c: c["baseline"]["nobroken"].update(ok=0),
+                 "final = 5": lambda c: c.update(final=5),
+                 "regressions = 'none'": lambda c: c.update(regressions="none")}
+        for what, edit in edits.items():
+            p = json.loads(good)
+            edit(p["checks"])
+            plan.write_text(json.dumps(p))
+            r = self.crew("run", str(plan), env={"FAKE_BREAK": "t2"}, check=False)  # t2 breaks the check
+            # 3.7, baseline = true: the checks after the tasks are skipped, the plan is `done`, exit 0
+            self.assertEqual(r.returncode, 2, f"{what}\n{r.stdout}{r.stderr}")
+            self.assertIn("is not what crew records there", r.stdout, what)
+        self.assertEqual(len(self.workers()), n0)  # refused before anything ran
+        plan.write_text(good)
+        r = self.crew("run", str(plan), env={"FAKE_BREAK": "t2"})
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)  # the plan itself is unharmed, and the check counts
+        self.assertEqual(json.loads(plan.read_text())["checks"]["regressions"], ["nobroken"])
+
+    def test_a_profile_with_a_relative_root_is_a_clear_error(self):
+        root = self.repo()
+        sh(root, "git", "remote", "add", "origin", "git@github.com:me/proj.git")
+        self.crew("init", "--workdir", str(root))
+        self.edit_profile(root, root=".", setup=[{"run": "echo proj-setup"}])
+        elsewhere = self.tmp / "elsewhere"
+        elsewhere.mkdir()
+        r = self.crew_in(elsewhere, "queue", "add", "goal", "--all", "--direct")
+        # 3.7: exit 0, "queued q1:"; the profile (its setup commands too) is copied to a name made from the
+        # folder crew was started in, which `crew projects` then reports as broken, and the item is dropped
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("project.root must be an absolute path", r.stdout)
+        self.assertEqual(sorted(f.name for f in (self.home / "projects").iterdir()), ["me__proj.json"])
+        self.assertFalse((self.home / "queue.json").exists())
+        self.assertIn("project.root must be an absolute path", self.crew_in(elsewhere, "projects").stdout)
+        self.crew("init", "--workdir", str(root), "--force")  # the way out the message names
+        self.assertEqual(self.crew_in(elsewhere, "queue", "add", "goal", "--all", "--direct").returncode, 0)
+        self.assertEqual(json.loads((self.home / "queue.json").read_text())["items"][0]["workdir"], str(root))
+
+    def test_unknown_settings_inside_a_section_are_reported_too(self):
+        root = self.repo()
+        self.write_cfg({"verify": {"fix_round": 3, "unsandbox": True}, "setup": {"enable": False},
+                        "split": {"tolerence": 0.5}, "planner": {"maxtasks": 2, "_note": "mine"},
+                        "providers": {"claude": {"enable": False, "timeout": 5}, "gemini": {"cmd": "gemini"}},
+                        "agents": {"Astra": {"role": "does it all", "prefer": "codex"}}})
+        r = self.crew("usage")
+        for name in ("verify.fix_round", "verify.unsandbox", "setup.enable", "split.tolerence", "planner.maxtasks",
+                     "providers.claude.enable", "providers.claude.timeout", "providers.gemini", "agents.Astra.prefer"):
+            self.assertIn(f"no setting named {name!r}; it is ignored", r.stdout)  # 3.7 reports none of these
+        self.assertEqual(r.stdout.count("no setting named"), 9, r.stdout)  # and no real setting, nor "_note"
+        self.write_cfg({})
+        self.crew("init", "--workdir", str(root))
+        path = self.home / "projects" / f"{crew.project_identity(root)[0]}.json"
+        prof = json.loads(path.read_text())
+        prof["overrides"] = {"verify": {"fix_rounds": 2, "fixround": 2}}
+        path.write_text(json.dumps(prof))
+        r = self.crew("config", "--workdir", str(root))
+        self.assertIn("this project's overrides: crew has no setting named 'verify.fixround'", r.stdout)
+        self.assertNotIn("'verify.fix_rounds'", r.stdout)
+
+    def test_an_error_after_the_reader_of_the_output_went_away_is_not_a_traceback(self):
+        root = self.repo()
+
+        def with_no_reader(*args):
+            r, w = os.pipe()
+            os.close(r)
+            try:
+                return subprocess.run([sys.executable, str(HERE / "crew.py"), "--config", str(self.cfg), *args],
+                                      stdout=w, stderr=subprocess.PIPE, text=True, env=self.env, timeout=120)
+            finally:
+                os.close(w)
+
+        for args in (("run", str(self.tmp / "no-such-plan.json")), ("run", "--workdir", str(root)),
+                     ("plans", "--workdir", str(self.tmp / "nowhere")), ("do", "", "--workdir", str(root))):
+            r = with_no_reader(*args)
+            self.assertNotIn("Traceback", r.stderr, args)  # 3.7: BrokenPipeError raised inside the error handler
+            self.assertEqual(r.returncode, 2, args)  # 3.7: 1, which is what a plan that needs review exits with
+        self.assertEqual(with_no_reader("plans", "--all").returncode, 0)  # a listing cut short, as before
+
+    # ---------------------------------------------------------------- parts of earlier fixes no test held
+
+    def test_guard_a_check_or_a_setup_command_cannot_start_crew(self):
+        root = self.repo()
+        said = {step: self.tmp / f"{step}.txt" for step in ("setup", "check")}
+        inner = {step: f"{sys.executable} {HERE / 'crew.py'} --config {self.cfg} do inner --workdir . > {out} 2>&1; "
+                       f"echo exit=$? >> {out}" for step, out in said.items()}
+        self.set_profile(root, setup=[{"run": inner["setup"]}], checks={"starts-crew": inner["check"]})
+        r = self.crew("do", "x", "--workdir", str(root))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        for step, out in said.items():  # law 11: every check runs with CREW_TASK set, and setup with them
+            self.assertIn("can't be started from inside one of its own tasks", out.read_text(), step)
+            self.assertIn("exit=2", out.read_text(), step)
+        self.assertEqual(len(self.workers()), 1)  # the outer task only
+        self.assertEqual(len(list((self.home / "plans").glob("*/*.json"))), 1)
+
+    def test_guard_every_timeout_is_capped_not_only_the_checks(self):
+        for extra in ({"setup": {"timeout_sec": 3000000}}, {"providers": {"codex": {"timeout_sec": 3000000}}},
+                      {"providers": {"claude": {"timeout_sec": 3000000}}}, {"verify": {"timeout_sec": 3000000}}):
+            self.write_cfg(extra)
+            r = self.crew("usage", check=False)
+            self.assertEqual(r.returncode, 2, f"{extra}\n{r.stdout}{r.stderr}")
+            self.assertIn("timeout_sec must be at most", r.stdout, extra)
+
+
+class TestThreeEight(CrewTest):
+    """Stops that were missed or never ended, output that was lost, and state that said more than was true
+    (3.7 review, stops and exits)."""
+
+    def workers(self):
+        return [c for c in self.calls() if "argv" in c and not c.get("planner")]
+
+    def plan_file(self) -> Path:
+        return max((self.home / "plans").glob("*/*.json"), key=lambda f: f.stat().st_mtime)
+
+    def agents_alive(self) -> list[int]:
+        out = subprocess.run(["ps", "-A", "-o", "pid=", "-o", "args="], capture_output=True, text=True).stdout
+        return [int(ln.split()[0]) for ln in out.splitlines() if f"{self.bin}/" in ln]
+
+    def queue_states(self) -> list[str]:
+        f = self.home / "queue.json"
+        return [i["status"] for i in json.loads(f.read_text())["items"]] if f.exists() else []
+
+    def argv(self, *args, around: str = "") -> list[str]:
+        """The command line that runs crew.py. With `around`, crew.py is unchanged and runs after that code
+        has changed something in the Python it runs on (as the 3.7 tests slow down Popen)."""
+        if not around:
+            return [sys.executable, str(HERE / "crew.py"), "--config", str(self.cfg), *args]
+        w = self.tmp / f"around{len(list(self.tmp.glob('around*.py')))}.py"
+        w.write_text(textwrap.dedent(around) + textwrap.dedent("""
+            import runpy, sys
+            sys.argv = sys.argv[1:]
+            runpy.run_path(sys.argv[0], run_name="__main__")
+        """))
+        return [sys.executable, str(w), str(HERE / "crew.py"), "--config", str(self.cfg), *args]
+
+    def patched(self, patch: str, *args) -> list[str]:
+        """The command line that runs crew's main() after `patch` has replaced one of crew's own functions:
+        how a kill at an exact point is made without a crash_point for it."""
+        w = self.tmp / f"patched{len(list(self.tmp.glob('patched*.py')))}.py"
+        w.write_text(f"import os, signal, sys\nsys.path.insert(0, {str(HERE)!r})\nimport crew\n"
+                     + textwrap.dedent(patch) + "\nsys.exit(crew.main())\n")
+        return [sys.executable, str(w), "--config", str(self.cfg), *args]
+
+    def start(self, argv, **env) -> subprocess.Popen:
+        return subprocess.Popen(argv, env={**self.env, **env}, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    def stopped(self, run: subprocess.Popen, within: float, why: str) -> tuple[str, str]:
+        """Wait for crew to end by itself; fail (and clean up) if it does not."""
+        import signal
+        try:
+            return run.communicate(timeout=within)
+        except subprocess.TimeoutExpired:
+            self.fail(why)
+        finally:
+            if run.poll() is None:
+                run.kill()
+            for pid in self.agents_alive():
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+
+    def wait_until(self, cond, secs=20, what="what the test waits for did not happen"):
+        for _ in range(int(secs * 10)):
+            if cond():
+                return
+            time.sleep(0.1)
+        self.fail(what)
+
+    def no_reader(self, *args, env=None, **kw) -> int:
+        r, w = os.pipe()
+        os.close(r)
+        try:
+            return subprocess.run(self.argv(*args), stdout=w, stderr=subprocess.DEVNULL, env={**self.env, **(env or {})},
+                                  timeout=120, **kw).returncode
+        finally:
+            os.close(w)
+
+    # ---------------------------------------------------------------- stopping `queue run`
+
+    def test_a_stop_signal_while_queue_run_starts_its_threads_is_acted_on(self):
+        a, b = self.repo("alpha"), self.repo("beta")
+        self.crew("queue", "add", "do it", "--direct", "--workdir", str(a), "--workdir", str(b))
+        # The signal arrives inside the call that starts the first worker thread.
+        run = self.start(self.argv("queue", "run", around="""
+            import os, signal
+            from concurrent.futures import ThreadPoolExecutor
+            real, sent = ThreadPoolExecutor.submit, []
+            def submit(self, *a, **kw):
+                f = real(self, *a, **kw)
+                if not sent:
+                    sent.append(1)
+                    os.kill(os.getpid(), signal.SIGTERM)
+                return f
+            ThreadPoolExecutor.submit = submit
+        """), FAKE_SLEEP="20")
+        out, err = self.stopped(run, 12, "crew did not stop: the thread it had started works through its project's "
+                                         "queue, and crew ignores every signal now")
+        self.assertEqual(run.returncode, 143, out + err)
+        self.assertEqual(self.agents_alive(), [])
+        self.assertLessEqual(set(self.queue_states()), {"queued", "paused"})  # nothing was run to its end
+
+    def test_a_stop_signal_while_queue_run_looks_at_its_workers_does_not_hang_it(self):
+        a, b = self.repo("alpha"), self.repo("beta")
+        self.crew("queue", "add", "do it", "--direct", "--workdir", str(a), "--workdir", str(b))
+        # The signal arrives at a moment the main thread holds the lock of one of the pool's futures, which
+        # it takes each time it looks at them (two seconds in, so the agents are at work).
+        run = self.start(self.argv("queue", "run", around="""
+            import os, signal, threading, time
+            from concurrent.futures import _base
+            start, sent = time.time(), []
+            class Watched(threading.Condition):
+                def __init__(self):
+                    super().__init__()
+                    take = self.acquire
+                    def acquire(*a, **kw):
+                        got = take(*a, **kw)
+                        if got and not sent and threading.current_thread() is threading.main_thread() \\
+                                and time.time() - start > 2:
+                            sent.append(1)
+                            os.kill(os.getpid(), signal.SIGTERM)
+                        return got
+                    self.acquire = acquire
+                def __enter__(self):
+                    return self.acquire()
+            make = _base.Future.__init__
+            def init(self):
+                make(self)
+                self._condition = Watched()
+            _base.Future.__init__ = init
+        """), FAKE_SLEEP="20")
+        out, err = self.stopped(run, 14, "crew never ended: the lock it held when the signal came was never given "
+                                         "back, a worker waits for it, crew waits for the worker")
+        self.assertEqual(run.returncode, 143, out + err)
+        self.assertEqual(self.agents_alive(), [])
+        self.assertEqual(set(self.queue_states()), {"paused"})
+
+    def test_a_stop_while_a_queue_worker_probes_a_cli_is_acted_on(self):
+        import signal
+        a = self.repo("alpha")
+        self.crew("queue", "add", "do it", "--direct", "--workdir", str(a))
+        run = self.start(self.argv("queue", "run"), FAKE_PROBE_SLEEP="30")  # `claude auth status` hangs
+        try:
+            self.wait_until(self.agents_alive, what="no CLI probe was started")
+            time.sleep(0.3)
+            run.send_signal(signal.SIGTERM)
+        except BaseException:
+            run.kill()
+            raise
+        out, err = self.stopped(run, 10, "crew did not stop: a worker thread waits for a probe nothing can interrupt")
+        self.assertEqual(run.returncode, 143, out + err)
+        self.assertEqual(self.agents_alive(), [])  # the probe was stopped with crew, like any other child
+        self.assertLessEqual(set(self.queue_states()), {"queued", "paused"})
+        r = self.crew("queue", "run")  # and nothing about the stop is in the way of the next run
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    # ---------------------------------------------------------------- output that is lost
+
+    def test_ctrl_c_with_the_output_reader_gone_is_still_a_clean_stop(self):
+        import signal
+        a, b = self.repo("alpha"), self.repo("beta")
+        self.crew("queue", "add", "do it", "--direct", "--agent", "Sol", "--workdir", str(a))
+        self.crew("queue", "add", "do it", "--direct", "--agent", "Astra", "--workdir", str(b))
+        run = self.start(self.argv("queue", "run"), FAKE_SLEEP="20")
+        try:
+            self.wait_until(lambda: len(self.workers()) == 2, what="the two agents did not start")
+            run.stdout.close()  # Ctrl-C on `crew queue run | tee log` goes to tee as well: nobody reads any more
+            run.send_signal(signal.SIGINT)
+            err = run.stderr.read()
+            run.wait(timeout=30)
+        finally:
+            if run.poll() is None:
+                run.kill()
+            run.stderr.close()
+        self.assertNotIn("Traceback", err)
+        self.assertEqual(run.returncode, 130, err)  # an interrupt, whatever became of the line that says so
+        self.assertEqual(self.agents_alive(), [])
+        self.assertEqual(self.queue_states(), ["paused", "paused"])  # not left `running` with nothing running
+
+        root = self.repo("gamma")  # the same for one plan, stopped while its agent works
+        run = self.start(self.argv("do", "x", "--workdir", str(root)), FAKE_SLEEP="20")
+        try:
+            self.wait_until(lambda: len(self.workers()) == 3, what="the agent did not start")
+            run.stdout.close()
+            run.send_signal(signal.SIGINT)
+            err = run.stderr.read()
+            run.wait(timeout=30)
+        finally:
+            if run.poll() is None:
+                run.kill()
+            run.stderr.close()
+        self.assertNotIn("Traceback", err)
+        self.assertEqual(run.returncode, 130, err)
+        self.assertEqual(self.agents_alive(), [])
+
+    def test_queue_run_that_loses_its_reader_stops_its_agents_and_pauses_its_items(self):
+        a, b = self.repo("alpha"), self.repo("beta")
+        self.crew("queue", "add", "do it", "--direct", "--agent", "Sol", "--workdir", str(a))    # codex: 2 s
+        self.crew("queue", "add", "do it", "--direct", "--agent", "Astra", "--workdir", str(b))  # claude: 30 s
+        claude = self.bin / "claude"
+        usual = claude.read_text()
+        claude.write_text(usual.replace('time.sleep(float(os.environ.get("FAKE_SLEEP", "0")))', "time.sleep(30)"))
+        run = self.start(self.argv("queue", "run"), FAKE_SLEEP="2")
+        try:
+            self.wait_until(lambda: len(self.workers()) == 2, what="the two agents did not start")
+            run.stdout.close()  # the reader has left; crew finds out at the line it prints when alpha's agent ends
+        except BaseException:
+            run.kill()
+            raise
+        try:
+            run.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            run.kill()
+            self.fail("crew went on for beta's agent after its output was lost")
+        finally:
+            run.stderr.close()
+        self.assertEqual(run.returncode, 141)
+        self.assertEqual(self.agents_alive(), [])  # beta's agent had 28 s to go: it was stopped
+        self.assertEqual(self.queue_states(), ["paused", "paused"])
+        claude.write_text(usual)
+        r = self.crew("queue", "run")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.queue_states(), ["done", "done"])
+
+    def test_an_error_no_check_foresaw_in_queue_run_stops_the_agents_at_work(self):
+        a, b = self.repo("alpha"), self.repo("beta")
+        self.crew("queue", "add", "do it", "--direct", "--agent", "Sol", "--workdir", str(a))
+        self.crew("queue", "add", "do it", "--direct", "--agent", "Astra", "--workdir", str(b))
+        # crew.py is unchanged. Once both agents are at work, an exception nothing in crew expects is
+        # raised in its main thread, wherever that thread is.
+        run = self.start(self.patched("""
+            import ctypes, threading, time
+            def strike():
+                while len(crew.ACTIVE) < 2:
+                    time.sleep(0.05)
+                time.sleep(0.5)
+                ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_ulong(threading.main_thread().ident),
+                                                           ctypes.py_object(RuntimeError))
+            threading.Thread(target=strike, daemon=True).start()
+        """, "queue", "run"), FAKE_SLEEP="20")
+        out, err = self.stopped(run, 12, "crew went on waiting for its agents after an error of its own")
+        self.assertEqual(run.returncode, 2, out + err)
+        self.assertIn("error: RuntimeError", out)
+        self.assertIn("this is a defect in crew", out)  # the last resort, with work in progress this time
+        self.assertNotIn("Traceback", out + err)
+        self.assertEqual(self.agents_alive(), [])  # "stops cleanly": neither agent outlived crew
+        self.assertEqual(self.queue_states(), ["paused", "paused"])
+        r = self.crew("queue", "run")  # and the next run picks both up
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_queue_add_cut_short_by_its_reader_announces_nothing_it_did_not_do(self):
+        a, b = self.repo("alpha"), self.repo("beta")
+        for root in (a, b):
+            self.set_profile(root)  # so that the two "queued" lines are all it prints
+        rc = self.no_reader("queue", "add", "do it", "--workdir", str(a), "--workdir", str(b))
+        self.assertEqual(self.queue_states(), ["queued", "queued"])  # saved before any of it is announced
+        self.assertEqual(rc, 141)  # and a command that changes something never reports a lost reader as success
+        self.assertEqual(self.no_reader("queue", "list"), 0)  # a listing still does: its reader chose to leave
+
+    def test_output_that_cannot_be_written_is_no_traceback_and_no_exit_0(self):
+        if not os.path.exists("/dev/full"):
+            self.skipTest("needs /dev/full")
+        root = self.repo()
+        self.crew("plan", "x", "--workdir", str(root))
+        plan = self.plan_file()
+
+        def to_a_full_disk(*args):
+            with open("/dev/full", "w") as full:
+                return subprocess.run(self.argv(*args), stdout=full, stderr=subprocess.PIPE, text=True, env=self.env,
+                                      timeout=120)
+        r = to_a_full_disk("run", str(plan))
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertEqual(r.returncode, 141, r.stderr)  # stopped where its output was lost, like a closed pipe
+        self.assertIn("No space left", r.stderr)  # said where it still can be
+        self.assertEqual(self.workers(), [])
+        r = to_a_full_disk("plans", "--all")
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertEqual(r.returncode, 2, r.stderr)  # not 0: nobody chose to stop reading this list
+        # stderr closed as well as the reader gone (`crew run plan 2>&- | head -1`)
+        self.assertEqual(self.no_reader("run", str(plan), preexec_fn=lambda: os.close(2)), 141)
+        r = self.crew("run", str(plan))  # none of it is in the way of a resume
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    # ---------------------------------------------------------------- what the plan file says after a stop
+
+    def test_a_kill_right_after_a_regression_is_recorded_does_not_lose_the_fix_round(self):
+        root = self.repo()
+        self.set_profile(root, checks={"guard": "test ! -f broken"}, setup=[])
+        killed = self.patched("""
+            save = crew._write_json
+            def write(path, data):
+                save(path, data)
+                checks = data.get("checks") if isinstance(data, dict) else None
+                if isinstance(checks, dict) and checks.get("regressions"):
+                    os.kill(os.getpid(), signal.SIGKILL)  # a kill or power cut right after this save
+            crew._write_json = write
+        """, "go", "x", "--workdir", str(root))
+        r = subprocess.run(killed, capture_output=True, text=True, env={**self.env, "FAKE_BREAK": "t2"}, timeout=120)
+        self.assertEqual(r.returncode, -9, r.stdout + r.stderr)
+        plan = self.plan_file()
+        self.assertEqual(json.loads(plan.read_text())["checks"]["regressions"], ["guard"])
+        r = self.crew("run", str(plan))
+        self.assertIn("[fix1]", r.stdout)  # the fix round the regression called for still happens
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        done = json.loads(plan.read_text())
+        self.assertEqual(crew.plan_state(done), "done")
+        self.assertEqual([t["id"] for t in done["tasks"]], ["t1", "t2", "fix1"])
+
+    def test_a_plan_stopped_during_its_last_checks_is_not_called_done(self):
+        for no_git in (False, True):
+            with self.subTest(no_git=no_git):
+                root = self.repo("inplace" if no_git else "proj")
+                self.set_profile(root, checks={"guard": "test ! -f broken"}, setup=[])
+                extra = ["--no-git"] if no_git else []
+                killed = self.patched("""
+                    run_checks = crew.Run._run_checks
+                    def stop_at_the_last_checks(self, label):
+                        if label == "after":
+                            os.kill(os.getpid(), signal.SIGKILL)
+                        return run_checks(self, label)
+                    crew.Run._run_checks = stop_at_the_last_checks
+                """, "go", "x", "--workdir", str(root), *extra)
+                r = subprocess.run(killed, capture_output=True, text=True, env={**self.env, "FAKE_BREAK": "t2"},
+                                   timeout=120)
+                self.assertEqual(r.returncode, -9, r.stdout + r.stderr)
+                plan = self.plan_file()
+                state = json.loads(plan.read_text())
+                self.assertEqual([t["status"] for t in state["tasks"]], ["done", "done"])
+                self.assertEqual(crew.plan_state(state), "paused")  # every task done, and nothing has checked it
+                listed = self.crew("plans", "--workdir", str(root)).stdout.splitlines()
+                self.assertTrue(any(ln.startswith("paused") for ln in listed), listed)
+                self.assertFalse(any(ln.startswith("done") for ln in listed), listed)
+                if not no_git:
+                    self.assertIn("its plan is paused", self.crew("clean").stdout)  # so its copy is kept for the checks
+                n0 = len(self.workers())
+                r = self.crew("run", str(plan), *extra)
+                self.assertNotIn("nothing to do", r.stdout)
+                self.assertIn("checks (after", r.stdout)  # the re-run checks what the stopped run did not
+                self.assertEqual(len(self.workers()), n0 + 1, r.stdout)  # and the regression it finds is fixed
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                self.assertEqual(crew.plan_state(json.loads(plan.read_text())), "done")
+
+    # ---------------------------------------------------------------- values no check foresaw
+
+    def test_odd_values_in_a_repository_a_long_plan_and_the_usage_log_are_not_a_defect_in_crew(self):
+        member = {"packages/web/package.json": json.dumps({"scripts": {"lint": "eslint ."}}),
+                  "packages/list/package.json": "[1]", "packages/broken/package.json": "{nope",
+                  "packages/odd/package.json": json.dumps({"scripts": 5})}
+        shapes = [{"scripts": ["build"]}, {"scripts": {"test": 5, "build": "vite build"}}, {"scripts": "x"},
+                  {"dependencies": ["react"], "devDependencies": 5}, {"workspaces": 5},
+                  {"workspaces": {"packages": 5}}, {"workspaces": ["/abs/*", ".", "", "packages/*"]},
+                  {"workspaces": "packages/*"}]
+        roots = []
+        for n, pkg in enumerate(shapes):
+            roots.append(self.repo(f"shape{n}", files={"package.json": json.dumps(pkg), **member}))
+            r = self.crew("init", "--workdir", str(roots[-1]))  # self.crew fails on exit 2 and on "a defect in crew"
+            self.assertEqual(r.returncode, 0, f"{pkg}\n{r.stdout}{r.stderr}")
+        found = crew.detect_project(roots[1], "x")["checks"]  # what has the right shape is still used
+        self.assertEqual(found.get("build"), "npm run build")
+        self.assertNotIn("test", found)
+        for n in (6, 7):
+            self.assertEqual(crew.detect_project(roots[n], "x")["checks"].get("lint"),
+                             "npm run lint --workspaces --if-present", shapes[n])
+        for name, files in (("pnpm", {"package.json": "{}", "pnpm-workspace.yaml": "packages:\n  - .\n  - /abs/*\n"}),
+                            ("deep", {"package.json": "[" * 100000 + "]" * 100000})):
+            r = self.crew("init", "--workdir", str(self.repo(name, files=files)))
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+        n = 1500  # each task depends on the next one in the file: a long chain, not a cycle
+        chain = self.tmp / "chain.json"
+        chain.write_text(json.dumps({"goal": "g", "workdir": str(roots[0]), "tasks": [
+            {"id": f"t{i}", "title": f"step {i}", "agent": "Sol", "instructions": "i", "acceptance": "a",
+             "depends_on": [f"t{i + 1}"] if i < n else []} for i in range(1, n + 1)]}))
+        r = self.crew("run", str(chain), "--dry-run")
+        self.assertEqual(r.returncode, 0, r.stdout[-500:] + r.stderr)
+        self.assertLess(r.stdout.index(f"[t{n}]"), r.stdout.index("[t1]"))  # and in dependency order
+        loop = json.loads(chain.read_text())
+        loop["tasks"][-1]["depends_on"] = ["t1"]
+        chain.write_text(json.dumps(loop))
+        r = self.crew("run", str(chain), "--dry-run", check=False)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("error: dependency cycle: t1 -> t2 -> ", r.stdout)
+
+        # Two calls that each reported a finite, absurd number of tokens: together they are infinity.
+        entry = json.dumps({"ts": time.time(), "provider": "claude", "tokens": 1e308, "seconds": 1e308, "ok": True,
+                            "project": "p"})
+        (self.home / "usage.jsonl").write_text(entry + "\n" + entry + "\n")
+        r = self.crew("usage")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.write_cfg({"split": {"metric": "tokens"}})
+        r = self.crew("do", "x", "--workdir", str(self.repo("after")))  # and a run after them ends as its plan does
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_text_that_cannot_be_encoded_is_refused_by_name_or_shown_escaped(self):
+        root = self.repo()
+        # "\ud83d" is valid JSON: what a tool writes for a string cut in the middle of an emoji.
+        half = self.tmp / "half.json"
+        half.write_text('{"summary": "one", "tasks": [{"id": "t1", "title": "Add the rocket \\ud83d to the page", '
+                        '"agent": "Sol", "instructions": "i", "acceptance": "a", "depends_on": []}]}')
+        r = self.crew("go", "x", "--workdir", str(root), env={"FAKE_PLAN": str(half)}, check=False)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("invalid plan: task t1: 'title' contains half of a surrogate pair", r.stdout)
+        self.assertEqual(self.workers(), [])
+        self.assertEqual(list((self.home / "plans").glob("*/*.json")), [])  # no plan was left that can never commit
+        own = self.tmp / "own.json"  # the same in a plan written by hand
+        own.write_text(json.dumps({"goal": "g", "workdir": str(root), **json.loads(half.read_text())}))
+        r = self.crew("run", str(own), check=False)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("half of a surrogate pair", r.stdout)
+
+        # In what an agent or a CLI says, it is shown escaped; the run goes on and ends as its plan does.
+        r = self.crew("do", "x", "--workdir", str(root),
+                      env={"FAKE_STATUS": '{"t1": "partial"}', "FAKE_SUMMARY": '"left the rocket \\ud83d out"'})
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)  # needs-review, as for any partial task
+        self.assertIn("left the rocket \\ud83d out", r.stdout)
+
+        # A byte that isn't UTF-8 in a goal typed on the command line is not such a half. Python hands it
+        # back to git as the byte it was; that worked before and still does (not text=True: crew prints it).
+        r = subprocess.run(self.argv("do", os.fsdecode(b"fix the caf\xe9 page"), "--workdir", str(root)),
+                           capture_output=True, env=self.env, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+        odd = os.fsencode(str(self.tmp)) + b"/caf\xe9"  # a folder whose name is Latin-1, not UTF-8
+        try:
+            os.mkdir(odd)
+        except OSError:
+            odd = None  # a file system that has no such names
+        if odd:
+            sh(odd, "git", "init", "-q", "-b", "main")
+            r = self.crew("init", "--workdir", os.fsdecode(odd), check=False)
+            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+            self.assertIn("not valid UTF-8", r.stdout)  # refused by name, with what to do about it
+            self.assertIn("caf\\xe9", r.stdout)
+
+        self.crew("plan", "x", "--workdir", str(root))
+        plan = max((self.home / "plans").glob("*/*.json"), key=lambda f: f.stat().st_mtime)
+        plan.write_bytes(b"\xff" + plan.read_bytes())
+        r = self.crew("run", str(plan), check=False)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn(f"error: {plan}: not valid", r.stdout)  # the error says which file
+
+    def test_every_process_crew_waits_for_has_a_time_limit(self):
+        import ast
+        tree = ast.parse((HERE / "crew.py").read_text())
+        waits = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                 and isinstance(n.func.value, ast.Name) and n.func.value.id == "subprocess"
+                 and n.func.attr in ("run", "call", "check_call", "check_output")]
+        self.assertGreater(len(waits), 3)
+
+        def taskkill(n):  # Windows only, where nothing has been run (see CLAUDE.md)
+            first = n.args[0].elts[0] if n.args and isinstance(n.args[0], ast.List) and n.args[0].elts else None
+            return isinstance(first, ast.Constant) and first.value == "taskkill"
+        untimed = [n.lineno for n in waits if "timeout" not in {k.arg for k in n.keywords} and not taskkill(n)]
+        self.assertEqual(untimed, [], "crew.py waits for a process at these lines with no time limit")
+        # `crew codex-login` was the one: it still hands the key over on stdin, never on the command line.
+        r = self.crew("codex-login", env={"OPENAI_API_KEY": "sk-test-not-a-real-key"})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("Successfully logged in", r.stdout)
+        login = [c for c in self.calls() if c.get("login")]
+        self.assertEqual([c["key_on_stdin"] for c in login], ["sk-test-not-a-real-key"])
+        self.assertEqual(login[0]["login"], ["login", "--with-api-key"])
+
+
 class TestQueue(CrewTest):
     def test_two_projects_run_in_parallel_on_both_providers(self):
         a, b = self.repo("alpha"), self.repo("beta")
@@ -2094,6 +3290,9 @@ def half_way(repo, target, write=True, die="killed"):
         os.kill(os.getppid(), signal.SIGKILL)
     sys.stderr.write("error: unable to write file: No space left on device\n")
     sys.exit(128)
+if cut == "commit" and "commit" in a and "--no-verify" in a:
+    os.kill(os.getppid(), signal.SIGKILL)  # crew dies between its `git add` and its `git commit`
+    sys.exit(1)
 if "-C" in a:
     wt = a[a.index("-C") + 1]
     if cut.startswith("merge") and "merge" in a and "--ff-only" in a:
@@ -2301,6 +3500,412 @@ class TestYourCommitsAndGit(CrewTest):
         r = self.crew("run", str(plan_a), check=False)
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
         self.assertIn(f"`crew run {plan_a}` start over", r.stdout)  # 3.5: "`crew run` start over"
+
+
+    def test_guard_taking_back_a_cut_short_adoption_never_deletes_through_a_symbolic_link(self):
+        """Passes on 3.6 and 3.7: it holds the "never through a symbolic link" half of the undo, which no
+        test held. The repository tracks a link to a folder outside it. Your commit turns the link into a
+        folder, with a file named like one in the folder the link leads to."""
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        (outside / "notes.txt").write_text("in no repository\n")
+        root = self.repo()
+        os.symlink(outside, root / "d")
+        sh(root, "git", "add", "d")
+        sh(root, "git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "a link")
+        self._publish_then_pause_after_t1(root)
+        g = self.plan_of(root)["git"]
+        branch, wt, tip = g["branch"], Path(g["worktree"]), g["tip"]
+        sh(root, "git", "checkout", "-q", branch)
+        os.unlink(root / "d")
+        (root / "d").mkdir()
+        for name in ("README.md", "a.txt", "d/notes.txt"):
+            (root / name).write_text("yours\n")
+        sh(root, "git", "add", "-A")
+        sh(root, "git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "mine")
+        mine = sh(root, "git", "rev-parse", "HEAD").strip()
+        sh(root, "git", "checkout", "-q", "main")
+        r = self.crew("run", "--workdir", str(root), env=self.git_cut("merge"), check=False)
+        self.assertEqual(r.returncode, -9, r.stdout + r.stderr)  # killed inside the merge ...
+        self.assertEqual(sh(wt, "git", "rev-parse", "HEAD").strip(), tip)
+        self.assertTrue((wt / "d").is_symlink())  # ... before git got to the link
+        r = self.crew("run", "--workdir", str(root), check=False)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("put back what it had written", r.stdout)
+        # d/notes.txt is a path the merge writes and the old tip lacks. Looked up through the link, which
+        # was still in place, it is the file outside: taking it back there would delete that one.
+        self.assertTrue((outside / "notes.txt").is_file(), "crew deleted a file outside its copy")
+        self.assertEqual((outside / "notes.txt").read_text(), "in no repository\n")
+        self.assertEqual(sh(root, "git", "show", f"{branch}:d/notes.txt"), "yours\n")
+        self.assertEqual(sh(root, "git", "diff", "--name-only", f"{mine}..{branch}").split(), ["t2.txt"])
+
+
+class TestAdoptionAndSubmodules(CrewTest):
+    """The 3.7 review's confirmed findings about bringing your commits into crew's copy and about
+    submodules. Each test fails on 3.7, except the two that say they guard a fix."""
+
+    plan_of = TestThreeThree.plan_of
+    workers = TestThreeThree.workers
+    files_on = TestThreeThree.files_on
+    key_of = TestThreeThree.key_of
+    plans_dir_of = TestThreeThree.plans_dir_of
+    _publish_then_pause_after_t1 = TestThreeThree._publish_then_pause_after_t1
+    _latest_or_none = TestThreeThree._latest_or_none
+    git_cut = TestYourCommitsAndGit.git_cut
+    you_commit = TestYourCommitsAndGit.you_commit
+    FILEENV = TestYourCommitsAndGit.FILEENV
+    ID = ("-c", "user.name=t", "-c", "user.email=t@t")
+
+    def remote(self, name, *versions):
+        """A repository to use as a submodule's remote, with one commit per version of its files.
+        Returns (path, sha of each commit); it is left at the first commit, so `submodule add` records that."""
+        src = self.tmp / name
+        src.mkdir()
+        sh(src, "git", "init", "-q", "-b", "main")
+        shas = []
+        for files in versions:
+            for path, text in files.items():
+                (src / path).write_text(text)
+            sh(src, "git", "add", "-A")
+            sh(src, "git", *self.ID, "commit", "-q", "-m", f"s{len(shas) + 1}")
+            shas.append(sh(src, "git", "rev-parse", "HEAD").strip())
+        sh(src, "git", "checkout", "-q", shas[0])
+        return (src, *shas)
+
+    def superproject(self, **submodules):
+        sup = self.tmp / "super"
+        sup.mkdir()
+        sh(sup, "git", "init", "-q", "-b", "main")
+        (sup / "README.md").write_text("hi\n")
+        sh(sup, "git", "add", "-A")
+        sh(sup, "git", *self.ID, "commit", "-q", "-m", "base")
+        for path, src in submodules.items():
+            sh(sup, "git", "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(src), path)
+        sh(sup, "git", *self.ID, "commit", "-q", "-m", "add submodules")
+        return sup
+
+    def commit_unpushed(self, sup, path):
+        """You commit inside your checkout of a submodule; its remote doesn't have that commit."""
+        (sup / path / "f.txt").write_text("mine, not pushed\n")
+        sh(sup / path, "git", *self.ID, "commit", "-q", "-am", "local work")
+        return sh(sup / path, "git", "rev-parse", "HEAD").strip()
+
+    def you_commit_on(self, sup, branch, change, msg="mine"):
+        """Like you_commit, for a change made with git commands in a repository that has submodules."""
+        sh(sup, "git", "checkout", "-q", branch)
+        change()
+        sh(sup, "git", *self.ID, "commit", "-q", "-m", msg)
+        sha = sh(sup, "git", "rev-parse", "HEAD").strip()
+        sh(sup, "git", "checkout", "-q", "-f", "main")
+        return sha
+
+    # ---------------------------------------------------------------- the adoption merge
+
+    def staged_then_cut_adoption(self, root):
+        """t2 has finished and crew is killed between its `git add` and its `git commit`. You commit on the crew
+        branch, and the next run is killed while git is half-way through bringing that commit into the copy."""
+        self._publish_then_pause_after_t1(root)
+        g = self.plan_of(root)["git"]
+        branch, wt, tip = g["branch"], Path(g["worktree"]), g["tip"]
+        r = self.crew("run", "--workdir", str(root), env=self.git_cut("commit"), check=False)
+        self.assertEqual(r.returncode, -9, r.stdout + r.stderr)
+        self.assertEqual(sh(wt, "git", "status", "--porcelain"), "A  t2.txt\n")  # staged, not committed
+        mine = self.you_commit(root, branch, {"README.md": "yours\n", "a.txt": "yours\n", "b.txt": "yours\n",
+                                              "note.txt": "yours\n"})
+        r = self.crew("run", "--workdir", str(root), env=self.git_cut("merge"), check=False)
+        self.assertEqual(r.returncode, -9, r.stdout + r.stderr)
+        self.assertEqual(sh(wt, "git", "rev-parse", "HEAD").strip(), tip)
+        self.assertIn(" M README.md\n", sh(wt, "git", "status", "--porcelain"))  # the merge had written this
+        return branch, wt, tip, mine
+
+    def test_a_commit_cut_after_staging_does_not_switch_the_undo_off(self):
+        root = self.repo()
+        branch, wt, tip, mine = self.staged_then_cut_adoption(root)
+        n = len(self.workers())
+        r = self.crew("run", "--workdir", str(root), check=False)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)  # 3.7: exit 2 on every run, "would be overwritten by merge"
+        self.assertEqual(len(self.workers()), n)  # the finished t2 is committed, not run again
+        self.assertEqual(sh(root, "git", "rev-parse", f"{branch}~1").strip(), mine)
+        self.assertEqual(sh(root, "git", "diff", "--name-only", f"{mine}..{branch}").split(), ["t2.txt"])
+
+    def test_a_commit_cut_after_staging_then_a_withdrawn_commit_is_not_delivered_as_the_tasks(self):
+        root = self.repo()
+        branch, wt, tip, mine = self.staged_then_cut_adoption(root)
+        sh(root, "git", "branch", "-f", branch, tip)  # you take your commit back
+        r = self.crew("run", "--workdir", str(root), check=False)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        # 3.7: crew(t2) is ["README.md", "a.txt", "t2.txt"], the half of your withdrawn commit git had written
+        self.assertEqual(sh(root, "git", "diff", "--name-only", f"{tip}..{branch}").split(), ["t2.txt"])
+        self.assertEqual(sh(root, "git", "show", f"{branch}:README.md"), "hi\n")
+
+    def deleted_by_a_waiting_task(self):
+        """t2 has finished, having deleted docs/old.txt, and waits to be committed."""
+        root = self.repo(files={"README.md": "hi\n", "docs/old.txt": "old\n", "docs/older.txt": "older\n"})
+        self._publish_then_pause_after_t1(root)
+        g = self.plan_of(root)["git"]
+        branch, wt, tip = g["branch"], Path(g["worktree"]), g["tip"]
+        self.crew("run", "--workdir", str(root), env={"CREW_CRASH_AT": "before-commit", "FAKE_DELETE": "docs"},
+                  check=False)
+        self.assertEqual(self.plan_of(root)["tasks"][1].get("committing"), tip)
+        self.assertEqual(sh(wt, "git", "status", "--porcelain"), " D docs/old.txt\n D docs/older.txt\n?? t2.txt\n")
+        return root, branch, wt, tip
+
+    def test_your_change_to_a_file_a_task_deleted_is_a_collision_not_a_silent_restore(self):
+        root, branch, wt, tip = self.deleted_by_a_waiting_task()
+        self.you_commit(root, branch, {"docs/old.txt": "yours\n"})
+        n = len(self.workers())
+        r = self.crew("run", "--workdir", str(root), check=False)
+        # 3.7: exit 0, plan done, crew(t2) is ["A t2.txt"] and the file is back on the branch
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("docs/old.txt", r.stdout)
+        self.assertIn("deleted there", r.stdout)
+        self.assertFalse((wt / "docs" / "old.txt").exists())  # the task's deletion stands
+        self.assertEqual(len(self.workers()), n)
+        self.assertNotIn("adopting", self.plan_of(root)["git"])
+        # The way out the message names: take your version of the file. The rest of the task's work is kept.
+        sh(wt, "git", "checkout", "--", "docs/old.txt")
+        r = self.crew("run", "--workdir", str(root), check=False)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(sh(root, "git", "show", f"{branch}:docs/old.txt"), "yours\n")
+        self.assertEqual(sh(root, "git", "diff", "--name-status", f"{branch}~1..{branch}").split("\n")[:2],
+                         ["D\tdocs/older.txt", "A\tt2.txt"])
+
+    def test_a_cut_short_adoption_never_puts_back_a_file_a_task_deleted(self):
+        root, branch, wt, tip = self.deleted_by_a_waiting_task()
+        self.you_commit(root, branch, {"docs/old.txt": "yours\n"})
+        # crew is killed after journaling the adoption, before git wrote anything; then you take the commit back
+        self.crew("run", "--workdir", str(root), env=self.git_cut("merge-early"), check=False)
+        sh(root, "git", "branch", "-f", branch, tip)
+        r = self.crew("run", "--workdir", str(root), check=False)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        # 3.7: "crew put back what it had written", and crew(t2) is ["A t2.txt"]: the deletions are lost
+        self.assertEqual(sh(root, "git", "diff", "--name-status", f"{tip}..{branch}").split("\n")[:3],
+                         ["D\tdocs/old.txt", "D\tdocs/older.txt", "A\tt2.txt"])
+
+    def test_a_file_you_and_a_task_both_deleted_stays_deleted_when_the_adoption_is_cut(self):
+        root, branch, wt, tip = self.deleted_by_a_waiting_task()
+
+        def change():
+            sh(root, "git", "rm", "-q", "docs/old.txt")
+            for name in ("a.txt", "b.txt", "note.txt"):
+                (root / name).write_text("yours\n")
+            sh(root, "git", "add", "-A")
+        self.you_commit_on(root, branch, change)
+        r = self.crew("run", "--workdir", str(root), env=self.git_cut("merge"), check=False)
+        self.assertEqual(r.returncode, -9, r.stdout + r.stderr)  # killed inside the merge: no collision here
+        self.assertFalse((wt / "docs" / "old.txt").exists())
+        sh(root, "git", "branch", "-f", branch, tip)  # you take the commit back
+        r = self.crew("run", "--workdir", str(root), check=False)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("crew put back what it had written", r.stdout)
+        # 3.7: the undo puts docs/old.txt back too, and crew(t2) is ["D docs/older.txt", "A t2.txt"]
+        self.assertEqual(sh(root, "git", "diff", "--name-status", f"{tip}..{branch}").split("\n")[:3],
+                         ["D\tdocs/old.txt", "D\tdocs/older.txt", "A\tt2.txt"])
+
+    def test_the_undo_leaves_an_ignored_file_that_was_there_before_the_merge(self):
+        root = self.repo(files={"README.md": "hi\n", ".gitignore": "*.log\n"})
+        self._publish_then_pause_after_t1(root)
+        g = self.plan_of(root)["git"]
+        branch, wt, tip = g["branch"], Path(g["worktree"]), g["tip"]
+        (wt / "keep.log").write_text("what the interrupted task logged\n")
+
+        def change():
+            (root / "keep.log").write_text("yours\n")
+            (root / "note.txt").write_text("yours\n")
+            sh(root, "git", "add", "-f", "keep.log", "note.txt")
+        self.you_commit_on(root, branch, change)
+        r = self.crew("run", "--workdir", str(root), env=self.git_cut("merge-early"), check=False)
+        self.assertEqual(r.returncode, -9, r.stdout + r.stderr)
+        self.assertIs(self.plan_of(root)["git"].get("adopting_clear"), True)  # git lets a merge write over it
+        sh(root, "git", "branch", "-f", branch, tip)  # you take the commit back; the merge never wrote a file
+        r = self.crew("run", "--workdir", str(root), env={"CREW_CRASH_AT": "before-commit"}, check=False)
+        self.assertIn("crew put back what it had written", r.stdout)
+        self.assertTrue((wt / "keep.log").exists())  # 3.7: deleted by the undo
+        self.assertEqual((wt / "keep.log").read_text(), "what the interrupted task logged\n")
+        self.assertFalse((wt / "note.txt").exists())
+
+    def test_merge_verify_signatures_does_not_refuse_your_own_unsigned_commit(self):
+        root = self.repo()
+        self._publish_then_pause_after_t1(root)
+        branch = self.plan_of(root)["git"]["branch"]
+        mine = self.you_commit(root, branch, {"note.txt": "yours\n"})
+        env = {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "merge.verifySignatures", "GIT_CONFIG_VALUE_0": "true"}
+        r = self.crew("run", "--workdir", str(root), env=env, check=False)
+        # 3.7: exit 2 on every run: "does not have a GPG signature ... git stopped part-way; crew put back ..."
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(sh(root, "git", "diff", "--name-only", f"{mine}..{branch}").split(), ["t2.txt"])
+
+    # ---------------------------------------------------------------- submodules
+
+    def test_one_submodule_that_cannot_be_fetched_does_not_break_the_others(self):
+        libsrc, _ = self.remote("libsrc", {"f.txt": "one\n"})
+        othersrc, _ = self.remote("othersrc", {"o.txt": "one\n"})  # recorded at its remote's HEAD
+        zzzsrc, _, _ = self.remote("zzzsrc", {"z.txt": "one\n"}, {"z.txt": "two\n"})
+        sup = self.superproject(lib=libsrc, other=othersrc, zzz=zzzsrc)
+        sh(zzzsrc, "git", "checkout", "-q", "main")  # zzz's remote has moved on from the commit you record
+        mine = self.commit_unpushed(sup, "lib")
+        sh(sup, "git", *self.ID, "commit", "-q", "-am", "use my lib commit")
+        seen = self.tmp / "seen.txt"
+        self.set_profile(sup, checks={"siblings": f"cat other/o.txt zzz/z.txt > {seen}"}, setup=[])
+        r = self.crew("go", "x", "--workdir", str(sup), env=self.FILEENV)
+        # 3.7: git stops at lib and leaves the two after it cloned but empty. t1 ends "partial" for
+        # "uncommitted changes to tracked files" (other), t2 is skipped, exit 1; zzz is emptied as "not pushed yet?"
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual([t["status"] for t in self.plan_of(sup)["tasks"]], ["done", "done"])
+        self.assertIn("the submodule lib stays empty in crew's copy", r.stdout)
+        self.assertNotIn("the submodule other stays empty", r.stdout)
+        self.assertNotIn("the submodule zzz stays empty", r.stdout)
+        self.assertEqual(seen.read_text(), "one\none\n")  # the checks saw both, at the commits you record
+        branch = self.plan_of(sup)["git"]["branch"]
+        self.assertEqual(sorted(sh(sup, "git", "diff", "--name-only", f"main..{branch}").split()), ["t1.txt", "t2.txt"])
+        self.assertEqual(sh(sup, "git", "ls-tree", branch, "lib").split()[2], mine)
+
+    def test_your_commit_that_moves_one_submodule_and_updates_another_is_not_taken_for_tampering(self):
+        libsrc, _ = self.remote("libsrc", {"f.txt": "one\n"})
+        othersrc, o1, o2 = self.remote("othersrc", {"o.txt": "one\n"}, {"o.txt": "two\n"})
+        sup = self.superproject(lib=libsrc, other=othersrc)
+        self._publish_then_pause_after_t1(sup, extra_env=self.FILEENV)
+        branch = self.plan_of(sup)["git"]["branch"]
+
+        def change():
+            sh(sup, "git", "mv", "lib", "vendor-lib")
+            sh(sup, "git", "-C", "other", "checkout", "-q", o2)
+            sh(sup, "git", "add", "-A")
+        mine = self.you_commit_on(sup, branch, change, "move lib, update other")
+        r = self.crew("run", "--workdir", str(sup), env=self.FILEENV, check=False)
+        # 3.7: exit 2 on every run: "the submodule `vendor-lib` ... has a different `.git` than when crew last
+        # looked". crew's own `git submodule update` had just filled that folder in.
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(sh(sup, "git", "diff", "--name-only", f"{mine}..{branch}").split(), ["t2.txt"])
+        self.assertEqual(sh(sup, "git", "ls-tree", branch, "other").split()[2], o2)
+
+    def agent_file_in_the_way_of_a_submodule_update(self, name, agent_text):
+        libsrc, s1, s2 = self.remote("libsrc", {"f.txt": "one\n"}, {"f.txt": "two\n", "agent.txt": "the lib's own\n"})
+        sup = self.superproject(lib=libsrc)
+        self._publish_then_pause_after_t1(sup, extra_env=self.FILEENV)
+        g = self.plan_of(sup)["git"]
+        branch, wt = g["branch"], Path(g["worktree"])
+        (wt / "lib" / name).parent.mkdir(exist_ok=True)
+        (wt / "lib" / name).write_text(agent_text)  # what the interrupted task left in the submodule
+
+        def change():
+            sh(sup, "git", "-C", "lib", "checkout", "-q", s2)
+            sh(sup, "git", "add", "lib")
+        mine = self.you_commit_on(sup, branch, change, "update lib")
+        return sup, branch, wt, mine, s2
+
+    def test_an_untracked_file_git_would_not_write_over_is_not_forced_over_by_the_next_run(self):
+        sup, branch, wt, mine, s2 = self.agent_file_in_the_way_of_a_submodule_update("agent.txt", "the agent's\n")
+        for attempt in (1, 2):
+            r = self.crew("run", "--workdir", str(sup), env=self.FILEENV, check=False)
+            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)  # 3.7: the second run goes through
+            self.assertIn("untracked working tree files would be overwritten", r.stdout)
+            self.assertNotIn("did not finish last time", r.stdout)  # git ran to its end and refused
+            # 3.7: the second run forces the checkout, and the file reads "the lib's own"
+            self.assertEqual((wt / "lib" / "agent.txt").read_text(), "the agent's\n")
+
+    def test_guard_a_cut_short_submodule_move_is_still_forced_past_generated_files(self):
+        """Passes on 3.7 too: it guards the fix above. What a check run leaves in a submodule (__pycache__) is
+        not an agent's work, and must not turn a move that was cut short back into a dead end."""
+        sup, branch, wt, mine, s2 = self.agent_file_in_the_way_of_a_submodule_update("__pycache__/m.cpython-313.pyc", "x")
+        r = self.crew("run", "--workdir", str(sup), env={**self.FILEENV, **self.git_cut("submodule")}, check=False)
+        self.assertEqual(r.returncode, -9, r.stdout + r.stderr)
+        self.assertEqual(self.plan_of(sup)["git"].get("sync_started"), ["lib"])
+        r = self.crew("run", "--workdir", str(sup), env=self.FILEENV, check=False)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(sh(sup, "git", "ls-tree", branch, "lib").split()[2], s2)
+        self.assertEqual(sh(sup, "git", "diff", "--name-only", f"{mine}..{branch}").split(), ["t2.txt"])
+
+    def test_an_unpushed_submodule_commit_on_the_crew_branch_stops_with_the_real_reason(self):
+        libsrc, _ = self.remote("libsrc", {"f.txt": "one\n"})
+        sup = self.superproject(lib=libsrc)
+        self._publish_then_pause_after_t1(sup, extra_env=self.FILEENV)
+        branch = self.plan_of(sup)["git"]["branch"]
+
+        def change():
+            self.commit_unpushed(sup, "lib")
+            sh(sup, "git", "add", "lib")
+        mine = self.you_commit_on(sup, branch, change, "use my lib commit")
+        n = len(self.workers())
+        r = self.crew("run", "--workdir", str(sup), env=self.FILEENV, check=False)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        # 3.7, first run only: "could not read crew/... from <repo> into crew's copy: ... Errors during submodule
+        # fetch: lib", although the branch had been read
+        self.assertNotIn("could not read", r.stdout)
+        self.assertIn("could not move the submodule checkout(s) lib", r.stdout)
+        self.assertEqual(self.plan_of(sup)["git"]["tip"], mine)  # your commit is adopted; only lib is behind
+        self.assertEqual(len(self.workers()), n)
+        sh(sup / "lib", "git", "-c", "protocol.file.allow=always", "push", "-q", "origin", "HEAD:refs/heads/mine")
+        r = self.crew("run", "--workdir", str(sup), env=self.FILEENV, check=False)  # pushed: the plan goes on
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(sh(sup, "git", "diff", "--name-only", f"{mine}..{branch}").split(), ["t2.txt"])
+
+    def test_files_a_task_leaves_inside_a_submodule_are_reported_and_the_copy_is_kept(self):
+        libsrc, _ = self.remote("libsrc", {"f.txt": "one\n"})
+        othersrc, _ = self.remote("othersrc", {"f.txt": "one\n"})
+        sup = self.superproject(lib=libsrc, other=othersrc)
+        self.commit_unpushed(sup, "other")  # so `other` is empty in crew's copy, and `lib` is populated
+        sh(sup, "git", *self.ID, "commit", "-q", "-am", "use my other commit")
+        made = {"lib/agent-made.txt": "an agent's work\n", "other/agent-made.txt": "an agent's work\n"}
+        r = self.crew("go", "x", "--workdir", str(sup), env={**self.FILEENV, "FAKE_EDIT": json.dumps(made)})
+        plan = self.plan_of(sup)
+        wt = Path(plan["git"]["worktree"])
+        # 3.7: both tasks "done", exit 0, "removed crew's copy": the two files are gone and nothing said so
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertEqual([t["status"] for t in plan["tasks"]], ["partial", "skipped"])
+        self.assertIn("2 new file(s) inside a submodule", r.stdout)
+        self.assertIn("lib/agent-made.txt, other/agent-made.txt", r.stdout)
+        self.assertIn("keeping crew's copy", r.stdout)
+        for f in made:
+            self.assertEqual((wt / f).read_text(), "an agent's work\n")
+        self.assertEqual(sh(sup, "git", "diff", "--name-only", f"main..{plan['git']['branch']}").split(), ["t1.txt"])
+
+    def test_guard_what_setup_and_checks_leave_inside_a_submodule_is_not_held_against_a_task(self):
+        """Passes on 3.7 too: it guards the fix above. Only files that appear during a task count as its own."""
+        libsrc, _ = self.remote("libsrc", {"f.txt": "one\n"})
+        sup = self.superproject(lib=libsrc)
+        self.set_profile(sup, setup=[{"run": "echo built > lib/setup-made.txt"}],
+                         checks={"cache": "mkdir -p lib/__pycache__ && touch lib/__pycache__/m.cpython-313.pyc"})
+        r = self.crew("go", "x", "--workdir", str(sup), env=self.FILEENV)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        plan = self.plan_of(sup)
+        self.assertEqual([t["status"] for t in plan["tasks"]], ["done", "done"])
+        self.assertFalse(Path(plan["git"]["worktree"]).exists())  # nothing of a task's was left: the copy is removed
+
+    # ---------------------------------------------------------------- inputs
+
+    def test_a_plan_whose_workdir_is_a_folder_inside_a_repository_is_refused_before_anything_is_made(self):
+        root = self.repo(files={"README.md": "hi\n", "packages/app/x.txt": "x\n"})
+        plan = self.tmp / "myplan.json"
+        text = json.dumps({"goal": "g", "workdir": str(root / "packages" / "app"), "tasks": [
+            {"id": "t1", "title": "one", "agent": "Luna", "instructions": "i", "acceptance": "a"}]})
+        plan.write_text(text)
+        for args in (("--dry-run",), ()):
+            r = self.crew("run", str(plan), *args, check=False)
+            # 3.7: the dry run exits 0; every run then fails with "could not clone ...: repository ... does not exist"
+            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+            self.assertIn(f'set "workdir" to {root}', r.stdout)
+            self.assertNotIn("could not clone", r.stdout)
+        self.assertEqual(plan.read_text(), text)  # 3.7 leaves a half-made git block in the file
+        self.assertFalse((self.home / "worktrees").exists())
+        r = self.crew("run", str(plan), "--no-git")  # in place, as the message says
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue((root / "packages" / "app" / "t1.txt").exists())
+
+    def test_an_empty_branch_prefix_is_refused(self):
+        root = self.repo()
+        self.write_cfg({"git": {"branch_prefix": ""}})
+        r = self.crew("go", "x", "--workdir", str(root), check=False)
+        # 3.7: runs, puts a branch with no prefix in your repo (20261113-...-x), and then refuses its own plan
+        # on every resume: "invalid git block (needs a crew branch, base commit and worktree)"
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("git.branch_prefix", r.stdout)
+        self.assertEqual(sh(root, "git", "branch", "--format=%(refname:short)").split(), ["main"])
+        self.assertEqual(self.workers(), [])
+        self.write_cfg({"git": {"branch_prefix": "wip/"}})  # a prefix of your own still works
+        r = self.crew("go", "x", "--workdir", str(root))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue(self.plan_of(root)["git"]["branch"].startswith("wip/"))
 
 
 if __name__ == "__main__":

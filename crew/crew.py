@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import copy
+import errno
 import fnmatch
 import hashlib
 import json
@@ -36,8 +37,7 @@ import threading
 import time
 import traceback
 from collections import Counter
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor
-from concurrent.futures import wait as wait_for_futures
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -49,7 +49,7 @@ except ImportError:  # Windows: thread locks only
 if sys.version_info < (3, 9):
     sys.exit("crew needs Python 3.9 or newer")
 
-VERSION = "3.7"
+VERSION = "3.8"
 HERE = Path(__file__).resolve().parent
 CREW_HOME = Path(os.path.expanduser(os.environ.get("CREW_HOME") or "~/.crew"))
 PROVIDERS = ("claude", "codex")
@@ -167,6 +167,12 @@ class ProviderUnavailable(ValueError):
     """No provider can take work right now (limits, logins): try again later."""
 
 
+class OutputLost(BrokenPipeError):
+    """crew's own output can't be written any more: its reader left (`crew ... | head`), the terminal
+    was closed under a crew that got no hang-up, or the disk it is redirected to is full. Raised by
+    log() for every way a write can fail, so that all of them end where a closed pipe does."""
+
+
 class _Lock:
     def __init__(self) -> None:
         self.tlock = threading.Lock()
@@ -231,11 +237,73 @@ def lock_held_here(name: str) -> bool:
 
 # --------------------------------------------------------------------------- small helpers
 
+def _printable(text: str) -> str:
+    """What print() can write. Text from a CLI or a plan may hold what the output has no bytes for
+    (half a surrogate pair out of a JSON escape; a byte of a file name that isn't UTF-8, where the
+    output is strict about it): that is shown as a backslash escape instead of ending the run with
+    an encoding error. Text the output can write as it is goes out unchanged."""
+    enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+    try:
+        text.encode(enc, getattr(sys.stdout, "errors", None) or "strict")
+        return text
+    except (LookupError, UnicodeError):
+        pass
+    try:
+        return text.encode(enc, "backslashreplace").decode(enc)
+    except (LookupError, UnicodeError):
+        return text.encode("ascii", "backslashreplace").decode("ascii")
+
+
+def not_text(s: str) -> bool:
+    """True for a string that can't be handed to git or another program: it holds half of a
+    surrogate pair. JSON can spell one ("\\ud83d", a string cut in the middle of an emoji), and
+    json.loads accepts it. The halves Python itself uses for a byte that isn't UTF-8 (in a file name
+    or a goal typed on the command line) are not meant: those go back out as the byte they were."""
+    try:
+        s.encode("utf-8", "surrogateescape")
+    except UnicodeEncodeError:
+        return True
+    return False
+
+
 def log(msg: str) -> None:
     prefix = getattr(_TL, "prefix", "")
     text = "\n".join(prefix + line if line else line for line in msg.split("\n")) if prefix else msg
     with LOG_LOCK:
-        print(text, flush=True)
+        try:
+            print(_printable(text), flush=True)
+        except UnicodeError:  # a ValueError too, and not a lost output
+            raise
+        except OSError as e:  # EPIPE, and also EIO (terminal gone) and ENOSPC (`> crew.log` on a full disk)
+            raise OutputLost(e.errno or errno.EIO, e.strerror or str(e)) from None
+        except ValueError as e:  # stdout was closed
+            raise OutputLost(errno.EBADF, str(e)) from None
+
+
+_OUTPUT_DROPPED: list[bool] = []
+
+
+def _drop_output() -> None:
+    """Point stdout at nothing once it has failed: what is still buffered must not fail a second
+    time when Python flushes at exit, which would replace crew's exit code with 120."""
+    _OUTPUT_DROPPED.append(True)
+    with contextlib.suppress(OSError, ValueError, AttributeError):
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+
+
+def say(msg: str) -> None:
+    """log() for a line crew prints while it is stopping or reporting an error. If the output has gone
+    as well (Ctrl-C on `crew ... | tee log` stops tee at the same moment), the line goes to stderr if
+    that still leads anywhere, and is dropped otherwise: failing to print it must not replace the
+    stop, its exit code and the bookkeeping that follows."""
+    try:
+        if _OUTPUT_DROPPED:
+            raise OutputLost(errno.EPIPE, "crew's output is gone")
+        log(msg)
+    except OutputLost:
+        _drop_output()
+        with contextlib.suppress(OSError, ValueError, AttributeError):
+            print(getattr(_TL, "prefix", "") + msg.strip("\n"), file=sys.stderr, flush=True)
 
 
 def crash_point(name: str) -> None:
@@ -287,6 +355,7 @@ def str_list(v) -> bool:
 
 MAX_JSON_DEPTH = 100  # crew's own files nest a handful of levels; deeper is corruption or an attack
 MAX_TIMEOUT_SEC = 2_000_000  # about 23 days; the operating system's wait call overflows not far above it
+MAX_USAGE_PER_CALL = 1e12  # tokens or seconds one call can be logged with; far above any real call
 
 
 def _read_json(path: Path):
@@ -294,6 +363,8 @@ def _read_json(path: Path):
         data = json.loads(Path(path).read_text())
     except json.JSONDecodeError as e:
         raise ValueError(f"{path}: invalid JSON ({e})") from None
+    except UnicodeDecodeError as e:  # a ValueError too, but one whose own text doesn't say which file
+        raise ValueError(f"{path}: not valid {e.encoding} text (byte {e.start}); crew's files are JSON") from None
     except RecursionError:
         raise ValueError(f"{path}: invalid JSON (nested too deeply)") from None
     # Bound nesting here, without recursing, so nothing downstream (deep_merge's deepcopy,
@@ -343,15 +414,43 @@ def global_config_path() -> Path:
 _UNKNOWN_NOTED: set[tuple[str, str]] = set()
 
 
+AGENT_KEYS = ("role", "prefers", "model")
+PROFILE_KEYS = ("project", "overrides")
+PROJECT_KEYS = ("name", "root", "roots", "first_commit", "key", "stack", "setup", "checks", "notes", "agent_docs",
+                "tracked_files", "detected_at")
+
+
+def _note_unknown(where: str, name: str, hint: str = "") -> None:
+    if not name.rsplit(".", 1)[-1].startswith("_") and (where, name) not in _UNKNOWN_NOTED:
+        _UNKNOWN_NOTED.add((where, name))
+        log(f"note: {where}: crew has no setting named {short(name, 60)!r}; it is ignored{hint}")
+
+
 def _note_unknown_keys(layer: dict, where: str) -> None:
     """A key crew doesn't know changes nothing, so say so once: a misspelling, or a project's
-    checks put under `overrides`, would otherwise look like a setting that took effect."""
-    for k in sorted(set(layer) - set(DEFAULTS)):
-        if not str(k).startswith("_") and (where, str(k)) not in _UNKNOWN_NOTED:
-            _UNKNOWN_NOTED.add((where, str(k)))
-            hint = " (a project's checks and setup belong under `project` in its profile)" \
-                if k in ("checks", "setup", "notes", "stack") and where.startswith("this project") else ""
-            log(f"note: {where}: crew has no setting named {short(str(k), 40)!r}; it is ignored{hint}")
+    checks put under `overrides`, would otherwise look like a setting that took effect. Every
+    setting but the section names sits one level down (`verify.unsandboxed`,
+    `providers.claude.sandboxed_bash`), so that level is checked too."""
+    for k in sorted(map(str, set(layer) - set(DEFAULTS))):
+        _note_unknown(where, k, " (a project's checks and setup belong under `project` in its profile)"
+                      if k in ("checks", "setup", "notes", "stack") and where.startswith("this project") else "")
+    for sec, known in DEFAULTS.items():
+        sub = layer.get(sec)
+        if not isinstance(sub, dict):
+            continue
+        if sec == "agents":  # the names are the owner's; what an agent may hold is fixed
+            for name, a in sub.items():
+                for k in sorted(map(str, set(a) - set(AGENT_KEYS))) if isinstance(a, dict) else []:
+                    _note_unknown(where, f"agents.{name}.{k}")
+        elif sec == "providers":
+            for p, pc in sub.items():
+                if p not in PROVIDERS:
+                    _note_unknown(where, f"providers.{p}", f" (the providers are {' and '.join(PROVIDERS)})")
+                for k in sorted(map(str, set(pc) - set(known[p]))) if p in PROVIDERS and isinstance(pc, dict) else []:
+                    _note_unknown(where, f"providers.{p}.{k}")
+        else:
+            for k in sorted(map(str, set(sub) - set(known))):
+                _note_unknown(where, f"{sec}.{k}")
 
 
 def load_config(explicit: Path | None, overrides: dict | None = None) -> dict:
@@ -379,13 +478,25 @@ def load_config(explicit: Path | None, overrides: dict | None = None) -> dict:
     for sec, k in numeric:
         if k in cfg[sec] and num(cfg[sec][k], None) is None:
             raise ValueError(f"config: {sec}.{k} must be a number")
+    # A switch must be a JSON boolean. "false" in quotes is a string, and a string is true: it would turn
+    # on what it was meant to turn off (verify.unsandboxed runs agent-edited check code with no sandbox).
+    switches = [("split", "fallback_on_error"), ("verify", "enabled"), ("verify", "unsandboxed"), ("setup", "enabled"),
+                ("git", "enabled")]
+    for sec, k in switches:
+        if k in cfg[sec] and not isinstance(cfg[sec][k], bool):
+            raise ValueError(f"config: {sec}.{k} must be true or false (no quotes), not {short(json.dumps(cfg[sec][k]), 30)}")
     timeouts = [("verify", cfg["verify"]), ("setup", cfg["setup"])] + [
         (f"providers.{p}", cfg["providers"][p]) for p in PROVIDERS if isinstance(cfg["providers"].get(p), dict)]
     for where, sec in timeouts:
         if num(sec.get("timeout_sec"), 0) > MAX_TIMEOUT_SEC:
             raise ValueError(f"config: {where}.timeout_sec must be at most {MAX_TIMEOUT_SEC} (seconds)")
-    if not isinstance(cfg["git"].get("branch_prefix", ""), str):
-        raise ValueError('config: git.branch_prefix must be a string like "crew/"')
+    if cfg["planner"].get("provider", "claude") not in PROVIDERS:
+        raise ValueError("config: planner.provider must be claude or codex")
+    prefix = cfg["git"].get("branch_prefix", "crew/")
+    if not isinstance(prefix, str) or not prefix.strip():
+        # Not empty: crew tells its own branches from yours by this prefix, and Run refuses a plan whose branch
+        # lacks one. With "" the first run made a branch of any name in your repo and no later run would touch it.
+        raise ValueError('config: git.branch_prefix must be a non-empty string like "crew/"')
     if not isinstance(cfg["planner"].get("model") or {}, dict):
         raise ValueError('config: planner.model must be an object like {"claude": "opus"}')
     if not isinstance(cfg["split"].get("target_share") or {}, dict) or not all(
@@ -402,6 +513,10 @@ def load_config(explicit: Path | None, overrides: dict | None = None) -> dict:
         for k in ("timeout_sec", "max_parallel"):
             if k in pc and num(pc[k], None) is None:
                 raise ValueError(f"config: providers.{p}.{k} must be a number")
+        for k in ("enabled", "sandboxed_bash"):
+            if k in pc and not isinstance(pc[k], bool):
+                raise ValueError(f"config: providers.{p}.{k} must be true or false (no quotes), "
+                                 f"not {short(json.dumps(pc[k]), 30)}")
         if pc.get("model") is not None and not isinstance(pc["model"], str):
             raise ValueError(f"config: providers.{p}.model must be a string or null")
     agents = cfg.get("agents")
@@ -482,11 +597,24 @@ def git_root(path: Path) -> Path | None:
     return Path(out).resolve() if r.returncode == 0 and out else None
 
 
+def need_utf8(path: Path, what: str) -> Path:
+    """Refuse, by name, a path that isn't valid UTF-8. crew hands paths on as text, and the write
+    denials of Claude's sandbox are JSON: a name with other bytes in it can't be written there, so
+    the denial for that folder would name nothing. Better not to start than to start without it."""
+    try:
+        str(path).encode("utf-8")
+    except UnicodeEncodeError:
+        shown = str(path).encode("utf-8", "surrogateescape").decode("utf-8", "backslashreplace")
+        raise ValueError(f"{what} {shown} has a name that is not valid UTF-8 (the bytes shown as \\x..). crew "
+                         "can't pass such a path on to git and the CLIs unchanged; rename it.") from None
+    return path
+
+
 def resolve_workdir(arg: Path | None) -> Path:
     p = Path(arg or Path.cwd()).expanduser().resolve()
     if not p.is_dir():
         raise ValueError(f"workdir not found: {p}")
-    return git_root(p) or p
+    return need_utf8(git_root(p) or p, "the folder")
 
 
 def tracked_dirty(root: Path) -> bool:
@@ -502,6 +630,12 @@ def stale_gitlinks(root: Path) -> list[str]:
     """Submodules whose checkout is at another commit than the index records (what `git add -u` would stage)."""
     out = git(root, "diff-files", "--raw", "-z", "--ignore-submodules=dirty").stdout.split("\0")
     return [path for meta, path in zip(out[::2], out[1::2]) if meta.startswith(":160000 160000 ")]
+
+
+def submodule_paths(root: Path) -> list[str]:
+    """The paths the index records as submodules (this repository's own, not nested ones)."""
+    out = git(root, "ls-files", "-s", "-z").stdout.split("\0")
+    return [e.partition("\t")[2] for e in out if e.startswith("160000 ") and e.partition("\t")[2]]
 
 
 def ignored_entries(root: Path) -> set[str]:
@@ -528,6 +662,22 @@ def current_branch(root: Path) -> str:
 def head_sha(root: Path) -> str:
     r = git(root, "rev-parse", "HEAD")
     return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def first_commit(root: Path) -> str:
+    """The oldest commit HEAD descends from, or ''. It stays the same through every later commit, rename
+    and change of remote, so it tells a repository from a different one that now sits at the same path."""
+    out = git(root, "rev-list", "--max-parents=0", "HEAD").stdout.split()
+    return out[-1] if out and is_sha(out[-1]) else ""
+
+
+def other_repository(root: Path, commits: list) -> bool:
+    """True when crew recorded `commits` for the repository at this path and the one there now holds
+    none of them: the folder was replaced by another project. False whenever that can't be told
+    (nothing recorded, or no git history to look in)."""
+    commits = [c for c in commits if is_sha(c)]
+    return bool(commits) and bool(head_sha(root)) and not any(
+        git(root, "cat-file", "-e", f"{c}^{{commit}}").returncode == 0 for c in commits)
 
 
 def git_identity_args(root: Path) -> list[str]:
@@ -598,7 +748,7 @@ def profile_path(key: str) -> Path:
     return CREW_HOME / "projects" / f"{key}.json"
 
 
-def load_profile(key: str) -> dict | None:
+def load_profile(key: str, note: bool = False) -> dict | None:
     p = profile_path(key)
     if not p.exists():
         return None
@@ -606,6 +756,11 @@ def load_profile(key: str) -> dict | None:
     if not isinstance(prof, dict) or not isinstance(prof.get("project"), dict):
         raise ValueError(f"{p}: not a crew project profile")
     proj = prof["project"]
+    if note:  # for the project a command works on: a misspelt `override` or `project.check` changes nothing
+        for k in sorted(map(str, set(prof) - set(PROFILE_KEYS))):
+            _note_unknown(f"profile {p}", k, " (a profile holds `project` and `overrides`)")
+        for k in sorted(map(str, set(proj) - set(PROJECT_KEYS))):
+            _note_unknown(f"profile {p}", f"project.{k}")
     if not isinstance(proj.get("checks", {}), dict) or not all(
             isinstance(k, str) and isinstance(v, str) for k, v in proj.get("checks", {}).items()):
         raise ValueError(f"{p}: project.checks must map names to shell commands")
@@ -617,9 +772,13 @@ def load_profile(key: str) -> dict | None:
         if (k == "name" or k in proj) and not (isinstance(proj.get(k), str) and proj.get(k)):
             raise ValueError(f"{p}: project.{k} must be a non-empty string "
                              "(`crew init --force` rebuilds the profile and keeps your overrides)")
-    for k in ("stack", "notes", "agent_docs"):
+    for k in ("stack", "notes", "agent_docs", "roots"):
         if not isinstance(proj.get(k, []), list) or not all(isinstance(x, str) for x in proj.get(k, [])):
             raise ValueError(f"{p}: project.{k} must be a list of strings")
+    # Absolute paths, as crew writes them. A relative one would mean whatever folder crew is started in.
+    if not all(os.path.isabs(r) for r in [proj.get("root", "/"), *proj.get("roots", [])]):
+        raise ValueError(f"{p}: project.root must be an absolute path "
+                         "(`crew init --force` rebuilds the profile and keeps your overrides)")
     if not isinstance(prof.get("overrides", {}), dict):
         raise ValueError(f"{p}: overrides must be an object")
     return prof
@@ -673,17 +832,43 @@ def _pick_package_manager(root: Path, pkg: dict) -> tuple[str, list[str]]:
     return "npm", notes
 
 
+def _obj(v) -> dict:
+    return v if isinstance(v, dict) else {}
+
+
+def _package_scripts(pkg) -> dict[str, str]:
+    """The scripts of a parsed package.json. It is the repository's file, not crew's, and any JSON
+    can be in it: only an object's string-valued entries count."""
+    return {k: v for k, v in _obj(_obj(pkg).get("scripts")).items() if isinstance(v, str)}
+
+
+def _package_json(path: Path):
+    """A package.json parsed, or None if it can't be."""
+    try:
+        return json.loads(_text(path) or "{}")
+    except (ValueError, RecursionError):
+        return None
+
+
 def _workspace_packages(root: Path, pkg: dict) -> list[Path]:
     pats = pkg.get("workspaces") or []
     if isinstance(pats, dict):
         pats = pats.get("packages") or []
+    if isinstance(pats, str):
+        pats = [pats]
     ws = _text(root / "pnpm-workspace.yaml")
-    pats = list(pats) + re.findall(r"^\s*-\s*['\"]?([^'\"\n#]+?)['\"]?\s*$", ws, re.M)
+    pats = (pats if isinstance(pats, list) else []) + re.findall(r"^\s*-\s*['\"]?([^'\"\n#]+?)['\"]?\s*$", ws, re.M)
     out = []
     for pat in pats:
         if not isinstance(pat, str) or pat.startswith("!"):
             continue
-        for d in sorted(root.glob(pat.rstrip("/"))):
+        if os.path.isabs(pat) or not Path(pat).parts:
+            continue  # absolute, "" or "." (the root itself, whose scripts are read already): no member to find
+        try:
+            found = sorted(root.glob(pat.rstrip("/")))
+        except (ValueError, NotImplementedError, IndexError, OSError, RecursionError):
+            continue  # a pattern pathlib has no glob for (which ones differs between Python versions)
+        for d in found:
             if (d / "package.json").is_file() and "node_modules" not in d.parts:
                 out.append(d)
     return out[:200]
@@ -699,12 +884,14 @@ def detect_project(root: Path, name: str) -> dict:
     if (root / "package.json").is_file():
         try:
             pkg = json.loads(_text(root / "package.json"))
-        except json.JSONDecodeError:
+        except (ValueError, RecursionError):
             notes.append("package.json is not valid JSON.")
     if isinstance(pkg, dict):
         pm, pm_notes = _pick_package_manager(root, pkg)
         notes += pm_notes
-        deps = {**(pkg.get("dependencies") or {}), **(pkg.get("devDependencies") or {})}
+        # The repository's own file: take what has the shape npm gives it and pass over the rest.
+        deps = {k: v if isinstance(v, str) else "" for k, v in
+                {**_obj(pkg.get("dependencies")), **_obj(pkg.get("devDependencies"))}.items()}
         stack.append(f"node/{pm}")
         stack += [label for dep, label in (("next", "next"), ("vite", "vite"), ("svelte", "svelte"),
                                            ("react", "react"), ("vue", "vue"), ("astro", "astro"),
@@ -715,9 +902,9 @@ def detect_project(root: Path, name: str) -> dict:
                    "yarn": "yarn install --immutable" if berry else "yarn install --frozen-lockfile",
                    "bun": "bun install --frozen-lockfile"}[pm]
         setup.append({"run": install, "unless_exists": "node_modules"})
-        scripts = pkg.get("scripts") or {}
+        scripts = _package_scripts(pkg)
         members = _workspace_packages(root, pkg)
-        member_scripts = set().union(*[set((json.loads(_text(d / "package.json") or "{}").get("scripts") or {}))
+        member_scripts = set().union(*[set(_package_scripts(_package_json(d / "package.json")))
                                        for d in members]) if members else set()
         run = (lambda s: f"{pm} run {s}")
         everywhere = {"npm": "npm run {s} --workspaces --if-present", "pnpm": "pnpm -r --if-present run {s}",
@@ -853,7 +1040,7 @@ def detect_project(root: Path, name: str) -> dict:
         notes.append(f"Large repo ({files} tracked files): every task must name the paths it touches.")
     return {"name": name, "root": str(root), "stack": stack, "setup": setup, "checks": checks,
             "notes": notes, "agent_docs": docs, "tracked_files": files,
-            "detected_at": time.strftime("%Y-%m-%d")}
+            "detected_at": time.strftime("%Y-%m-%d"), "first_commit": first_commit(root)}
 
 
 def _path_key(root: Path) -> str:
@@ -871,13 +1058,27 @@ def _migrate_key(root: Path, key: str) -> None:
     if old == key or not (profile_path(old).exists() or plans_dir(old).is_dir()):
         return
     moved = running = 0
+    aside = None
     with file_lock("profiles"):
         if profile_path(old).exists():
-            if profile_path(key).exists():  # another checkout already has one: keep both
-                profile_path(old).replace(profile_path(old).with_suffix(".json.moved"))
+            # A profile already at the new name is this checkout's own when it records this path and no
+            # other: `origin` was removed and has come back, and ensure_profile left the old-name profile in
+            # place when it copied it. The copy is the one in use since, with whatever was edited since: it wins.
+            own = False
+            with contextlib.suppress(ValueError, OSError):
+                there, mine = load_profile(key), load_profile(old)
+                if there is not None and mine is not None and there["project"].get("root") == str(root) \
+                        and not there["project"].get("roots") \
+                        and profile_path(old).stat().st_mtime >= profile_path(key).stat().st_mtime:
+                    mine["project"]["name"] = there["project"]["name"]  # the name that goes with this key
+                    _write_json(profile_path(old), mine)
+                    own = True
+            if profile_path(key).exists() and not own:  # another checkout's: keep both
+                aside = profile_path(old).with_suffix(".json.moved")
+                profile_path(old).replace(aside)
             else:
                 profile_path(old).replace(profile_path(key))
-            moved += 1
+                moved += 1
         if plans_dir(old).is_dir():
             plans_dir(key).mkdir(parents=True, exist_ok=True)
             for f in sorted(plans_dir(old).glob("*.json")):
@@ -897,36 +1098,61 @@ def _migrate_key(root: Path, key: str) -> None:
             with contextlib.suppress(OSError):
                 plans_dir(old).rmdir()
     if moved:
-        log(f"note: moved crew's profile and plans for {root} to its new name ({key})")
+        log(f"note: moved crew's {'plans' if aside is not None else 'profile and plans'} for {root} to its "
+            f"new name ({key})")
+    if aside is not None:  # said as it is: nothing reads a .moved file
+        log(f"note: {root} is now {key}, which already has a profile ({profile_path(key)}); that one is used. The "
+            f"profile this checkout had until now was set aside as {aside}: copy what you need from it.")
     if running and str(root) not in _MIGRATION_NOTED:
         _MIGRATION_NOTED.add(str(root))
         log(f"note: {running} plan(s) of {root} are running and stay in {plans_dir(old)} until they stop")
 
 
 def _profile_of_checkout(root: Path, key: str) -> tuple[str, dict] | None:
-    """(old name, profile) that this checkout had under another key, newest first; None if it had none."""
+    """(old name, profile) that this checkout had under another key, newest first; None if it had none.
+    A profile is a checkout's when it records the checkout's path: as `root` (the checkout it was detected
+    in) or among `roots` (other checkouts of the same remote, which share it). The path alone is not
+    enough: a different repository may sit there now, and the profile holds setup commands crew runs
+    outside any sandbox. So the profile is left alone when the repository has none of the commits crew
+    recorded for the one that was there (`first_commit` in the profile, else the path's plans)."""
     files = [f for f in (CREW_HOME / "projects").glob("*.json") if f.stem != key]
     for f in sorted(files, key=lambda f: f.stat().st_mtime if f.exists() else 0, reverse=True):
         try:
             prof = load_profile(f.stem)
         except (ValueError, OSError):
             continue
-        if prof and prof["project"].get("root") == str(root):
-            return str(prof["project"].get("name") or f.stem), prof
+        if not prof or str(root) not in (prof["project"].get("root"), *prof["project"].get("roots", [])):
+            continue
+        was = str(prof["project"].get("name") or f.stem)
+        seen = prof["project"].get("first_commit")
+        if other_repository(root, [seen] if is_sha(seen) else _commits_planned_at(root)):
+            log(f"note: {root} was known to crew as {was}, but the repository there now has none of that "
+                f"project's commits: a different project is in that folder, so the profile {f} is not used for it.")
+            continue
+        return was, prof
     return None
 
 
 def ensure_profile(root: Path, *, force: bool = False, quiet: bool = False) -> tuple[str, dict]:
     key, name = project_identity(root)
     _migrate_key(root, key)
-    prof = None if force else load_profile(key)
+    prof = None if force else load_profile(key, note=True)
+    if prof is not None and str(root) not in (prof["project"].get("root"), *prof["project"].get("roots", [])):
+        # Several checkouts of one remote share its profile, and `root` names only the one it was detected
+        # in. Each other one is put on record, so that its profile is still found when its `origin` changes.
+        with file_lock("profiles"):
+            prof = load_profile(key) or prof
+            if str(root) not in prof["project"].get("roots", []):
+                prof["project"]["roots"] = [*prof["project"].get("roots", []), str(root)]
+                _write_json(profile_path(key), prof)
     earlier = None if prof is not None or profile_path(key).exists() else _profile_of_checkout(root, key)
     if earlier is not None and not force:
         # `origin` was renamed, re-pointed or removed, so this checkout has a new name. What was detected
         # and edited for it under the old one still describes it: carry it over instead of starting again.
         # The old profile stays (another checkout of the old remote may use it, and so do earlier plans).
         was, prof = earlier
-        prof["project"]["name"] = name
+        prof["project"].update(name=name, root=str(root))  # the copy is this checkout's own
+        prof["project"].pop("roots", None)
         with file_lock("profiles"):
             _write_json(profile_path(key), prof)
         log(f"note: {root} was known to crew as {was}; its profile was copied to {profile_path(key)}, and "
@@ -1013,7 +1239,9 @@ def read_usage(window_hours: float) -> list[dict]:
             continue
         if not isinstance(e, dict) or num(e.get("ts")) < cutoff or not isinstance(e.get("provider"), str):
             continue
-        e["tokens"], e["seconds"] = num(e.get("tokens")), num(e.get("seconds"))
+        # Bounded, not only finite: a CLI's reply can report 1e308 tokens, and two such entries add up to
+        # infinity, which no later step can count, divide or print.
+        e["tokens"], e["seconds"] = (min(max(num(e.get(k)), 0.0), MAX_USAGE_PER_CALL) for k in ("tokens", "seconds"))
         e["project"] = e["project"] if isinstance(e.get("project"), str) else ""
         out.append(e)
     return out
@@ -1101,9 +1329,8 @@ def login_status(cfg: dict, p: str) -> tuple[bool, str]:
             # No terminal for a probe (here and in the others below): `claude auth status` and `claude --help`
             # touch the terminal they are given, and from a background job (`crew ... &`) that stops the
             # whole job, crew included, with the plan lock held and no timeout able to fire.
-            r = subprocess.run([provider_cfg(cfg, p)["cmd"], *sub], capture_output=True, stdin=subprocess.DEVNULL,
-                               text=True, timeout=60, env=provider_env(p))
-            _AUTH_CACHE[p] = (r.returncode == 0, short((r.stdout or r.stderr).strip(), 100))
+            rc, out, err = _probe([provider_cfg(cfg, p)["cmd"], *sub], provider_env(p))
+            _AUTH_CACHE[p] = (rc == 0, short((out or err).strip(), 100))
         except (OSError, subprocess.TimeoutExpired) as e:
             _AUTH_CACHE[p] = (False, str(e))
     return _AUTH_CACHE[p]
@@ -1113,10 +1340,11 @@ def login_status(cfg: dict, p: str) -> tuple[bool, str]:
 # update that renames one is caught up front instead of failing every task.
 CONTRACT = {
     "claude": [(["--help"], ["--print", "--output-format", "--json-schema", "--setting-sources",
-                             "--permission-mode", "--tools", "--allowedTools", "--settings", "--model"])],
+                             "--permission-mode", "--tools", "--allowedTools", "--disallowedTools", "--settings",
+                             "--model"])],
     "codex": [(["exec", "--help"], ["--json", "--output-schema", "--output-last-message", "--sandbox",
-                                    "--skip-git-repo-check", "--cd", "--model"])],
-    "codex-sandbox": [(["sandbox", "--help"], ["--permission-profile"])],
+                                    "--skip-git-repo-check", "--cd", "--model", "--ignore-rules", "--config"])],
+    "codex-sandbox": [(["sandbox", "--help"], ["--permission-profile", "--config"])],
 }
 _CONTRACT_CACHE: dict[str, str] = {}
 
@@ -1130,9 +1358,8 @@ def contract_problem(cfg: dict, which: str) -> str:
         problem = ""
         for args, needles in CONTRACT[which]:
             try:
-                r = subprocess.run([cmd, *args], capture_output=True, stdin=subprocess.DEVNULL, text=True,
-                                   timeout=60, env=provider_env(p))
-                text = r.stdout + r.stderr
+                _, out, err = _probe([cmd, *args], provider_env(p))
+                text = out + err
             except (OSError, subprocess.TimeoutExpired) as e:
                 problem = f"`{os.path.basename(cmd)} {' '.join(args)}` failed: {e}"
                 break
@@ -1419,6 +1646,25 @@ def _exec(cmd: list[str], stdin_text: str | bytes, cwd: Path, timeout: float,
     return rc, dec(out), dec(err), time.time() - t0
 
 
+def _probe(cmd: list[str], env: dict | None = None, timeout: float = 60, stdin_text: str = "") -> tuple[int, str, str]:
+    """Run one of crew's short helper commands (a login check, `--help`, a sandbox test) and return
+    (exit code, stdout, stderr). It goes through _exec like every other child: in its own session, on
+    record, killed as a tree, and stopped with crew. `queue run` makes these calls in worker threads,
+    where a signal can't interrupt a plain subprocess.run: crew then waited out every probe, a minute
+    each if a CLI hung, before it stopped. Raises OSError if the command can't be started and
+    subprocess.TimeoutExpired if it takes longer than `timeout`, as subprocess.run would."""
+    try:
+        cwd = Path.cwd()
+    except OSError:  # the directory crew was started in has been deleted
+        cwd = Path(os.sep)
+    rc, out, err, _ = _exec(cmd, stdin_text, cwd, timeout, dict(os.environ) if env is None else env)
+    if rc == 124 and err.endswith(f"timed out after {timeout:.0f}s"):
+        raise subprocess.TimeoutExpired(cmd, timeout)
+    if rc == 127 and not out and err.startswith(f"cannot start {cmd[0]}: "):
+        raise OSError(err)
+    return rc, out, err
+
+
 _SANDBOX_READY: list[bool] = []
 
 
@@ -1431,8 +1677,8 @@ def claude_sandbox_ready() -> bool:
             ok = True
         elif sys.platform.startswith("linux") and shutil.which("bwrap") and shutil.which("socat"):
             with contextlib.suppress(OSError, subprocess.TimeoutExpired):
-                ok = subprocess.run(["bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "true"],
-                                    capture_output=True, stdin=subprocess.DEVNULL, timeout=20).returncode == 0
+                ok = _probe(["bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "true"],
+                            timeout=20)[0] == 0
         _SANDBOX_READY.append(ok)
     return _SANDBOX_READY[0]
 
@@ -1452,11 +1698,10 @@ def codex_sandbox_problem(cfg: dict) -> str:
         if not problem:
             with tempfile.TemporaryDirectory(prefix="crew-probe-") as d:
                 try:
-                    r = subprocess.run([cmd, "sandbox", "-P", ":workspace", "-C", d, "--", "sh", "-c", "exit 7"],
-                                       capture_output=True, stdin=subprocess.DEVNULL, text=True, errors="replace",
-                                       timeout=60, env=provider_env("codex"))
-                    if r.returncode != 7:
-                        problem = f"codex sandbox does not work here: {short(r.stderr or r.stdout, 200) or r.returncode}"
+                    rc, out, err = _probe([cmd, "sandbox", "-P", ":workspace", "-C", d, "--", "sh", "-c", "exit 7"],
+                                          provider_env("codex"))
+                    if rc != 7:
+                        problem = f"codex sandbox does not work here: {short(err or out, 200) or rc}"
                 except (OSError, subprocess.TimeoutExpired) as e:
                     problem = f"codex sandbox does not work here: {e}"
         _SANDBOX_PROBE[cmd] = problem
@@ -1477,8 +1722,8 @@ def run_shell(cfg: dict, command: str, root: Path, timeout: float, *, sandboxed:
             env.pop(k, None)
     if sandboxed:  # repo-controlled commands: no credentials at all (setup keeps them for private registries)
         env = {k: v for k, v in env.items() if not SECRET_ENV.search(k)}
-        argv = [provider_cfg(cfg, "codex")["cmd"], "sandbox", "-P", ":workspace", "-C", str(root),
-                "--", "sh", "-c", command]
+        argv = [provider_cfg(cfg, "codex")["cmd"], "sandbox", *_codex_own_config_only(root), "-P", ":workspace",
+                "-C", str(root), "--", "sh", "-c", command]
     else:
         argv = ["sh", "-c", command] if os.name != "nt" else ["cmd", "/c", command]
     rc, out, err, secs = _exec(argv, "", root, timeout, env)
@@ -1519,33 +1764,35 @@ CODEX_SANDBOX_FLAGS = ("--sandbox", "-s", "--dangerously-bypass-approvals-and-sa
 
 
 def _claude_worker_args(args: list[str], deny: list[str]) -> tuple[list[str], bool]:
-    """The worker flags for Claude: the configured `args`, plus whatever they leave out of what
-    keeps a worker contained. `args` exists to add flags, so a config that sets it must not lose
-    the permission mode, the sandbox or the write denials by leaving them out; a key the config
-    does set is kept. Returns (flags, is the sandbox on with its escape hatch off?)."""
+    """The worker flags for Claude: crew's `--settings`, then the configured `args`. `args` exists to
+    add flags, so a config that sets it must not lose the permission mode, the sandbox or the write
+    denials by leaving them out; a key the config does set is kept. crew's own flags come first: a
+    flag at the end of `args` that is missing its value then has nothing of crew's to swallow, and
+    ends in the CLI's own error. Returns (flags, is every shell command sandboxed?)."""
     flat: list[str] = []
     for a in args:  # --settings=x becomes --settings x
         flat += ["--settings", a.split("=", 1)[1]] if a.startswith("--settings=") else [a]
-    if "--permission-mode" not in flat and "--dangerously-skip-permissions" not in flat:
-        flat = ["--permission-mode", "acceptEdits", *flat]
     # Claude reads one --settings, the last on its command line, and ignores any before it whole.
     # Only that one is passed on: the settings crew adds its rules to, and decides the Bash grant
     # by, are then the only settings the worker is started with.
-    out: list[str] = []
-    at, i = -1, 0
+    rest: list[str] = []
+    raw, i = None, 0
     while i < len(flat):
-        if flat[i] == "--settings" and i + 1 < len(flat):  # the next token is its value, as the CLI pairs them
-            if at >= 0:
-                del out[at:at + 2]
-            at = len(out)
-            out += flat[i:i + 2]
+        if flat[i] == "--settings":
+            # Without a value the CLI takes the next token for one: crew's own flag, or a file of that name
+            # in the working tree, which an agent can write.
+            if i + 1 >= len(flat) or flat[i + 1].startswith("-"):
+                raise ValueError("providers.claude.args: --settings has no value. Give JSON or a JSON file after "
+                                 "it, so crew can add its sandbox rules to it.")
+            raw = flat[i + 1]
             i += 2
         else:
-            out.append(flat[i])
+            rest.append(flat[i])
             i += 1
+    if "--permission-mode" not in rest and "--dangerously-skip-permissions" not in rest:
+        rest = ["--permission-mode", "acceptEdits", *rest]
     data: dict = {}
-    if at >= 0:
-        raw = out[at + 1]
+    if raw is not None:
         try:
             data = json.loads(raw) if raw.lstrip().startswith("{") else _read_json(Path(raw).expanduser())
         except (OSError, ValueError) as e:
@@ -1560,11 +1807,54 @@ def _claude_worker_args(args: list[str], deny: list[str]) -> tuple[list[str], bo
         sb.setdefault(k, v)
     kept = fs.get("denyWrite") if isinstance(fs.get("denyWrite"), list) else []
     fs["denyWrite"] = list(dict.fromkeys([*kept, *deny]))
-    if at >= 0:
-        out[at + 1] = json.dumps(data)
-    else:
-        out += ["--settings", json.dumps(data)]
-    return out, sb.get("enabled") is True and sb.get("allowUnsandboxedCommands") is False
+    # The other provider's stored login stays out of this worker's reach (law 10): the sandbox limits
+    # writes, not reads, and whatever a worker reads goes to its own model provider.
+    kept = fs.get("denyRead") if isinstance(fs.get("denyRead"), list) else []
+    fs["denyRead"] = list(dict.fromkeys([*kept, os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")]))
+    # excludedCommands run outside the sandbox. They ask first, but not once crew has allowed Bash.
+    contained = sb.get("enabled") is True and sb.get("allowUnsandboxedCommands") is False \
+        and not sb.get("excludedCommands")
+    return ["--settings", json.dumps(data), *rest], contained
+
+
+def _claude_own_settings_files() -> list[Path]:
+    """The settings files of the owner's that every Claude call loads (`--setting-sources user` plus
+    the machine's managed settings)."""
+    managed = Path({"darwin": "/Library/Application Support/ClaudeCode",
+                    "win32": r"C:\Program Files\ClaudeCode"}.get(sys.platform, "/etc/claude-code"))
+    return [Path(os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")) / "settings.json",
+            managed / "managed-settings.json", *sorted((managed / "managed-settings.d").glob("*.json"))]
+
+
+def claude_shell_refusal(pc: dict, contained: bool) -> str:
+    """'' if a Claude worker may have Bash, else why not. It may when every command it could run is
+    sandboxed: the sandbox starts here, the settings the worker gets have it on with its escape hatch
+    off, and nothing takes commands out of it. Claude merges `sandbox.excludedCommands` from the
+    owner's own settings into crew's (crew can't empty that list from the command line); such a
+    command asks before it runs unsandboxed, and crew's `--allowedTools Bash` would be the answer."""
+    if not pc.get("sandboxed_bash", True):
+        return "providers.claude.sandboxed_bash is false"
+    if not contained:
+        return ("the --settings in providers.claude.args turn the sandbox off, leave its escape hatch open "
+                "or take commands out of it (sandbox.excludedCommands)")
+    for f in _claude_own_settings_files():
+        if not f.is_file():
+            continue
+        try:
+            data = _read_json(f)
+        except (OSError, ValueError):
+            return f"crew can't read {f} as JSON, so it can't tell whether that file takes commands out of the sandbox"
+        sb = data.get("sandbox") if isinstance(data, dict) else None
+        if isinstance(sb, dict) and sb.get("excludedCommands"):
+            return (f"{f} takes commands out of the sandbox (sandbox.excludedCommands: "
+                    f"{short(json.dumps(sb['excludedCommands']), 80)}); remove them there to give workers a shell")
+    if not claude_sandbox_ready():
+        return "Claude's sandbox can't start here" + (" (apt install bubblewrap socat)"
+                                                      if sys.platform.startswith("linux") else "")
+    return ""
+
+
+_NO_SHELL_NOTED: set[str] = set()
 
 
 def run_claude(cfg: dict, prompt: str, workdir: Path, *, schema: dict | None = None,
@@ -1584,11 +1874,20 @@ def run_claude(cfg: dict, prompt: str, workdir: Path, *, schema: dict | None = N
         # Claude's sandbox would otherwise let it write a repo's git directory; crew's copy's .git
         # and the user's own checkout are made read-only for the agent.
         args, contained = _claude_worker_args(list(pc.get("args") or []), deny_write or [])
-        cmd += args
-        if pc.get("sandboxed_bash", True) and contained and claude_sandbox_ready():
+        why = claude_shell_refusal(pc, contained)
+        if not why:
             # Every shell command then runs in the sandbox without a prompt (the settings above
             # turn off its escape hatch). Never granted when the sandbox can't start.
             cmd += ["--allowedTools", "Bash"]
+        else:
+            # No shell at all, not merely no grant: without the grant the worker's commands still run
+            # wherever the owner's own settings allow them (an allow rule such as `Bash(crew *)`, or
+            # autoAllowBashIfSandboxed), and with the sandbox off or unable to start that is unsandboxed.
+            cmd += ["--disallowedTools", "Bash"]
+            if why not in _NO_SHELL_NOTED:
+                _NO_SHELL_NOTED.add(why)
+                log(f"note: Claude workers get no shell: {why}")
+        cmd += args  # last: a flag there that lacks its value can't take one of crew's for it
     rc, out, err, secs = _exec(cmd, prompt, workdir, pc.get("timeout_sec", 1800), provider_env("claude"))
     data = _last_json_object(out) or {}
     text = data.get("result") or ""
@@ -1613,10 +1912,46 @@ def run_claude(cfg: dict, prompt: str, workdir: Path, *, schema: dict | None = N
     return res
 
 
+def _toml_string(text: str) -> str:
+    return '"' + "".join(f"\\u{ord(c):04x}" if c < " " or c == "\x7f" else "\\" + c if c in '"\\' else c
+                         for c in text) + '"'
+
+
+def _codex_own_config_only(workdir: Path) -> list[str]:
+    """Flags that keep Codex to the owner's own configuration in `workdir`, for `codex exec` and
+    `codex sandbox` alike. Codex loads `.codex/config.toml` from a project it trusts, and `codex exec`
+    trusts whatever directory it is started in (it writes that into ~/.codex/config.toml). In crew's
+    copy that file belongs to whoever worked there last: a Claude worker can write it, and the tool
+    servers it names are started outside any sandbox, its sandbox settings and environment policy are
+    obeyed. Marking the directory untrusted for this one call is how Codex is told not to read it.
+    The second flag puts CREW_TASK into the shell of every command even when the owner's
+    `shell_environment_policy` passes on only a core set of variables."""
+    try:
+        paths = list(dict.fromkeys((str(workdir), os.path.realpath(workdir))))
+        for p in paths:
+            p.encode("utf-8")
+    except (OSError, UnicodeEncodeError):  # a path crew can't write as TOML: no way to say it to Codex
+        raise ValueError(f"crew can't name {workdir} to Codex (its path is not valid UTF-8), so it can't keep Codex "
+                         "from loading settings left in that directory; Codex is not run there") from None
+    untrusted = ",".join(f'{_toml_string(p)}={{trust_level="untrusted"}}' for p in paths)
+    return ["-c", f"projects={{{untrusted}}}", "-c", 'shell_environment_policy.set.CREW_TASK="1"']
+
+
+def _codex_sets_sandbox(args: list[str]) -> bool:
+    """Does the configured `args` choose Codex's sandbox itself? `-s` also takes its value attached
+    (`-sread-only`, `-s=read-only`); a second `--sandbox` from crew is then an error on every task."""
+    return any(a in CODEX_SANDBOX_FLAGS or a.startswith("--sandbox=") or (a.startswith("-s") and not a.startswith("--"))
+               for a in args)
+
+
 def run_codex(cfg: dict, prompt: str, workdir: Path, *, schema: dict | None = None,
               read_only: bool = False, model: str | None = None, deny_write: list[str] | None = None) -> Result:
     # Codex's workspace-write sandbox already keeps .git and everything outside the workdir read-only.
     pc = provider_cfg(cfg, "codex")
+    try:
+        own_config_only = _codex_own_config_only(workdir)
+    except ValueError as e:
+        return Result("codex", False, error=str(e))
     with tempfile.TemporaryDirectory(prefix="crew-codex-") as tmp:
         last = Path(tmp) / "last.txt"
         cmd = [pc["cmd"], "exec", "--json", "-C", str(workdir), "-o", str(last)]
@@ -1628,13 +1963,19 @@ def run_codex(cfg: dict, prompt: str, workdir: Path, *, schema: dict | None = No
             sf = Path(tmp) / "schema.json"
             sf.write_text(json.dumps(schema))
             cmd += ["--output-schema", str(sf)]
+        args = []
         if read_only:
             cmd += ["--sandbox", "read-only"]
         else:
             args = list(pc.get("args") or [])
-            if not any(a in CODEX_SANDBOX_FLAGS or a.startswith("--sandbox=") for a in args):
+            if not _codex_sets_sandbox(args):
                 args = ["--sandbox", "workspace-write", *args]  # `args` adds flags; it never drops the sandbox
             cmd += args
+        # An `allow` rule in an execpolicy file runs the matching command outside the sandbox, with no
+        # question asked. The owner's rules are written for the tool they sit at (the README suggests one
+        # for `crew` itself), and a rules file in the working tree is whatever an earlier agent left there.
+        # Neither is for a worker, or for the planner, which is read-only. After `args`: the last -c wins.
+        cmd += ([] if "--ignore-rules" in args else ["--ignore-rules"]) + own_config_only
         cmd += ["-"]  # prompt on stdin
         rc, out, err, secs = _exec(cmd, prompt, workdir, pc.get("timeout_sec", 1800), provider_env("codex"))
         text = last.read_text(errors="replace").strip() if last.exists() else ""
@@ -1789,6 +2130,11 @@ def validate_plan(cfg: dict, plan: dict, max_tasks: int | None = None) -> list[d
                 raise ValueError(f"task {name}: missing or empty {k!r}")
             if "\0" in t[k] or (k in ("id", "agent") and re.search(r"[\x00-\x1f]", t[k])):
                 raise ValueError(f"task {name}: {k!r} contains control characters")
+            if not_text(t[k]):
+                # "\ud83d" is valid JSON (a string cut in the middle of an emoji) and is not text: it can't
+                # be put in a commit message, so a plan holding it could never commit its task.
+                raise ValueError(f"task {name}: {k!r} contains half of a surrogate pair (\\ud800-\\udfff), "
+                                 "which is not valid text")
         deps = t.setdefault("depends_on", [])
         if not isinstance(deps, list) or not all(isinstance(d, str) for d in deps):
             raise ValueError(f"task {name}: depends_on must be a list of task ids")
@@ -1805,22 +2151,29 @@ def validate_plan(cfg: dict, plan: dict, max_tasks: int | None = None) -> list[d
 
 
 def topo_order(tasks: list[dict]) -> list[dict]:
+    """Tasks with each one after everything it depends on (depth first, in the order given). Done with
+    a stack of its own, not by recursion: a long chain of dependencies in a hand-written plan is not
+    an error, and Python's recursion limit would make it one."""
     by_id = {t["id"]: t for t in tasks}
     order, state = [], {}
-
-    def visit(tid: str, path: tuple) -> None:
-        if state.get(tid) == "done":
-            return
-        if state.get(tid) == "active":
-            raise ValueError("dependency cycle: " + " -> ".join((*path, tid)))
-        state[tid] = "active"
-        for d in by_id[tid]["depends_on"]:
-            visit(d, (*path, tid))
-        state[tid] = "done"
-        order.append(by_id[tid])
-
     for t in tasks:
-        visit(t["id"], ())
+        if state.get(t["id"]) == "done":
+            continue
+        state[t["id"]] = "active"
+        stack = [(t["id"], iter(by_id[t["id"]]["depends_on"]))]
+        while stack:
+            tid, deps = stack[-1]
+            for d in deps:
+                if state.get(d) == "active":
+                    raise ValueError("dependency cycle: " + " -> ".join([*(s[0] for s in stack), d]))
+                if state.get(d) != "done":
+                    state[d] = "active"
+                    stack.append((d, iter(by_id[d]["depends_on"])))
+                    break
+            else:
+                state[tid] = "done"
+                order.append(by_id[tid])
+                stack.pop()
     return order
 
 
@@ -1858,7 +2211,30 @@ def plans_for(key: str, root: Path | None = None) -> list[Path]:
                 continue
             if not isinstance(data, dict) or data.get("workdir") != str(root):
                 continue
+            # The same path is not always the same repository. A plan kept under another name is this
+            # checkout's only if the repository still has the commit the plan was made on: one made for
+            # a project that used to be in this folder would be run on, and delivered into, another.
+            if f.parent != plans_dir(key) and other_repository(root, _plan_commits(data)):
+                continue
         out.append(f)
+    return out
+
+
+def _plan_commits(plan: dict) -> list[str]:
+    """The commits a plan records of the repository it was made for: where its branch starts, and where
+    the checkout was when it was planned."""
+    g, pa = plan.get("git"), plan.get("planned_at")
+    return [c for c in (g.get("base") if isinstance(g, dict) else None,
+                        pa.get("head") if isinstance(pa, dict) else None) if is_sha(c)]
+
+
+def _commits_planned_at(root: Path) -> list[str]:
+    """What every plan made for this path, under any name, records of the repository that was there."""
+    out: list[str] = []
+    for f in (CREW_HOME / "plans").glob("*/*.json"):
+        plan = _plan_or_none(f)
+        if plan and plan.get("workdir") == str(root):
+            out += _plan_commits(plan)
     return out
 
 
@@ -2005,6 +2381,30 @@ def own_files_in(cfg: dict, workdir: Path) -> dict[Path, str]:
     return out
 
 
+def plan_tip(plan: dict):
+    """The commit a plan's work ends at; None for a plan that works in place (no git block)."""
+    g = plan.get("git") if isinstance(plan.get("git"), dict) else None
+    return (g.get("tip") or g.get("base")) if g else None
+
+
+def checks_due(plan: dict) -> bool:
+    """The checks ran before the work (a baseline is recorded) and have not been run on what the plan
+    now ends at: a run that was stopped while they ran, or commits made since. `final_tip` alone can't
+    tell: without git it is None both before and after, so the results must be there as well."""
+    checks = plan.get("checks") if isinstance(plan.get("checks"), dict) else {}
+    if not isinstance(checks.get("baseline"), dict):
+        return False
+    return not isinstance(checks.get("final"), dict) or checks.get("final_tip") != plan_tip(plan)
+
+
+def checks_skipped(plan: dict) -> bool:
+    """crew recorded that the checks could not be run on what the plan now ends at (switched off since
+    the baseline, taken out of the profile, or the sandbox gone), and said so when it happened."""
+    checks = plan.get("checks") if isinstance(plan.get("checks"), dict) else {}
+    s = checks.get("skipped")
+    return isinstance(s, dict) and s.get("tip") == plan_tip(plan)
+
+
 def plan_state(plan: dict) -> str:
     """done, paused (work left that a re-run continues), or needs-review."""
     tasks = [t for t in plan.get("tasks", []) if isinstance(t, dict)]
@@ -2012,8 +2412,11 @@ def plan_state(plan: dict) -> str:
     checks = plan.get("checks") if isinstance(plan.get("checks"), dict) else {}
     if any(s in ("pending", "running") for s in statuses) or any("committing" in t for t in tasks):
         return "paused"
-    if all(s == "done" for s in statuses) and not checks.get("regressions") and not plan.get("setup_failed"):
-        return "done"
+    if all(s == "done" for s in statuses) and not plan.get("setup_failed"):
+        if checks_due(plan) and not checks_skipped(plan):
+            return "paused"  # every task is done, but nothing is done until the checks have run on it (law 5)
+        if not checks.get("regressions"):
+            return "done"
     return "needs-review"
 
 
@@ -2086,6 +2489,17 @@ def remove_tree(path: Path, tries: int = 5) -> None:
             time.sleep(1)
 
 
+def plan_workdir(plan, plan_path) -> Path:
+    """The folder a plan is for: an absolute path, as crew writes it and the README asks of a plan written
+    by hand. A relative one would mean the folder crew happens to be started in, a different one each time."""
+    wd = plan.get("workdir") if isinstance(plan, dict) else None
+    if not isinstance(wd, str) or not wd:
+        raise ValueError(f"{plan_path}: not a crew plan (needs goal, workdir, tasks)")
+    if not os.path.isabs(wd):
+        raise ValueError(f"{plan_path}: workdir must be an absolute path, not {short(wd, 80)!r}")
+    return Path(wd)
+
+
 class Run:
     """One pass over a plan: worktree, setup, baseline checks, tasks, verification.
 
@@ -2101,8 +2515,18 @@ class Run:
         if not isinstance(plan, dict) or not isinstance(plan.get("goal"), str) \
                 or not isinstance(plan.get("workdir"), str) or not plan["workdir"]:
             raise ValueError(f"{plan_path}: not a crew plan (needs goal, workdir, tasks)")
-        if not isinstance(plan.setdefault("checks", {}), dict):
+        plan_workdir(plan, plan_path)
+        checks = plan.setdefault("checks", {})
+        if not isinstance(checks, dict):
             raise ValueError(f"{plan_path}: 'checks' must be an object")
+        # What crew records of the checks decides `done`: a baseline that isn't one would skip the checks
+        # after the tasks, and one that says a check already failed would hide a regression.
+        results = lambda v: isinstance(v, dict) and all(  # noqa: E731
+            isinstance(r, dict) and isinstance(r.get("ok"), bool) for r in v.values())
+        for k, ok in (("baseline", results), ("final", results), ("regressions", str_list)):
+            if k in checks and not ok(checks[k]):
+                raise ValueError(f"{plan_path}: checks.{k} is not what crew records there; restore the file, or "
+                                 "start a new plan")
         self.order = validate_plan(cfg, plan)
         for t in plan["tasks"]:  # what crew itself records on a task is read back from disk like the rest
             snap = t.get("untracked_before")
@@ -2115,7 +2539,8 @@ class Run:
             if wrong:
                 raise ValueError(f"{plan_path}: task {t['id']}: {wrong[0]!r} is not what crew records there; "
                                  "restore the file, or start a new plan")
-        self.root = Path(plan["workdir"])
+        self.root = need_utf8(Path(plan["workdir"]), "this plan's workdir")
+        need_utf8(self.path.absolute(), "the plan file")
         if not self.root.is_dir():
             raise ValueError(f"workdir not found: {self.root}")
         key = plan["project"].get("key") if isinstance(plan.get("project"), dict) else None
@@ -2135,6 +2560,15 @@ class Run:
             raise ValueError(f"{self.root} is in a git repository, but git can't use it ({err or 'git not found'}). "
                              "Fix git (install it, or `git config --global --add safe.directory <repo>`), "
                              "or pass --no-git.")
+        top = git_root(self.root) if self.use_git else None
+        with contextlib.suppress(OSError):
+            top = None if top is None or os.path.samefile(top, self.root) else top
+        if top is not None:
+            # `git clone` of a folder inside a repository fails ("does not exist"); the command line turns
+            # such a folder into its repository, a plan file has to name the repository itself.
+            raise ValueError(f"{plan_path}: workdir {self.root} is a folder inside the git repository {top}. crew "
+                             f"works on a whole repository: set \"workdir\" to {top}, or pass --no-git to work in "
+                             "that folder in place.")
         g = plan.get("git")
         if g is not None:
             if not self.use_git:
@@ -2147,7 +2581,8 @@ class Run:
                   and g["branch"].startswith(tuple({self.cfg["git"].get("branch_prefix") or "crew/",
                                                     "crew/", "crew-"} - {""}))
                   and (g.get("tip") is None or is_sha(g["tip"]))
-                  and (g.get("untracked_base") is None or str_list(g["untracked_base"])))
+                  and all(g.get(k) is None or str_list(g[k])
+                          for k in ("untracked_base", "inside_base", "adopting_gone")))
             if not ok:
                 raise ValueError(f"{plan_path}: invalid git block (needs a crew branch, base commit and worktree)")
         self.git = g
@@ -2215,14 +2650,22 @@ class Run:
         # git.owner is the plan file this git block was written for. A copy of that file carries it
         # along, so the copy is still recognised after `crew clean --all` has removed the pointer.
         made_for = g.get("owner") if isinstance(g.get("owner"), str) else ""
+
+        def real(named) -> str:
+            """A recorded path as it is spelled today. The one on record stops being the file's own
+            spelling when its folder is moved and a link left in its place. Followed by path, never by
+            inode, so a hard link is still another file."""
+            with contextlib.suppress(OSError, ValueError, RuntimeError, TypeError):
+                return str(Path(named).resolve())
+            return ""
         for claimed in dict.fromkeys((owner, made_for)):
-            other = _plan_claiming(claimed, wt) if claimed and claimed != me else None
+            other = _plan_claiming(claimed, wt) if claimed and real(claimed) != me else None
             if other is None:
                 continue
             # The file this git block was written for still exists and still records itself as the owner:
             # this file is a copy of it, and stays refused whatever state the original is in. Run after
             # the original has finished, a copy made earlier would do its tasks again on the finished branch.
-            a_copy = claimed == made_for and other["git"].get("owner") == claimed
+            a_copy = claimed == made_for and real(other["git"].get("owner")) == real(claimed)
             if a_copy or wt.exists() or plan_state(other) == "paused":
                 raise ValueError(f"crew's copy {wt} (branch {g['branch']}) belongs to another plan, {claimed}"
                                  f"{', which this file is a copy of' if a_copy else ''}. Continue that plan with "
@@ -2409,16 +2852,27 @@ class Run:
                 raise ValueError(f"could not check out {g['base'][:10]} in {wt}: {short(r.stderr, 300)}")
             if (wt / ".gitmodules").exists():
                 r = git(wt, "submodule", "update", "--init", "--recursive", timeout=1800, track=True)
+                failed: dict[str, str] = {}
                 if r.returncode != 0:
-                    log(f"  warning: submodules didn't initialise: {short(r.stderr, 200)}")
+                    # git stops at the first submodule it can't clone or put on its commit, and leaves the ones
+                    # after it cloned with nothing checked out: they then count as changed, for every task. So
+                    # each one again on its own. --force: git skips the checkout of a submodule whose HEAD
+                    # already names the recorded commit. This copy is new; there is nothing in it to overwrite.
+                    for path in submodule_paths(wt):
+                        one = git(wt, "submodule", "update", "--init", "--recursive", "--force", "--", path,
+                                  timeout=1800, track=True)
+                        if one.returncode != 0:
+                            failed[path] = ([ln.strip() for ln in one.stderr.splitlines() if ln.strip()]
+                                            or ["git gave no reason"])[-1]
                 # One that was cloned but could not be put on the commit this base records (it isn't on the
                 # submodule's remote: not pushed yet) is left on its remote's HEAD, and the first task's
                 # `git add -u` would commit that as a pointer change. Leave it empty, like one that
                 # could not be cloned at all.
-                for path in stale_gitlinks(wt):
+                for path in dict.fromkeys([*failed, *stale_gitlinks(wt)]):
                     git(wt, "submodule", "deinit", "-f", "--", path, timeout=600)
                     log(f"  warning: the submodule {short(path, 80)} stays empty in crew's copy: the commit your "
-                        "repo records for it could not be fetched from the submodule's remote (not pushed yet?)")
+                        "repo records for it could not be fetched from the submodule's remote (not pushed yet?)"
+                        + (f": {short(failed[path], 200)}" if path in failed else ""))
                 if stale_gitlinks(wt):
                     raise ValueError(f"could not put the submodules of crew's copy {wt} on the commits "
                                      f"{g['base'][:10]} records; `crew run {self.path}` starts the copy over")
@@ -2480,6 +2934,7 @@ class Run:
                     self._undo_half_merge(tip, g["adopting"])  # it was stopped part-way: take that back
                 g.pop("adopting", None)  # it didn't happen; the code below does it again if still needed
                 g.pop("adopting_clear", None)
+                g.pop("adopting_gone", None)
                 self.save()
         if head != tip and not any("committing" in t for t in tasks):
             raise ValueError(f"crew's copy {wt} has commits crew didn't make (HEAD {head[:10]}, expected "
@@ -2497,31 +2952,65 @@ class Run:
         # comparisons run in the clone: it holds your commits (once fetched) and crew's, while your
         # repo doesn't have crew's until they are published.
         if rb and rb != tip and head == tip:
-            r = git(wt, "fetch", "-q", "--no-tags", "origin",
+            # --no-recurse-submodules: a commit of yours that moves a submodule makes git fetch that submodule
+            # too, and when that fails (its commit isn't pushed) git reports the whole fetch as failed although
+            # it has read your branch. _sync_submodules() fetches what it needs and gives the real reason.
+            r = git(wt, "fetch", "-q", "--no-tags", "--no-recurse-submodules", "origin",
                     f"+refs/heads/{g['branch']}:refs/remotes/origin/{g['branch']}", timeout=600, track=True)
             if r.returncode != 0:
                 raise ValueError(f"could not read {g['branch']} from {root} into crew's copy: "
                                  f"{short(r.stderr, 200)}")
             if git(wt, "merge-base", "--is-ancestor", tip, rb).returncode == 0:
-                g["adopting"] = rb  # journal first: a kill right after the merge resumes by recording it
-                # git's own test for this merge, run first and changing nothing (and nothing staged: only a
-                # commit that was cut short leaves that). When it passes, nothing of a task's stands at the
-                # paths the merge writes; with that on record, a merge that is stopped part-way (a signal,
-                # a kill, a full disk) can be taken back without touching a task's work.
                 git(wt, "update-index", "-q", "--refresh", timeout=600)
-                clear = git(wt, "diff-index", "--cached", "--quiet", tip, "--", timeout=600).returncode == 0 \
-                    and git(wt, "read-tree", "-n", "-m", "-u", tip, rb, timeout=600).returncode == 0
+                unstaged = git(wt, "diff-index", "--cached", "--quiet", tip, "--", timeout=600).returncode == 0
+                if not unstaged and any("committing" in t for t in tasks):
+                    # A commit of crew's own was cut between `git add` and `git commit` (task.committing is its
+                    # journal, and _reconcile() stages the files again). Left staged, they would switch the
+                    # undo below off; un-staged, they are in the working tree exactly as the task left them.
+                    git(wt, "reset", "-q", timeout=600, track=True)
+                    unstaged = git(wt, "diff-index", "--cached", "--quiet", tip, "--", timeout=600).returncode == 0
+                # git calls a tracked file that is missing from the working tree up to date. One a task deleted
+                # (or whose folder it replaced by a link) passes git's test below: the merge would put it back
+                # with your version and say nothing, and the undo would put it back too. Where your commits
+                # change such a file, that is a collision like an edit. Where they delete it as well, nothing
+                # collides; the undo is told to leave it deleted (git.adopting_gone).
+                st = git(wt, "diff", "--name-status", "-z", "--no-renames", tip, rb, "--", timeout=600).stdout.split("\0")
+                missing = {p for p in git(wt, "diff-files", "--name-only", "-z", "--diff-filter=D",
+                                          "--ignore-submodules=all", timeout=600).stdout.split("\0") if p}
+                back = sorted(p for how, p in zip(st[::2], st[1::2]) if how != "D" and p in missing)
+                gone = sorted(p for how, p in zip(st[::2], st[1::2]) if how == "D" and p in missing)
+                if back:
+                    g["published"] = tip  # your branch has everything crew committed; `clean` and `plans` rely on it
+                    self.save()
+                    raise ValueError(f"could not bring your commits on {g['branch']} into crew's copy {wt}: they change "
+                                     f"{len(back)} file(s) that a task whose work isn't committed yet deleted there "
+                                     f"({short(', '.join(back[:5]), 300)}), and git would put them back without "
+                                     f"saying so. To take your version, restore them in the copy "
+                                     f"(`git -C {wt} checkout -- <file>`) and run `crew run {self.path}` again; or "
+                                     "`crew clean --all`, which discards the copy's uncommitted work, and "
+                                     f"`crew run {self.path}` starts the copy over from your branch.")
+                g["adopting"] = rb  # journal first: a kill right after the merge resumes by recording it
+                # git's own test for this merge, run first and changing nothing (and with nothing staged). When
+                # it passes, nothing of a task's stands at the paths the merge writes; with that on record, a
+                # merge that is stopped part-way (a signal, a kill, a full disk) can be taken back without
+                # touching a task's work.
+                clear = unstaged and git(wt, "read-tree", "-n", "-m", "-u", tip, rb, timeout=600).returncode == 0
                 if clear:
                     g["adopting_clear"] = True
+                    if gone:
+                        g["adopting_gone"] = gone
                 self.save()
                 # merge.autoStash from your git config would stash a task's uncommitted work, let the merge
-                # through and hand the collision back as conflict markers.
-                m = git(wt, "-c", "merge.autoStash=false", "merge", "-q", "--ff-only", rb, timeout=1800, track=True)
+                # through and hand the collision back as conflict markers; merge.verifySignatures would refuse
+                # your own unsigned commit, on every run. The copy is crew's and the commits are yours.
+                m = git(wt, "-c", "merge.autoStash=false", "-c", "merge.verifySignatures=false", "merge", "-q",
+                        "--ff-only", rb, timeout=1800, track=True)
                 if m.returncode:
                     if clear and head_sha(wt) == tip:
                         self._undo_half_merge(tip, rb)  # nothing was in its way, so it failed part-way
                     g.pop("adopting", None)
                     g.pop("adopting_clear", None)
+                    g.pop("adopting_gone", None)
                     self.save()
                     g["published"] = tip  # your branch has everything crew committed; `clean` and `plans` rely on it
                     self.save()
@@ -2592,13 +3081,20 @@ class Run:
             git(wt, "submodule", "update", "--checkout", "--recursive", "--force", "--", *redo,
                 timeout=1800, track=True)
             stale = stale_gitlinks(wt)
+        if not stale:
+            return
         if journal:
-            clean = [p for p in stale if p not in known and
-                     not git(wt / p, "status", "--porcelain", "--untracked-files=no").stdout.strip()]
+            # No local changes: nothing tracked is edited, and nothing untracked is there that a forced checkout
+            # could write over (git refuses to; forcing it on the next run would lose an agent's file).
+            clean = [p for p in stale if p not in known and not tracked_dirty(wt / p)
+                     and all(is_generated(f) or is_sandbox_stub(wt / p / f) for f in untracked(wt / p))]
             if clean:
                 g["sync_started"] = known + clean
                 self.save()
-        r = git(wt, "submodule", "update", "--checkout", "--recursive", timeout=1800, track=True)
+        # Only the checkouts that are behind. Without paths git also fills in every submodule that is registered
+        # and has no checkout here (one your commit moved to a new path, one that could not be cloned when the
+        # copy was made), and the check of each submodule's `.git` that follows takes that for tampering.
+        r = git(wt, "submodule", "update", "--checkout", "--recursive", "--", *stale, timeout=1800, track=True)
         left = stale_gitlinks(wt)
         if left:
             why = short(" ".join(ln.strip() for ln in r.stderr.splitlines() if ln.strip()), 300)
@@ -2612,7 +3108,10 @@ class Run:
         target's files are in the copy (one perhaps half written), and git refuses to merge over them.
         git had found the merge's paths clear before it began (git.adopting_clear), so what stands at
         those paths now is the merge's own work: put each back as `tip` has it. Paths the merge doesn't
-        write, where a task's uncommitted work is, are not touched."""
+        write, where a task's uncommitted work is, are not touched. Nor are the two things git's test
+        lets through: a file a task had deleted (git.adopting_gone; one your commits change is refused
+        before the merge) and a file git ignores, which may have been there before. What the merge itself
+        wrote at an ignored path stays: git never lists it, so no commit can pick it up."""
         wt = self.workdir
         with contextlib.suppress(OSError):
             (wt / ".git" / "index.lock").unlink()  # the stopped merge's
@@ -2620,25 +3119,41 @@ class Run:
         paths = [p for p in git(wt, "diff", "--name-only", "-z", "--no-renames", tip, target, "--",
                                 timeout=600).stdout.split("\0") if p]
         in_tip = {p for p in git(wt, "ls-tree", "-r", "-z", "--name-only", tip, timeout=600).stdout.split("\0") if p}
+        gone = set(self.git.get("adopting_gone") or [])  # deleted by a task before the merge: they stay deleted
         top = wt.resolve()
-        for p in paths:
-            f = wt / p
-            if p in in_tip or (top / p).parent != f.parent.resolve():  # never through a symbolic link
-                continue
-            if f.is_symlink() or f.is_file():
-                with contextlib.suppress(OSError):
-                    f.unlink()
-                    for d in f.parents:  # the directories the merge made for it, while they are empty
-                        if d == wt:
-                            break
-                        d.rmdir()
-        restore = [p for p in paths if p in in_tip]
-        if restore:
-            r = git(wt, "checkout-index", "-f", "-z", "--stdin", timeout=1800, track=True,
-                    stdin="\0".join(restore) + "\0")
-            if r.returncode != 0:
-                log(f"  warning: could not put back every file of a merge that was stopped part-way: "
-                    f"{short(r.stderr, 200)}")
+        paths = [p for p in paths if p not in gone
+                 and (p in in_tip or (top / p).parent == (wt / p).parent.resolve())]  # never through a symbolic link
+
+        def remove(new: list[str]) -> None:
+            for p in new:
+                f = wt / p
+                if f.is_symlink() or f.is_file():
+                    with contextlib.suppress(OSError):
+                        f.unlink()
+                        for d in f.parents:  # the directories the merge made for it, while they are empty
+                            if d == wt:
+                                break
+                            d.rmdir()
+
+        def put_back(old: list[str]) -> None:
+            if old:
+                r = git(wt, "checkout-index", "-f", "-z", "--stdin", timeout=1800, track=True,
+                        stdin="\0".join(old) + "\0")
+                if r.returncode != 0:
+                    log(f"  warning: could not put back every file of a merge that was stopped part-way: "
+                        f"{short(r.stderr, 200)}")
+
+        # git's test lets a merge write over a file that is ignored, so one of those may have stood at a path
+        # the merge adds before it began: it is not the merge's own, and it stays. What is ignored is asked
+        # with the ignore rules as they were then, so the merge's own .gitignore files are taken back first.
+        rules = [p for p in paths if p.rsplit("/", 1)[-1] == ".gitignore"]
+        remove([p for p in rules if p not in in_tip])
+        put_back([p for p in rules if p in in_tip])
+        new = [p for p in paths if p not in in_tip and p not in rules]
+        ignored = set(git(wt, "check-ignore", "-z", "--stdin", timeout=600,
+                          stdin="\0".join(new) + "\0").stdout.split("\0")) if new else set()
+        remove([p for p in new if p not in ignored])
+        put_back([p for p in paths if p in in_tip and p not in rules])
         log("note: an earlier attempt to bring your commits into crew's copy was stopped part-way; "
             "crew put back what it had written")
 
@@ -2667,13 +3182,39 @@ class Run:
         g["tip"] = new
         g.pop("adopting", None)
         g.pop("adopting_clear", None)
+        g.pop("adopting_gone", None)
         if (self.workdir / ".gitmodules").exists():
             g["sync_submodules"] = True
         g["git_fingerprint"] = self._git_fingerprint()
         self.save()
 
     def _snapshot(self) -> dict:
-        return {"untracked": sorted(untracked(self.workdir)), "ignored": sorted(ignored_entries(self.workdir))}
+        return {"untracked": sorted(untracked(self.workdir)), "ignored": sorted(ignored_entries(self.workdir)),
+                "inside": sorted(self._inside_submodules())}
+
+    def _inside_submodules(self, links: dict | None = None) -> set[str]:
+        """Files in a submodule's folder that git in the copy never lists: what a populated submodule calls
+        untracked, and whatever stands in the folder of one that is empty in this copy. They belong to another
+        repository, so crew can't commit them. A task that leaves new ones is told so and the copy is kept;
+        unseen, they went with the copy while the task was called done."""
+        if links is None:
+            known = self.git.get("gitlinks") if self.git and isinstance(self.git.get("gitlinks"), dict) else None
+            if not known or not (self.workdir / ".git").is_dir():
+                return set()
+            self._check_git_integrity()  # git is about to run inside them
+            links = self._gitlinks(known)  # the paths the copy's own index names, each as recorded
+        found: set[str] = set()
+        for name, state in links.items():
+            sub = self.workdir / name
+            if isinstance(state, str) and state.startswith("file "):
+                found |= {f"{name}/{f}" for f in untracked(sub)}
+            elif state == "none" and sub.is_dir() and not sub.is_symlink():
+                for d, _, files in os.walk(sub):
+                    rel = Path(d).relative_to(self.workdir).as_posix()
+                    found |= {f"{rel}/{f}" for f in files}
+                    if len(found) > 5000:
+                        break
+        return {f for f in found if not is_generated(f) and not is_sandbox_stub(self.workdir / f)}
 
     def _new_files(self, snap: dict) -> tuple[list[str], list[str]]:
         """Files the task created: (to commit, left out). Never anything that existed before,
@@ -2777,6 +3318,7 @@ class Run:
             self.git["setup_ok"] = failed is None
             self.git["setup_failed"] = failed
             self.git["untracked_base"] = sorted(untracked(self.workdir))
+            self.git["inside_base"] = sorted(self._inside_submodules(self._gitlinks()))  # what setup put there
         if failed:
             self.plan["setup_failed"] = failed
             self.failed += 1
@@ -2834,6 +3376,12 @@ class Run:
         resumed = task.get("status") == "running"
         task["status"] = "running"
         task["started"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        if not self.git:
+            # In place there is no commit to tie check results to. What was recorded before stops counting
+            # in the same save that lets a task change files, or a stop during the next checks would leave
+            # the old results standing for the new work.
+            for k in ("final", "final_tip", "regressions", "skipped"):
+                self.plan["checks"].pop(k, None)
         self.save()
         self.ran_tasks += 1
         done = {t["id"]: t for t in self.plan["tasks"] if t.get("status") == "done"}
@@ -2915,7 +3463,11 @@ class Run:
             g["git_fingerprint"] = self._git_fingerprint()
             if isinstance(g.get("gitlinks"), dict):
                 g["gitlinks"] = self._gitlinks(g["gitlinks"])  # the commit may have dropped a submodule
+        snap = task.get("untracked_before") or {}
+        inside = sorted(self._inside_submodules() - set(snap["inside"])) if isinstance(snap.get("inside"), list) else []
         left = ([f"nested git repository {n}" for n in nested] + ([problem] if problem else [])
+                + ([f"{len(inside)} new file(s) inside a submodule, which is another repository "
+                    f"({short(', '.join(inside[:5]), 300)})"] if inside else [])
                 + (["uncommitted changes to tracked files"] if tracked_dirty(wt) else []))
         if left:
             note = "; ".join(left)
@@ -2972,11 +3524,31 @@ class Run:
         while True:
             final = self._run_checks("after")
             if final is None:
+                # They ran before the work and can't be run now. Recorded and said, so that the plan's state
+                # shows a choice or a missing sandbox, and isn't mistaken for a run stopped during its checks.
+                why = ("this project's profile lists no checks now" if not self.project.get("checks") else
+                       "verify.enabled is off" if not self.cfg["verify"].get("enabled", True) else
+                       codex_sandbox_problem(self.cfg) or "no sandbox to run them in")
+                if not checks_skipped(self.plan):
+                    checks["skipped"] = {"tip": plan_tip(self.plan), "why": why}
+                    self.save()
+                log(f"checks: not run after the work ({why}), though they ran before it; "
+                    "the plan's last changes are unchecked")
                 return
             regs = [n for n, r in final.items()
                     if not r["ok"] and (not isinstance(baseline.get(n), dict) or baseline[n].get("ok", True))]
             checks["final"], checks["regressions"] = final, regs
             checks["final_tip"] = (self.git.get("tip") or self.git["base"]) if self.git else None
+            checks.pop("skipped", None)
+            fix = None
+            if regs and rounds < int(num(self.cfg["verify"].get("fix_rounds"), 1)) and not self.stopped:
+                # The fix task goes into the same save as the result that calls for it (law 3). Saved after
+                # it, a stop between the two left a plan with a regression on record, its tip verified and
+                # nothing to run: the fix round was lost for good.
+                rounds += 1
+                fix = self._fix_task(rounds, regs, final)
+                self.plan["tasks"].append(fix)
+                self.by_id[fix["id"]] = fix
             self.save()
             known = [n for n, r in final.items() if not r["ok"] and n not in regs]
             if known:
@@ -2984,16 +3556,11 @@ class Run:
             if not regs:
                 log("checks: no regressions")
                 return
-            if rounds >= int(num(self.cfg["verify"].get("fix_rounds"), 1)) or self.stopped:
+            if fix is None:
                 log(f"checks: still failing after this run: {', '.join(regs)}")
                 self.failed += 1
                 return
-            rounds += 1
-            task = self._fix_task(rounds, regs, final)
-            self.plan["tasks"].append(task)
-            self.by_id[task["id"]] = task
-            self.save()
-            self.execute(task)
+            self.execute(fix)
 
     def _fix_task(self, n: int, regs: list[str], final: dict) -> dict:
         checks = self.project.get("checks") or {}
@@ -3025,10 +3592,11 @@ class Run:
         if self.git and self.git.get("published") != (self.git.get("tip") or self.git["base"]) \
                 and (self.git.get("tip") or self.git["base"]) != self.git["base"]:
             return False
-        checks = self.plan["checks"]
-        tip = (self.git.get("tip") or self.git["base"]) if self.git else None
-        return not (self.project.get("checks") and self.cfg["verify"].get("enabled", True)
-                    and "baseline" in checks and checks.get("final_tip") != tip)
+        if not checks_due(self.plan):
+            return True
+        if not checks_skipped(self.plan):
+            return False  # never settled (a run stopped during its checks): verify() runs them, or records why not
+        return not (self.project.get("checks") and self.cfg["verify"].get("enabled", True))
 
     def finish_pending_removal(self) -> None:
         """A finished run was removing crew's copy when it stopped: complete that."""
@@ -3060,7 +3628,8 @@ class Run:
             self._check_git_integrity()  # the checks ran the agents' code in this copy since crew last looked
             leftovers = wt.is_dir() and (tracked_dirty(wt) or any(
                 not is_generated(f) and not is_sandbox_stub(wt / f)
-                for f in untracked(wt) - set(g.get("untracked_base") or [])))
+                for f in untracked(wt) - set(g.get("untracked_base") or []))
+                or bool(self._inside_submodules() - set(g.get("inside_base") or [])))
             state = plan_state(self.plan)
             unpublished = tip != g["base"] and g.get("published") != tip
             if state == "paused" or leftovers or unpublished:
@@ -3083,6 +3652,10 @@ class Run:
 
 def run_plan(cfg: dict, plan_path: Path, *, dry_run: bool = False, retry_failed: bool = False,
              use_git: bool = True, show_split: bool = True) -> int:
+    # The file itself, not a symbolic link to it. crew's first save would replace the link with a file
+    # (tmp + rename), and from then on the lock taken here, named after the link's target, would be
+    # another one than every later `crew run <link>` and `crew clean` works out.
+    plan_path = Path(plan_path).resolve()
     probe = Run(cfg, plan_path, dry_run=dry_run, retry_failed=retry_failed, use_git=use_git)
     if dry_run:
         run = probe
@@ -3119,7 +3692,7 @@ def run_plan(cfg: dict, plan_path: Path, *, dry_run: bool = False, retry_failed:
                     run.finish()
                 except KeyboardInterrupt:
                     where = run.workdir if run.git else run.root
-                    log(f"\ninterrupted; the work so far is in {where}, and `crew run {plan_path}` resumes it")
+                    say(f"\ninterrupted; the work so far is in {where}, and `crew run {plan_path}` resumes it")
                     raise
             finally:
                 _TL.pidfile = None
@@ -3191,14 +3764,19 @@ def queue_add(goal: str, roots: list[Path], *, direct: bool = False, agent: str 
         items = load_queue()
         seen = [int(i["id"][1:]) for i in items if re.fullmatch(r"q\d+", i["id"])]
         n = max([int(num(_load_queue_data().get("next_id"), 1)) - 1] + seen + [0])
+        added = []
         for root in roots:
             key, prof = ensure_profile(root)
             n += 1
             items.append({"id": f"q{n}", "key": key, "name": prof["project"]["name"], "workdir": str(root),
                           "goal": goal, "status": "queued", "plan": None, "direct": direct, "agent": agent,
                           "added": time.strftime("%Y-%m-%d %H:%M")})
-            log(f"queued q{n}: {prof['project']['name']}")
+            added.append(f"queued q{n}: {prof['project']['name']}")
         save_queue(items, next_id=n + 1)
+    # Said once it is true. Printed item by item before the save, a reader that left after the first line
+    # (`... | grep -q queued`, `| head -1`) ended the command there: "queued q1" on the screen, nothing queued.
+    for line in added:
+        log(line)
 
 
 def queue_list() -> None:
@@ -3218,6 +3796,13 @@ def _process_item(explicit: Path | None, item: dict, use_git: bool, retry_failed
         root = resolve_workdir(Path(item["workdir"]))
         cfg, project = context_for(root, explicit)
         path = Path(item["plan"]) if item.get("plan") else new_plan_path(project["key"], item["goal"])
+        found = _where_plan_is(path) if item.get("plan") else path
+        if found != path:
+            # The plan was moved when the checkout got a remote, and `origin` may have changed again since:
+            # it is under the name the checkout had then, not under today's. Planning again would leave
+            # the real plan orphaned with its copy and do its finished tasks a second time.
+            path = found
+            queue_update(item["id"], plan=str(path))
         if not path.exists() and path.parent == plans_dir(_path_key(root)) != plans_dir(project["key"]):
             # A remote was added since this item was queued: the project's plans moved to its new name.
             path = plans_dir(project["key"]) / path.name
@@ -3242,11 +3827,15 @@ def _process_item(explicit: Path | None, item: dict, use_git: bool, retry_failed
     except ProjectBusy as e:
         log(f"skipped: {e}")
     except ProviderUnavailable as e:
-        log(f"paused: {short(str(e), 300)}")
         queue_update(item["id"], status="paused", result=short(str(e), 300))
+        log(f"paused: {short(str(e), 300)}")
+    except OutputLost:  # not this item's fault, and crew stops on it (main): the next `queue run` continues
+        queue_update(item["id"], status="paused", result="stopped: crew's output could not be written")
+        raise
     except Exception as e:  # one project's problem must not stop the others
-        log(f"error: {type(e).__name__}: {e}" if not isinstance(e, (ValueError, OSError)) else f"error: {e}")
+        # The queue first, then the line about it: if printing fails, the item's state is already right.
         queue_update(item["id"], status="error", result=short(str(e), 300))
+        log(f"error: {type(e).__name__}: {e}" if not isinstance(e, (ValueError, OSError)) else f"error: {e}")
     finally:
         _TL.prefix = ""
 
@@ -3266,10 +3855,17 @@ def _queue_run(explicit: Path | None, jobs: int, use_git: bool, retry_failed: bo
     if not items:
         log("nothing to run in the queue")
         return 0
-    by_project: dict[str, list[dict]] = {}
+    # One group per checkout, in queue order. An item's key is the name the checkout had when the item
+    # was queued, and that changes with `origin`: grouped by key alone, two items for one checkout queued
+    # either side of such a change would run side by side. (Two checkouts of one remote share a key, and
+    # with it a plans folder, so they stay in one group as before.)
+    order = {id(i): n for n, i in enumerate(items)}
+    groups: list[list[dict]] = []
     for i in items:
-        by_project.setdefault(i["key"], []).append(i)
-    log(f"running {len(items)} queued item(s) across {len(by_project)} project(s), up to {jobs} at a time")
+        mine = [g for g in groups if any(x["key"] == i["key"] or x["workdir"] == i["workdir"] for x in g)]
+        groups = [g for g in groups if not any(g is m for m in mine)]
+        groups.append(sorted([x for g in mine for x in g] + [i], key=lambda x: order[id(x)]))
+    log(f"running {len(items)} queued item(s) across {len(groups)} project(s), up to {jobs} at a time")
 
     def worker(group: list[dict]) -> None:
         for item in group:  # one project's items run one after another
@@ -3278,23 +3874,39 @@ def _queue_run(explicit: Path | None, jobs: int, use_git: bool, retry_failed: bo
             _process_item(explicit, item, use_git, retry_failed)
 
     pool = ThreadPoolExecutor(max_workers=max(1, jobs))
-    futures = [pool.submit(worker, g) for g in by_project.values()]
+    futures: list = []
     try:
-        # Waited for half a second at a time, not for as long as it takes: Python acts on a signal only
+        # The threads are started inside the try. A SIGTERM or hang-up that arrives while they are being
+        # started is a SystemExit raised right here; outside the try nothing called stop_all() for it,
+        # the threads already running worked through their projects' whole queue, and every later
+        # signal found the handler that does nothing.
+        # Signals are held while the pool and its futures are touched, here and below. Their locks are
+        # taken by Python code (threading, concurrent.futures), and a handler that raises between a lock
+        # being taken and the `with` that would release it leaves it locked for good: the worker that
+        # next finishes waits for that lock for ever, and crew for the worker, deaf to every signal.
+        # A signal held this way takes effect a moment later, when the block ends.
+        with _signals_held():
+            for g in groups:
+                futures.append(pool.submit(worker, g))
+        # Looked at a few times a second, not waited for as long as it takes: Python acts on a signal only
         # when its main thread next runs. A stop signal that the system hands to a worker thread (it
         # does when that thread has just started a child and gets to the signal first) doesn't wake a
         # main thread that is asleep here, and would go unanswered until some task ended by itself.
         waiting = set(futures)
         while waiting:
-            done, waiting = wait_for_futures(waiting, timeout=0.5, return_when=FIRST_COMPLETED)
-            for f in done:
-                with contextlib.suppress(Interrupted):  # a worker stopped because crew is stopping
-                    f.result()
+            with _signals_held():
+                for f in [f for f in waiting if f.done()]:
+                    waiting.discard(f)
+                    with contextlib.suppress(Interrupted):  # a worker stopped because crew is stopping
+                        f.result()
+            if waiting:
+                time.sleep(0.2)  # a signal that arrives here acts at once
     except BaseException:
-        stop_all()
-        for f in futures:
-            f.cancel()
-        pool.shutdown(wait=True)
+        with _signals_held():
+            stop_all()
+            for f in futures:
+                f.cancel()
+            pool.shutdown(wait=True)
         raise
     pool.shutdown(wait=True)
     queue_list()
@@ -3504,8 +4116,7 @@ def doctor(cfg: dict, root: Path | None) -> int:
             problems += 1
             continue
         try:
-            ver = subprocess.run([pc["cmd"], "--version"], capture_output=True, stdin=subprocess.DEVNULL, text=True,
-                                 timeout=60).stdout.strip()
+            ver = _probe([pc["cmd"], "--version"], provider_env(p))[1].strip()
         except (OSError, subprocess.TimeoutExpired) as e:
             ver = f"version check failed: {e}"
         ok, detail = login_status(cfg, p)
@@ -3520,12 +4131,19 @@ def doctor(cfg: dict, root: Path | None) -> int:
                               else "codex login (ChatGPT plan), or set OPENAI_API_KEY and run "
                                    "`crew codex-login`, or set CODEX_API_KEY"))
     if provider_cfg(cfg, "claude").get("enabled", True):
-        if claude_sandbox_ready():
-            log("claude sandbox: ready, so Claude workers run shell commands sandboxed without prompts")
-        else:
+        pc = provider_cfg(cfg, "claude")
+        try:
+            why = claude_shell_refusal(pc, _claude_worker_args(list(pc.get("args") or []), [])[1])
+        except ValueError as e:
+            why = str(e)
+            problems += 1
+        if not claude_sandbox_ready():
             hint = " -> apt install bubblewrap socat" if sys.platform.startswith("linux") else ""
-            log("claude sandbox: NOT available, so Claude workers' shell commands are refused "
-                f"(never run unsandboxed){hint}")
+            log(f"claude sandbox: NOT available, so Claude workers get no shell (never an unsandboxed one){hint}")
+        elif why:
+            log(f"claude sandbox: ready, but Claude workers get no shell: {why}")
+        else:
+            log("claude sandbox: ready, so Claude workers run shell commands sandboxed without prompts")
     mode = sandbox_mode(cfg)
     log("checks: " + ("run in codex sandbox" if mode == "codex-sandbox" else
                       f"run unsandboxed ({codex_sandbox_problem(cfg)})" if mode else
@@ -3550,10 +4168,14 @@ def codex_login(cfg: dict) -> int:
         sys.exit("codex is not installed: npm install -g @openai/codex")
     if not key:
         sys.exit("OPENAI_API_KEY is not set. For a ChatGPT plan, run `codex login` instead.")
-    r = subprocess.run([provider_cfg(cfg, "codex")["cmd"], "login", "--with-api-key"],
-                       input=key, text=True, capture_output=True)
-    log(short((r.stdout or r.stderr).strip(), 300) or f"exit {r.returncode}")
-    return r.returncode
+    try:  # the key goes in on stdin, never on the command line; two minutes, like no other call without a limit
+        rc, out, err = _probe([provider_cfg(cfg, "codex")["cmd"], "login", "--with-api-key"], provider_env("codex"),
+                              timeout=120, stdin_text=key)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log(f"error: `codex login --with-api-key` did not finish: {e}")
+        return 1
+    log(short((out or err).strip(), 300) or f"exit {rc}")
+    return rc
 
 
 SKILL_MD = """---
@@ -3563,7 +4185,7 @@ description: Hand a coding goal to crew, the owner's dispatcher that runs tasks 
 
 # crew
 
-crew is a command-line tool on this machine. It plans a goal into tasks for three agents (Astra the architect, Sol the builder, Luna the verifier), runs each task on Claude Code or Codex inside that tool's sandbox, and keeps usage split between the owner's two subscriptions. It works in its own copy of the repository on a `crew/...` branch and never touches the checkout you are in.
+crew is a command-line tool on this machine. It plans a goal into tasks for three agents (Astra the architect, Sol the builder, Luna the verifier), runs each task on Claude Code or Codex inside that tool's sandbox, and keeps usage split between the owner's two subscriptions. In a git repository it works in its own copy on a `crew/...` branch and never touches the checkout you are in. A folder that is not a git repository has no branch to work on: crew edits it in place, so tell the owner that before you run crew there.
 
 ## Before anything else
 
@@ -3577,12 +4199,12 @@ Pick one, say which and why in a line, then run it.
 |---|---|
 | One small change one agent can finish | `crew do '<goal>' --workdir <repo>` |
 | Work with several parts, or design before building | `crew go '<goal>' --workdir <repo>` |
-| The owner wants to read the plan first | `crew plan '<goal>' --workdir <repo>`, then `crew run --workdir <repo>` |
+| The owner wants to read the plan first | `crew plan '<goal>' --workdir <repo>`, then `crew run <plan file>` with the file it printed |
 | The same goal in several repositories | `crew queue add '<goal>' --workdir <repo1> --workdir <repo2>`, then `crew queue run` |
 
 - Always pass `--workdir` with the repository's absolute path.
 - Put the goal in single quotes with no apostrophes. One or two sentences: the outcome, and how to tell it is done.
-- `crew do` goes to Sol. Add `--agent Luna` for tests, docs and review, `--agent Astra` for design or a hard bug.
+- `crew do` goes to Sol. Add `--agent Luna` for tests, docs and review, `--agent Astra` for design or a hard bug. These are the names crew ships with; if it answers `unknown agent`, it lists the owner's own.
 - Agents have no network. If the goal needs a package the repository lacks, tell the owner to install and commit it first.
 - A run takes minutes. Start it and wait for it to exit. Do not start a second one for the same repository.
 
@@ -3590,7 +4212,7 @@ Pick one, say which and why in a line, then run it.
 
 crew prints the branch it made and two commands, one to review it and one to merge it.
 
-1. Report what happened in crew's own words: `done`, `needs-review` or `paused`, and any warning it printed.
+1. Report what happened. crew exits 0 only when the plan is done; `crew plans --workdir <repo>` gives the plan's state in crew's own words (`done`, `needs-review` or `paused`). Pass on any warning it printed.
 2. Read the branch's diff with the review command and tell the owner what you would question. You are not the model that wrote it, which is why your reading is worth having.
 3. Do not merge, push or delete the branch unless the owner asks.
 
@@ -3599,7 +4221,7 @@ crew prints the branch it made and two commands, one to review it and one to mer
 | Question | Command |
 |---|---|
 | Which plans exist here, and their state | `crew plans --workdir <repo>` (`--all` for every project) |
-| Continue a paused plan | `crew run --workdir <repo>`, or `crew run <plan file>` for one in particular |
+| Continue a paused plan | `crew run <plan file>`, with the file `crew plans --workdir <repo>` shows beside it. Without a file crew resumes the newest plan, which may be another one |
 | How usage is split | `crew usage` |
 | Whether everything is installed and logged in | `crew doctor` |
 
@@ -3741,7 +4363,7 @@ def main(argv: list[str] | None = None) -> int:
     global CREW_HOME
     if not CREW_HOME.is_absolute():
         if str(CREW_HOME).startswith("~"):
-            log(f"error: can't expand CREW_HOME={CREW_HOME}: set HOME, or set CREW_HOME to an absolute path")
+            say(f"error: can't expand CREW_HOME={CREW_HOME}: set HOME, or set CREW_HOME to an absolute path")
             return 2
         CREW_HOME = CREW_HOME.resolve()
     stop_signals = [getattr(signal, s) for s in ("SIGINT", "SIGTERM", "SIGHUP") if hasattr(signal, s)]
@@ -3768,14 +4390,14 @@ def main(argv: list[str] | None = None) -> int:
     if os.environ.get("CREW_TASK") and (args.cmd in ("plan", "go", "do", "run")
                                         or (args.cmd == "queue" and getattr(args, "qcmd", "") == "run")):
         # A worker has the same skills and instructions as the tool the owner uses, so it may try.
-        log("error: crew can't be started from inside one of its own tasks. If you are one of crew's "
+        say("error: crew can't be started from inside one of its own tasks. If you are one of crew's "
             "agents, the task in front of you is yours to do.")
         return 2
     try:
         if args.cmd == "install":
             return install()
         if args.cmd == "skill":
-            print(SKILL_MD, end="")
+            log(SKILL_MD[:-1] if SKILL_MD.endswith("\n") else SKILL_MD)  # log(): flushed, and a lost reader is handled
             return 0
         cfg = load_config(args.config)
         init_slots(cfg)
@@ -3837,10 +4459,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.cmd == "run":
             if args.plan:
                 plan_path = _where_plan_is(args.plan)
-                data = _read_json(plan_path)
-                if not isinstance(data, dict) or not isinstance(data.get("workdir"), str):
-                    raise ValueError(f"{plan_path}: not a crew plan (needs goal, workdir, tasks)")
-                root = resolve_workdir(Path(data["workdir"]))
+                root = resolve_workdir(plan_workdir(_read_json(plan_path), plan_path))
             else:
                 root = resolve_workdir(args.workdir)
                 key, _ = ensure_profile(root, quiet=True)  # also moves plans if the project's name changed
@@ -3864,8 +4483,9 @@ def main(argv: list[str] | None = None) -> int:
                         except ValueError as e:
                             log(f"skipping {f.name}: {e}")
                             continue
-                        if isinstance(r, str) and Path(r).is_dir() and Path(r) not in roots:
-                            roots.append(Path(r))
+                        r = resolve_workdir(Path(r)) if isinstance(r, str) and Path(r).is_dir() else None
+                        if r is not None and r not in roots:
+                            roots.append(r)
                 if not roots:
                     if args.all:
                         raise ValueError("no usable project to queue for: run `crew init` in each project first "
@@ -3888,24 +4508,34 @@ def main(argv: list[str] | None = None) -> int:
                     save_queue(keep)
                 log(f"removed {len(items) - len(keep)} item(s)")
                 return 0
-    except BrokenPipeError:  # output piped into e.g. `head`
-        sys.stderr.close()
-        with contextlib.suppress(OSError, ValueError):
-            # What is still buffered must not fail a second time when Python flushes at exit: that
-            # would replace the exit code below with 120.
-            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
-        if args.cmd in ("plan", "go", "do", "run") or (args.cmd == "queue" and args.qcmd == "run"):
-            # The run stopped where its output was lost, as a rule with work left: never exit 0. Like the
-            # other ways of being stopped from outside, it reports the signal's number.
+    except SystemExit:  # SIGTERM or a hang-up (on_stop), wherever it was raised: nothing crew started outlives it
+        stop_all()
+        raise
+    except BrokenPipeError as e:  # crew's output can't be written (OutputLost): piped into `head`, as a rule
+        work = args.cmd in ("plan", "go", "do", "run") or (args.cmd == "queue" and args.qcmd == "run")
+        listing = (args.cmd in ("plans", "projects", "config", "skill", "doctor")
+                   or (args.cmd == "usage" and not args.clear_cooldowns) or (args.cmd == "queue" and args.qcmd == "list"))
+        reader_left = e.errno == errno.EPIPE
+        if work:
             stop_all()
-            return 128 + int(getattr(signal, "SIGPIPE", 13))
-        return 0  # a listing cut short by its reader
+        if not reader_left:  # a full disk, a terminal that is gone: said on stderr, if that still goes anywhere
+            with contextlib.suppress(OSError, ValueError, AttributeError):
+                print(f"crew: error: can't write output: {e.strerror or e}", file=sys.stderr, flush=True)
+        with contextlib.suppress(OSError, ValueError, AttributeError):  # AttributeError: started with stderr closed
+            sys.stderr.close()
+        _drop_output()
+        if listing:
+            return 0 if reader_left else 2  # a listing cut short by its reader is the reader's choice
+        # A run stopped where its output was lost, as a rule with work left: never exit 0. Like the other
+        # ways of being stopped from outside, it reports the signal's number. So does every other command
+        # that changes something (`queue add`, `init`, `clean`): it may have been cut short before it did.
+        return 128 + int(getattr(signal, "SIGPIPE", 13)) if work or reader_left else 2
     except (ValueError, OSError) as e:
-        log(f"error: {e}")
+        say(f"error: {e}")
         return 2
     except KeyboardInterrupt:
         stop_all()
-        log("\ninterrupted; unfinished tasks stay pending, so re-running resumes them")
+        say("\ninterrupted; unfinished tasks stay pending, so re-running resumes them")
         return 130
     except Exception as e:  # a value in one of crew's files that no check foresaw, or a bug: one line, not a traceback
         stop_all()
@@ -3913,7 +4543,7 @@ def main(argv: list[str] | None = None) -> int:
         at = ([f for f in frames if f.filename == __file__] or frames)[-1]
         if os.environ.get("CREW_TRACEBACK"):
             traceback.print_exc()
-        log(f"error: {type(e).__name__}: {e} (crew.py line {at.lineno}, in {at.name}). If one of crew's files "
+        say(f"error: {type(e).__name__}: {e} (crew.py line {at.lineno}, in {at.name}). If one of crew's files "
             "was edited by hand, check it. Otherwise this is a defect in crew: CREW_TRACEBACK=1 shows the trace.")
         return 2
     return 2
