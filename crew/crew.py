@@ -46,7 +46,7 @@ except ImportError:  # Windows: thread locks only
 if sys.version_info < (3, 9):
     sys.exit("crew needs Python 3.9 or newer")
 
-VERSION = "3.2"
+VERSION = "3.3"
 HERE = Path(__file__).resolve().parent
 CREW_HOME = Path(os.path.expanduser(os.environ.get("CREW_HOME") or "~/.crew"))
 PROVIDERS = ("claude", "codex")
@@ -215,6 +215,17 @@ def file_lock(name: str, *, blocking: bool = True, note: str = ""):
         lk.tlock.release()
 
 
+def plan_lock_name(path: Path) -> str:
+    """The lock (and <name>.pids file) of one plan file. It is named after the file's path, so a
+    plan file must not be moved while its lock is held."""
+    return f"plan-{hashlib.sha1(str(Path(path).resolve()).encode()).hexdigest()[:12]}"
+
+
+def lock_held_here(name: str) -> bool:
+    lk = _LOCKS.get(name)
+    return lk is not None and lk.owner == threading.get_ident()
+
+
 # --------------------------------------------------------------------------- small helpers
 
 def log(msg: str) -> None:
@@ -253,11 +264,25 @@ def num(v, default: float = 0.0) -> float:
     return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else default
 
 
+MAX_JSON_DEPTH = 100  # crew's own files nest a handful of levels; deeper is corruption or an attack
+
+
 def _read_json(path: Path):
     try:
-        return json.loads(Path(path).read_text())
+        data = json.loads(Path(path).read_text())
     except json.JSONDecodeError as e:
         raise ValueError(f"{path}: invalid JSON ({e})") from None
+    except RecursionError:
+        raise ValueError(f"{path}: invalid JSON (nested too deeply)") from None
+    # Bound nesting here, without recursing, so nothing downstream (deep_merge's deepcopy,
+    # _write_json's json.dumps) can overflow on a crafted or corrupted file either.
+    level = [data]
+    for _ in range(MAX_JSON_DEPTH):
+        level = [c for v in level if isinstance(v, (dict, list))
+                 for c in (v.values() if isinstance(v, dict) else v)]
+        if not level:
+            return data
+    raise ValueError(f"{path}: invalid JSON (nested more than {MAX_JSON_DEPTH} levels deep)")
 
 
 def _write_json(path: Path, data) -> None:
@@ -420,6 +445,12 @@ def tracked_dirty(root: Path) -> bool:
 def untracked(root: Path) -> set[str]:
     out = git(root, "ls-files", "--others", "--exclude-standard", "-z").stdout
     return {f for f in out.split("\0") if f}
+
+
+def stale_gitlinks(root: Path) -> list[str]:
+    """Submodules whose checkout is at another commit than the index records (what `git add -u` would stage)."""
+    out = git(root, "diff-files", "--raw", "-z", "--ignore-submodules=dirty").stdout.split("\0")
+    return [path for meta, path in zip(out[::2], out[1::2]) if meta.startswith(":160000 160000 ")]
 
 
 def ignored_entries(root: Path) -> set[str]:
@@ -778,26 +809,47 @@ def _path_key(root: Path) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]", "_", f"{root.name}-{hashlib.sha1(str(root).encode()).hexdigest()[:6]}")
 
 
+_MIGRATION_NOTED: set[str] = set()
+
+
 def _migrate_key(root: Path, key: str) -> None:
-    """A remote was added after `crew init`: move the path-keyed profile and plans to the new key."""
+    """A remote was added after `crew init`: move the path-keyed profile and plans to the new key.
+    A plan that is running stays put (its lock and pid file are named after its path, and its run
+    saves to that path); a later command moves it. plans_for() looks in both folders meanwhile."""
     old = _path_key(root)
     if old == key or not (profile_path(old).exists() or plans_dir(old).is_dir()):
         return
+    moved = running = 0
     with file_lock("profiles"):
         if profile_path(old).exists():
             if profile_path(key).exists():  # another checkout already has one: keep both
                 profile_path(old).replace(profile_path(old).with_suffix(".json.moved"))
             else:
                 profile_path(old).replace(profile_path(key))
+            moved += 1
         if plans_dir(old).is_dir():
             plans_dir(key).mkdir(parents=True, exist_ok=True)
-            for f in plans_dir(old).glob("*.json"):
-                dest = plans_dir(key) / f.name
-                if not dest.exists():
-                    f.replace(dest)
+            for f in sorted(plans_dir(old).glob("*.json")):
+                dest, lock = plans_dir(key) / f.name, plan_lock_name(f)
+                if dest.exists():
+                    continue
+                if lock_held_here(lock):  # this very run: file_lock is re-entrant within a thread
+                    running += 1
+                    continue
+                try:
+                    with file_lock(lock, blocking=False):  # nobody is running it, and nobody can start to
+                        reap_orphans(CREW_HOME / "locks" / f"{lock}.pids")  # the new path has a new pid file
+                        f.replace(dest)
+                        moved += 1
+                except LockBusy:
+                    running += 1
             with contextlib.suppress(OSError):
                 plans_dir(old).rmdir()
-    log(f"note: moved crew's profile and plans for {root} to its new name ({key})")
+    if moved:
+        log(f"note: moved crew's profile and plans for {root} to its new name ({key})")
+    if running and str(root) not in _MIGRATION_NOTED:
+        _MIGRATION_NOTED.add(str(root))
+        log(f"note: {running} plan(s) of {root} are running and stay in {plans_dir(old)} until they stop")
 
 
 def ensure_profile(root: Path, *, force: bool = False, quiet: bool = False) -> tuple[str, dict]:
@@ -925,7 +977,7 @@ def per_call_estimate(cfg: dict) -> dict[str, float]:
 
 def load_state() -> dict:
     try:
-        state = json.loads(_state().read_text())
+        state = _read_json(_state())
     except (OSError, ValueError):
         state = {}
     if not isinstance(state, dict):
@@ -1119,6 +1171,31 @@ def _descendants(pid: int) -> list[int]:
     return found
 
 
+@contextlib.contextmanager
+def _signals_held():
+    """Ctrl-C, SIGTERM and SIGHUP that arrive inside this block take effect when it ends. For the
+    moments when stopping half-way would leave a child running that nothing knows about: while one
+    is started and recorded, and while one is being killed. Python delivers signals to the main
+    thread only; in any other thread this does nothing."""
+    pending: list[int] = []
+    held: dict[int, object] = {}
+    try:
+        if threading.current_thread() is threading.main_thread():
+            for name in ("SIGINT", "SIGTERM", "SIGHUP"):
+                if hasattr(signal, name):
+                    held[getattr(signal, name)] = signal.signal(getattr(signal, name), lambda n, f: pending.append(n))
+        yield
+    finally:
+        for signum, old in held.items():
+            signal.signal(signum, signal.SIG_DFL if old is None else old)
+        if pending:
+            old = held[pending[0]]
+            if callable(old):
+                old(pending[0], None)  # what the signal would have done: SystemExit or KeyboardInterrupt
+            elif old in (None, signal.SIG_DFL):
+                os.kill(os.getpid(), pending[0])
+
+
 def _kill_group(proc: subprocess.Popen) -> None:
     """Stop a CLI and everything it started: SIGTERM, a grace period, then SIGKILL."""
     if os.name == "nt":
@@ -1126,11 +1203,7 @@ def _kill_group(proc: subprocess.Popen) -> None:
         with contextlib.suppress(OSError):
             proc.kill()
         return
-    try:
-        old_int = signal.signal(signal.SIGINT, signal.SIG_IGN)  # don't abort the cleanup
-    except ValueError:  # not the main thread
-        old_int = None
-    try:
+    with _signals_held():  # a second stop signal must not cut the kill short
         tree = _descendants(proc.pid)
         for sig, wait in ((signal.SIGTERM, 10), (signal.SIGKILL, 5)):
             for kill in [lambda: os.killpg(proc.pid, sig)] + [lambda p=p: os.kill(p, sig) for p in tree]:
@@ -1138,9 +1211,6 @@ def _kill_group(proc: subprocess.Popen) -> None:
                     kill()
             with contextlib.suppress(subprocess.TimeoutExpired):
                 proc.wait(timeout=wait)
-    finally:
-        if old_int is not None:
-            signal.signal(signal.SIGINT, old_int)
 
 
 def _proc_start(pid: int) -> str:
@@ -1184,7 +1254,7 @@ def reap_orphans(pf: Path) -> None:
         lines = pf.read_text(errors="replace").splitlines()
         for ln in lines:
             pid_s, _, started = ln.partition("\t")
-            if not pid_s.isdigit() or not started or _proc_start(int(pid_s)) != started:
+            if not (pid_s.isascii() and pid_s.isdigit()) or not started or _proc_start(int(pid_s)) != started:
                 continue
             pid = int(pid_s)
             tree = _descendants(pid)
@@ -1219,16 +1289,20 @@ def _exec(cmd: list[str], stdin_text: str, cwd: Path, timeout: float, env: dict)
         raise Interrupted()
     if not Path(cwd).is_dir():
         return 127, "", f"workdir not found: {cwd}", 0.0
-    try:
-        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                cwd=str(cwd), env=env, start_new_session=True)
-    except OSError as e:
-        return 127, "", f"cannot start {cmd[0]}: {e.strerror or e}", time.time() - t0
-    with ACTIVE_LOCK:
-        ACTIVE.add(proc)
-    _register_child(proc.pid)
+    proc = None
     try:
         try:
+            # Held: a stop signal between the child's start and its record would leave it running
+            # with nothing to kill it, now or on the next run. It is acted on right after.
+            with _signals_held():
+                try:
+                    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                            stderr=subprocess.PIPE, cwd=str(cwd), env=env, start_new_session=True)
+                except OSError as e:
+                    return 127, "", f"cannot start {cmd[0]}: {e.strerror or e}", time.time() - t0
+                with ACTIVE_LOCK:
+                    ACTIVE.add(proc)
+                _register_child(proc.pid)
             out, err = proc.communicate(stdin_text.encode("utf-8", "replace"), timeout=timeout)
             rc = proc.returncode
         except subprocess.TimeoutExpired:
@@ -1242,12 +1316,15 @@ def _exec(cmd: list[str], stdin_text: str, cwd: Path, timeout: float, env: dict)
                 out, err = b"", b""
             rc, err = 124, (err or b"") + f"\ntimed out after {timeout:.0f}s".encode()
         except BaseException:
-            _kill_group(proc)  # Ctrl-C does not reach a child in its own session
+            if proc is not None:
+                _kill_group(proc)  # Ctrl-C does not reach a child in its own session
             raise
     finally:
-        with ACTIVE_LOCK:
-            ACTIVE.discard(proc)
-        _unregister_child(proc.pid)
+        if proc is not None:
+            with ACTIVE_LOCK:
+                ACTIVE.discard(proc)
+            if proc.poll() is not None:  # one that is somehow still alive stays on record for reap_orphans
+                _unregister_child(proc.pid)
     if STOPPING.is_set():
         raise Interrupted()
     dec = lambda b: (b or b"").decode("utf-8", "replace")  # noqa: E731
@@ -1632,7 +1709,15 @@ def new_plan_path(key: str, goal: str) -> Path:
 def plans_for(key: str, root: Path | None = None) -> list[Path]:
     """This project's plans, oldest first; with root, only those for that checkout."""
     out = []
-    for f in sorted(plans_dir(key).glob("*.json"), key=lambda p: p.stat().st_mtime):
+    dirs = [plans_dir(key)]
+    if root is not None and _path_key(root) != key:
+        dirs.append(plans_dir(_path_key(root)))  # plans that were running when the project got its new name
+
+    def mtime(p: Path) -> float:
+        with contextlib.suppress(OSError):
+            return p.stat().st_mtime
+        return 0.0
+    for f in sorted((f for d in dirs for f in d.glob("*.json")), key=mtime):
         if root is not None:
             try:
                 data = _read_json(f)
@@ -1928,7 +2013,6 @@ class Run:
         self.stopped = False
         self.ran_tasks = 0
         self.setup_done_now = False
-        self.recreated = False
         self.guarded: dict[Path, str] = {}
 
     def save(self) -> None:
@@ -1981,15 +2065,18 @@ class Run:
         pointer, wt = self._pointer(), Path(self.git["worktree"])
         owner = ""
         with contextlib.suppress(OSError):
-            owner = pointer.read_text().strip() if pointer.is_file() else ""
-        if owner and owner != me and Path(owner).is_file():
-            other = _plan_or_none(Path(owner))
-            og = other.get("git") if other else None
-            theirs = isinstance(og, dict) and isinstance(og.get("worktree"), str) \
-                and Path(og["worktree"]).resolve() == wt.resolve()
-            if theirs and (wt.exists() or plan_state(other) == "paused"):
-                raise ValueError(f"crew's copy {wt} (branch {g['branch']}) belongs to another plan, {owner}. "
+            owner = pointer.read_text(errors="replace").strip() if pointer.is_file() else ""
+        # git.owner is the plan file this git block was written for. A copy of that file carries it
+        # along, so the copy is still recognised after `crew clean --all` has removed the pointer.
+        made_for = g.get("owner") if isinstance(g.get("owner"), str) else ""
+        for claimed in dict.fromkeys((owner, made_for)):
+            other = _plan_claiming(claimed, wt) if claimed and claimed != me else None
+            if other is not None and (wt.exists() or plan_state(other) == "paused"):
+                raise ValueError(f"crew's copy {wt} (branch {g['branch']}) belongs to another plan, {claimed}. "
                                  "Finish that plan with `crew run`, or start a new plan for this goal.")
+        if made_for != me:
+            g["owner"] = me
+            self.save()
         if owner != me:
             wt.parent.mkdir(parents=True, exist_ok=True)
             pointer.write_text(me)
@@ -2029,18 +2116,18 @@ class Run:
         if tip == g["base"] and git(self.root, "rev-parse", "--verify", "-q", f"refs/heads/{g['branch']}").returncode:
             return True  # nothing committed yet: no branch to publish
         self._check_git_integrity()
-        r = git(self.root, "fetch", "--no-tags", "--no-write-fetch-head", str(self.workdir),
+        r = git(self.root, "fetch", "--no-tags", "--no-write-fetch-head", "--no-recurse-submodules", str(self.workdir),
                 f"refs/heads/{g['branch']}:refs/heads/{g['branch']}", timeout=600, track=True)
         ok = r.returncode == 0
         if not ok:
             why = ([ln.strip() for ln in r.stderr.splitlines() if ln.strip()] or ["git gave no reason"])[-1]
             if "checked out" in why:
-                hint = "Switch that checkout to another branch, then `crew run` copies the commits over."
+                hint = f"Switch that checkout to another branch, then `crew run {self.path}` copies the commits over."
             elif "non-fast-forward" in why or "rejected" in why:
                 hint = ("Your branch has commits that crew's copy lacks. The next `crew run` builds on them if it "
                         "can, or tells you the two have diverged.")
             else:
-                hint = "The next `crew run` tries again."
+                hint = f"`crew run {self.path}` tries again."
             log(f"  warning: couldn't update {g['branch']} in {self.root}: {short(why, 200)}\n"
                 f"           crew's copy keeps the commits. {hint}")
         g["published"] = tip if ok else g.get("published")
@@ -2077,7 +2164,7 @@ class Run:
             # Journal first: a crash from here on resumes with the same branch and clone.
             self.git = self.plan["git"] = {"branch": branch, "base": base, "tip": base, "worktree": str(wt),
                                            "start": pa.get("branch") or current_branch(root) or base,
-                                           "creating": True}
+                                           "creating": True, "owner": str(self.path.resolve())}
             self.save()
             self._claim_copy()
             crash_point("branch-recorded")
@@ -2094,7 +2181,18 @@ class Run:
             log("setup failed last time and no agent has run since: starting the clone over to retry it")
             g["creating"] = True
         if g.get("creating") or not (wt / ".git").is_dir():
-            vanished = not g.get("creating")
+            if not g.get("creating"):
+                # The copy is gone, and with it whatever its tasks hadn't committed. Journaled in the
+                # same save as `creating`: a rebuild that is itself cut short must not forget it.
+                for t in tasks:
+                    if "committing" in t:
+                        for k in ("committing", "untracked_before", "commit"):
+                            t.pop(k, None)
+                        t["status"] = "pending"
+                        t["result"] = "[crew] its uncommitted work was lost with crew's copy of the repo; it runs again"
+                        log(f"[{t['id']}] its uncommitted work was lost with crew's copy of the repo; it runs again")
+                    elif t.get("status") == "running":
+                        t.pop("untracked_before", None)  # snapshot of a copy that no longer exists
             g["creating"] = True
             g.pop("removing", None)
             self.save()
@@ -2131,11 +2229,12 @@ class Run:
                                  "this plan can't continue. Start a new plan.")
             # -B: when you have the crew branch checked out, the clone arrives with a local branch of
             # that name already; it is reset to the same starting point.
-            r = git(wt, "checkout", "-q", "--no-track", "-B", g["branch"], start_at)
+            r = git(wt, "checkout", "-q", "-f", "--no-track", "-B", g["branch"], start_at)
             if r.returncode != 0:
                 raise ValueError(f"could not create {g['branch']} in {wt}: {short(r.stderr, 300)}")
             g["tip"] = start_at
-            self.recreated = vanished
+            if start_at != g["base"]:
+                self._sync_submodules()  # still under `creating`: a failure here starts the copy over
             for t in tasks:  # a task counts as done only if its commit is on the branch
                 if t.get("commit") and git(wt, "merge-base", "--is-ancestor", t["commit"], start_at).returncode:
                     log(f"[{t['id']}] its commit {t['commit'][:10]} never reached {g['branch']}; it runs again")
@@ -2155,6 +2254,14 @@ class Run:
         if busy:
             raise ValueError(f"crew's copy {wt} has an unfinished {busy}; `crew clean --all` and `crew run`")
         tip = g.get("tip") or g["base"]
+        if g.get("adopting"):  # an earlier run was stopped while fast-forwarding the copy onto your commits
+            if head == g["adopting"] and head != tip:
+                self._adopted(tip, head)  # the merge had finished: record it now
+                tip = head
+                log(f"note: continuing from your own commits on {g['branch']} ({head[:10]})")
+            else:
+                g.pop("adopting", None)  # it never happened; the code below does it again if still needed
+                self.save()
         if head != tip and not any("committing" in t for t in tasks):
             raise ValueError(f"crew's copy {wt} has commits crew didn't make (HEAD {head[:10]}, expected "
                              f"{tip[:10]}). Inspect them; `crew clean --all` and `crew run` start over from "
@@ -2177,19 +2284,65 @@ class Run:
                 raise ValueError(f"could not read {g['branch']} from {root} into crew's copy: "
                                  f"{short(r.stderr, 200)}")
             if git(wt, "merge-base", "--is-ancestor", tip, rb).returncode == 0:
-                if git(wt, "merge", "-q", "--ff-only", f"origin/{g['branch']}").returncode:
-                    raise ValueError(f"could not bring your commits on {g['branch']} into crew's copy")
-                g["tip"] = rb
-                g["git_fingerprint"] = self._git_fingerprint()
+                g["adopting"] = rb  # journal first: a kill right after the merge resumes by recording it
                 self.save()
+                m = git(wt, "merge", "-q", "--ff-only", rb, timeout=1800, track=True)
+                if m.returncode:
+                    g.pop("adopting", None)
+                    self.save()
+                    g["published"] = tip  # your branch has everything crew committed; `clean` and `plans` rely on it
+                    self.save()
+                    why = short(" ".join(ln.strip() for ln in m.stderr.splitlines() if ln.strip()), 300)
+                    raise ValueError(f"could not bring your commits on {g['branch']} into crew's copy {wt}: "
+                                     f"{why or 'git gave no reason'}. Files left in the copy (by an interrupted task, "
+                                     "or by setup) are in the way. Move or delete them there and run "
+                                     f"`crew run {self.path}` again; or `crew clean --all`, which discards the "
+                                     f"copy's uncommitted work, and `crew run {self.path}` starts the copy over "
+                                     "from your branch.")
+                crash_point("adopt-merged")  # merge done, git.adopting saved, tip not yet moved
+                self._adopted(tip, rb)
                 log(f"note: continuing from your own commits on {g['branch']} ({rb[:10]})")
             elif git(wt, "merge-base", "--is-ancestor", rb, tip).returncode != 0:
                 raise ValueError(f"{g['branch']} in {root} and crew's copy have diverged: each has commits the "
                                  f"other lacks. To combine them, check the branch out in your repo and run "
                                  f"`git fetch {wt} {g['branch']}` then `git merge FETCH_HEAD`; after that "
                                  "`crew run` continues from your branch. Or start a new plan.")
+        if g.get("sync_submodules"):  # journaled by _adopted(): repeated here until it has worked
+            self._sync_submodules()
+            g.pop("sync_submodules", None)
+            self.save()
         if g.get("published") != (g.get("tip") or g["base"]) and (g.get("tip") or g["base"]) != g["base"]:
             self._publish()
+
+    def _sync_submodules(self) -> None:
+        """HEAD moved to commits this copy's submodule checkouts weren't made for (your own commits, or the
+        branch a rebuilt copy starts from). A checkout left behind would be staged by the next task's
+        `git add -u` as a pointer change that undoes yours, so move the checkouts to what HEAD records.
+        Only submodules that are already initialised: no --init, so nothing new is registered or cloned."""
+        wt = self.workdir
+        if not (wt / ".gitmodules").exists() or not stale_gitlinks(wt):
+            return
+        r = git(wt, "submodule", "update", "--checkout", "--recursive", timeout=1800, track=True)
+        left = stale_gitlinks(wt)
+        if left:
+            why = short(" ".join(ln.strip() for ln in r.stderr.splitlines() if ln.strip()), 300)
+            raise ValueError(f"could not move the submodule checkout(s) {', '.join(left[:5])} in crew's copy {wt} to "
+                             f"the commits {self.git['branch']} records: {why or 'git gave no reason'}. crew stopped "
+                             "before running a task, because the next commit would move the pointer(s) back. "
+                             f"Fix the cause and `crew run {self.path}` again.")
+
+    def _adopted(self, old: str, new: str) -> None:
+        """crew's copy was fast-forwarded from crew's tip (old) to your commits (new): record it in one save."""
+        g = self.git
+        for t in self.plan["tasks"]:
+            if t.get("committing") == old:
+                t["committing"] = new  # its finished work is still uncommitted, now on top of your commits
+        g["tip"] = new
+        g.pop("adopting", None)
+        if (self.workdir / ".gitmodules").exists():
+            g["sync_submodules"] = True
+        g["git_fingerprint"] = self._git_fingerprint()
+        self.save()
 
     def _snapshot(self) -> dict:
         return {"untracked": sorted(untracked(self.workdir)), "ignored": sorted(ignored_entries(self.workdir))}
@@ -2218,8 +2371,6 @@ class Run:
         if not self.git:
             return
         for task in self.plan["tasks"]:
-            if self.recreated and task.get("status") == "running":
-                task.pop("untracked_before", None)  # snapshot of a copy that no longer exists
             if "committing" not in task:
                 continue
             self.ran_tasks += 1  # the branch changes: verification must run again
@@ -2233,13 +2384,6 @@ class Run:
                 log(f"[{task['id']}] recovered its commit {head[:10]} after an interruption")
                 self.save()
                 self._publish()
-            elif self.recreated:
-                for k in ("committing", "untracked_before", "commit"):
-                    task.pop(k, None)
-                task["status"] = "pending"
-                task["result"] = "[crew] its uncommitted work was lost with crew's copy of the repo; it runs again"
-                log(f"[{task['id']}] its uncommitted work was lost with crew's copy of the repo; it runs again")
-                self.save()
             else:
                 log(f"[{task['id']}] committing work an interrupted run left behind")
                 self._commit_task(task, task.get("provider") or "?")
@@ -2590,7 +2734,7 @@ class Run:
             if state == "paused" or leftovers or unpublished:
                 why = ("uncommitted changes are left in it" if leftovers else
                        "its commits aren't in your repo yet" if unpublished else "the plan isn't finished")
-                log(f"git: keeping crew's copy {wt} ({why}); `crew run` continues there")
+                log(f"git: keeping crew's copy {wt} ({why}); `crew run {self.path}` continues there")
             elif wt.exists():
                 g["removing"] = True  # journaled: an interrupted removal starts the copy over next time
                 self.save()
@@ -2615,7 +2759,7 @@ def run_plan(cfg: dict, plan_path: Path, *, dry_run: bool = False, retry_failed:
         run.finish()
         return 0
     require_safe_home(cfg)
-    lock = f"plan-{hashlib.sha1(str(Path(plan_path).resolve()).encode()).hexdigest()[:12]}"
+    lock = plan_lock_name(plan_path)
     try:
         with file_lock(lock, blocking=False, note=f"running {plan_path}"):
             pidfile = CREW_HOME / "locks" / f"{lock}.pids"
@@ -2737,6 +2881,10 @@ def _process_item(explicit: Path | None, item: dict, use_git: bool, retry_failed
         root = resolve_workdir(Path(item["workdir"]))
         cfg, project = context_for(root, explicit)
         path = Path(item["plan"]) if item.get("plan") else new_plan_path(project["key"], item["goal"])
+        if not path.exists() and path.parent == plans_dir(_path_key(root)) != plans_dir(project["key"]):
+            # A remote was added since this item was queued: the project's plans moved to its new name.
+            path = plans_dir(project["key"]) / path.name
+            queue_update(item["id"], plan=str(path))
         if not path.exists():
             queue_update(item["id"], status="planning", plan=str(path))  # recorded before planning
             if item.get("direct"):
@@ -2821,6 +2969,19 @@ def _plan_or_none(path: Path) -> dict | None:
     return None
 
 
+def _plan_claiming(path: str, wt: Path) -> dict | None:
+    """The plan stored at `path`, if that is a plan file whose copy is `wt`. `path` was read from
+    disk (a <copy>.plan pointer, a plan's git.owner), so it may be anything."""
+    try:
+        plan = _plan_or_none(Path(path)) if path and Path(path).is_file() else None
+        g = plan.get("git") if plan else None
+        if isinstance(g, dict) and isinstance(g.get("worktree"), str) and Path(g["worktree"]).resolve() == Path(wt).resolve():
+            return plan
+    except (OSError, ValueError):
+        pass
+    return None
+
+
 def unpublished(g: dict) -> bool:
     """Does crew's copy hold commits that the branch in the user's repo doesn't have yet?"""
     tip = g.get("tip")
@@ -2837,19 +2998,16 @@ def clean(all_: bool) -> int:
             owners[Path(g["worktree"]).resolve()] = f
     removed = 0
     for wt in sorted(d for d in (CREW_HOME / "worktrees").glob("*/*") if d.is_dir()):
-        plan_file = owners.get(wt.resolve())
-        pointer = Path(f"{wt}.plan")
-        if plan_file is None and pointer.is_file():  # plans saved with --out live elsewhere
-            with contextlib.suppress(OSError):
-                candidate = Path(pointer.read_text().strip())
-                plan = _plan_or_none(candidate) if candidate.is_file() else None
-                g = plan.get("git") if plan else None
-                if isinstance(g, dict) and isinstance(g.get("worktree"), str) and Path(g["worktree"]).resolve() == wt.resolve():
-                    plan_file = candidate
+        pointer, named = Path(f"{wt}.plan"), ""
+        with contextlib.suppress(OSError):
+            named = pointer.read_text(errors="replace").strip() if pointer.is_file() else ""
+        # The pointer is written by every run, so it names the plan that last worked here (wherever
+        # its file is, and whichever other files name the same copy); the scan covers older copies.
+        plan_file = Path(named) if _plan_claiming(named, wt) is not None else owners.get(wt.resolve())
         if plan_file is None and not all_:
             log(f"kept {wt} (no plan claims it; `crew clean --all` removes it)")
             continue
-        lock = f"plan-{hashlib.sha1(str(plan_file.resolve()).encode()).hexdigest()[:12]}" if plan_file else "orphan"
+        lock = plan_lock_name(plan_file) if plan_file else "orphan"
         try:
             with file_lock(lock, blocking=False):
                 plan = _plan_or_none(plan_file) if plan_file else None
@@ -2859,7 +3017,7 @@ def clean(all_: bool) -> int:
                 g = plan.get("git") if plan else None
                 if isinstance(g, dict) and unpublished(g):
                     if not all_:
-                        log(f"kept {wt} (its commits aren't in your repo yet: `crew run` copies them there, "
+                        log(f"kept {wt} (its commits aren't in your repo yet: `crew run {plan_file}` copies them there, "
                             "`crew clean --all` discards them)")
                         continue
                     log(f"warning: {wt} held commits on {g.get('branch')} that never reached your repo; "
@@ -2943,7 +3101,7 @@ def list_plans(key: str | None, root: Path | None = None) -> None:
                 f"{short(str(plan.get('goal', '')), 50):<50} {f}")
             log(f"              {', '.join(f'{v} {k}' for k, v in sorted(counts.items()))}")
             if isinstance(plan.get("git"), dict) and unpublished(plan["git"]):
-                log("              its latest commits are only in crew's copy; `crew run` copies them into your repo")
+                log(f"              its latest commits are only in crew's copy; `crew run {f}` copies them into your repo")
             shown += 1
     if not shown:
         log("no plans yet")
@@ -3047,6 +3205,11 @@ def install() -> int:
 # --------------------------------------------------------------------------- cli
 
 def main(argv: list[str] | None = None) -> int:
+    # git sets these for shell aliases and hooks (GIT_DIR in a linked worktree, GIT_INDEX_FILE in a hook). Left
+    # in place they point every `git -C <dir>` that crew and its agents run at the caller's repository instead.
+    for var in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                "GIT_COMMON_DIR", "GIT_NAMESPACE", "GIT_PREFIX"):
+        os.environ.pop(var, None)
     ap = argparse.ArgumentParser(prog="crew", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", type=Path, help="use this config instead of ~/.crew/config.json")
@@ -3114,9 +3277,19 @@ def main(argv: list[str] | None = None) -> int:
             log(f"error: can't expand CREW_HOME={CREW_HOME}: set HOME, or set CREW_HOME to an absolute path")
             return 2
         CREW_HOME = CREW_HOME.resolve()
-    for sig in ("SIGTERM", "SIGHUP"):  # become SystemExit, so running agents are stopped with crew
-        if hasattr(signal, sig):
-            signal.signal(getattr(signal, sig), lambda n, f: sys.exit(128 + n))
+    stop_signals = [getattr(signal, s) for s in ("SIGINT", "SIGTERM", "SIGHUP") if hasattr(signal, s)]
+
+    def on_stop(signum, frame):
+        # SIGTERM/SIGHUP become SystemExit, so running agents are stopped with crew. One request is
+        # enough: a second one (closing a terminal sends two hang-ups) must not cut the stopping short.
+        for s in stop_signals:
+            signal.signal(s, signal.SIG_IGN)
+        if signum == signal.SIGINT:
+            raise KeyboardInterrupt
+        sys.exit(128 + signum)
+    for s in stop_signals:
+        if not (s == signal.SIGINT and signal.getsignal(s) == signal.SIG_IGN):  # e.g. started with nohup or `&`
+            signal.signal(s, on_stop)
 
     try:
         if args.cmd == "install":

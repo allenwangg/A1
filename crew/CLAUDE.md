@@ -2,7 +2,7 @@
 
 crew (`crew.py`) drives the `claude` and `codex` CLIs across the owner's projects. It is one
 stdlib-only Python file plus `crew.json` (a copy of `DEFAULTS`), `README.md` and `test_crew.py`.
-These rules come from six rounds of adversarial review; each one records a defect that was
+These rules come from seven rounds of adversarial review; each one records a defect that was
 found and fixed. Do not relax them for convenience. `ASSURANCE.md` holds the evidence.
 
 ## Laws: invariants every change must keep
@@ -18,6 +18,12 @@ found and fixed. Do not relax them for convenience. `ASSURANCE.md` holds the evi
    (`rb`), correct `git.published` from it, and compare ancestry inside the clone, which holds
    both sides once fetched. The user's repo doesn't have crew's commits until they are published.
    Commits that were refused stay in the clone; `clean` keeps such a clone unless `--all`.
+   `main()` removes the git location variables crew inherits (`GIT_DIR`, `GIT_WORK_TREE`,
+   `GIT_INDEX_FILE` and the rest): left in place they point every `git -C <dir>` at the
+   caller's repository. The publish fetch passes `--no-recurse-submodules`. When the clone is
+   put on commits its submodule checkouts weren't made for (the user's own commits, or the
+   branch a rebuilt clone starts from), `_sync_submodules()` moves them, without `--init`;
+   otherwise the next task's `git add -u` commits a pointer change that undoes the user's.
 2. **Agent-modified code never runs outside a sandbox.** Setup (network, unsandboxed) runs only
    on the base commit in a fresh clone, before any agent has run there; in place (`--no-git`)
    only before the first task ever runs. Checks run inside `codex sandbox -P :workspace`, or
@@ -37,7 +43,11 @@ found and fixed. Do not relax them for convenience. `ASSURANCE.md` holds the evi
    `safe.directory` and hosted git settings.
 3. **Journal before you act.** Any step that changes a repo or a clone is written to the plan
    file first: `git.creating`, `task.untracked_before`, `task.status = running`,
-   `task.committing`, `git.removing`. `_reconcile()` finishes or undoes what a crash cut off.
+   `task.committing`, `git.adopting`, `git.sync_submodules`, `git.removing`. `_reconcile()`
+   finishes or undoes what a crash cut off. A fact the resume depends on is saved in the same
+   write as the step that creates it: when the clone has vanished, the tasks that lost
+   uncommitted work are reset in the save that sets `git.creating`, and `_adopted()` moves
+   `git.tip` and every `task.committing` marker together.
    Long git commands (clone, checkout, fetch) run with `git(..., track=True)`, so they are in
    the pid file and `reap_orphans()` stops them before a resume touches the clone.
    A task counts as done only if its `crew(<id>):` commit is on the branch. Never add a
@@ -56,18 +66,27 @@ found and fixed. Do not relax them for convenience. `ASSURANCE.md` holds the evi
    (tmp + fsync + rename). `reap_orphans()` kills CLIs a dead crew left behind, matched by pid
    and start time. Each clone belongs to one plan file, named by `<clone>.plan`:
    `_claim_copy()` writes it on every run and refuses a clone another live plan owns; `clean`
-   uses it to find plans saved with `--out`. Plans outside `~/.crew/plans` get a path hash in
-   their branch name (`_branch_name`).
+   reads it first to find a clone's plan. The plan also records its own path as `git.owner`, so
+   a copied plan file is refused after the pointer is gone. Plans outside `~/.crew/plans` get a
+   path hash in their branch name (`_branch_name`). A plan's lock and pid file are named after
+   its path (`plan_lock_name`), so `_migrate_key` moves a plan file only while holding that
+   lock, after reaping its pid file, and `plans_for` looks in the old folder too.
 7. **Nothing read from disk or a CLI is trusted.** Validate types (`num()`, `load_config`,
    `load_profile`, `validate_plan`, the plan `git` block), reject control characters in task
    fields, decode subprocess output with `errors="surrogateescape"` (git) or `"replace"`, treat
    a reply crew can't parse as a failed attempt (never a traceback), and detect usage limits
-   only from the provider's own error message (`LIMIT_RE`), never from raw stdout.
+   only from the provider's own error message (`LIMIT_RE`), never from raw stdout. `_read_json`
+   is the only reader of crew's files and bounds their nesting (`MAX_JSON_DEPTH`), because
+   `deepcopy` and `json.dumps` overflow on depth that `json.loads` accepts. Pointer and pid
+   files are read with `errors="replace"` and checked before use.
 8. **Codex `error` events are not failures.** Success is `turn.completed` and no `turn.failed`
    with exit 0; "Reconnecting..." notices are diagnostics.
 9. **Every subprocess has a timeout, runs in its own session, and is killed as a tree.**
    `_exec` is the only way to start a CLI. SIGTERM/SIGHUP become `SystemExit` so children die
-   with crew.
+   with crew. A child is started and recorded inside `_signals_held()`, and killed inside it, so
+   a stop signal can't land between a child's start and its record or cut a kill short; the
+   first stop signal makes crew ignore later ones. `_exec` drops a child's record only once the
+   child has exited. A signal that was ignored when crew started (nohup) stays ignored.
 10. **Credentials stay with their provider.** `provider_env()` strips the other provider's keys;
     sandboxed checks get no `SECRET_ENV` variables at all; keys are never logged or put on a
     command line (`codex-login` pipes via stdin).
@@ -97,6 +116,12 @@ found and fixed. Do not relax them for convenience. `ASSURANCE.md` holds the evi
   per-process only, and `codex sandbox` is unavailable, so checks are skipped.
 - Both CLI sandboxes allow writes under the temp directory. Repos kept under `/tmp` lose
   isolation; crew warns. (crew's own home there is refused, see law 2.)
-- Two plan files written before 3.2 that already name the same branch are refused only while
-  one of them has a live clone; after that they share the branch.
+- Two plan files written before 3.3 (no `git.owner`) that already name the same branch are
+  refused only while one of them has a live clone; after that they share the branch.
+- SIGKILL cannot be held off. One that lands in the few milliseconds between a tracked git
+  command starting and its pid being recorded leaves that git running unrecorded; the next run
+  fails once ("another process may still be writing there") and succeeds when repeated.
+- Submodules: only an update the user commits on a crew branch is tested. The Codex sandbox
+  lets a worker replace a submodule's `.git` file in the clone (probed); crew's git commands
+  there recurse into submodules, and the fingerprint does not cover those files yet.
 - The `tokens` metric is approximate: the two CLIs count differently.
