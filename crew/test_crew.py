@@ -85,6 +85,8 @@ def work(prompt):
 
 FAKE_CLAUDE = FAKE_COMMON + r'''
 a = sys.argv[1:]
+if os.environ.get("FAKE_PROBE_READS_TERMINAL") and (a == ["--help"] or a[:2] == ["auth", "status"]):
+    sys.stdin.read(1)  # the real CLI touches the terminal it is given, even for these two
 if a == ["--help"]:
     help_text("--print --output-format --json-schema --setting-sources --permission-mode --tools "
               "--allowedTools --settings --model"); sys.exit(0)
@@ -196,6 +198,8 @@ class CrewTest(unittest.TestCase):
                            capture_output=True, text=True, env={**self.env, **(env or {})}, timeout=120)
         if check and r.returncode not in (0, 1):
             self.fail(f"crew {args} exited {r.returncode}\n{r.stdout}\n{r.stderr}")
+        if "this is a defect in crew" in r.stdout + r.stderr:  # main()'s last resort: no test may reach it
+            self.fail(f"crew {args} hit an error no check foresaw\n{r.stdout}\n{r.stderr}")
         return r
 
     def calls(self) -> list[dict]:
@@ -1593,6 +1597,378 @@ class TestSayWhatIsIgnored(CrewTest):
         self.assertNotIn(str(out.resolve()), self.crew("plans", "--workdir", str(other)).stdout)
         self.crew("run", str(out))  # finishes; the copy and its pointer go
         self.assertNotIn(str(out.resolve()), self.crew("plans", "--all").stdout)
+
+
+class TestThreeSeven(CrewTest):
+    """Stops that were missed, plans that could not be found, and values no check foresaw (3.4 review)."""
+
+    def workers(self):
+        return [c for c in self.calls() if "argv" in c and not c.get("planner")]
+
+    def plan_file(self) -> Path:
+        return max((self.home / "plans").glob("*/*.json"), key=lambda f: f.stat().st_mtime)
+
+    def crew_with_no_reader(self, *args, env=None) -> int:
+        """crew's exit code when whatever was reading its output has gone away (`crew ... | head`)."""
+        r, w = os.pipe()
+        os.close(r)
+        try:
+            return subprocess.run([sys.executable, str(HERE / "crew.py"), "--config", str(self.cfg), *args], stdout=w,
+                                  stderr=subprocess.DEVNULL, env={**self.env, **(env or {})}, timeout=120).returncode
+        finally:
+            os.close(w)
+
+    def files_on(self, root, branch):
+        return sh(root, "git", "ls-tree", "-r", "--name-only", branch).split()
+
+    def agents_alive(self) -> list[int]:
+        out = subprocess.run(["ps", "-A", "-o", "pid=", "-o", "args="], capture_output=True, text=True).stdout
+        return [int(ln.split()[0]) for ln in out.splitlines() if f"{self.bin}/" in ln]
+
+    def paused(self, root, **kw) -> Path:
+        self.crew("go", "x", "--workdir", str(root), env={"CREW_CRASH_AT": "before-commit"}, check=False, **kw)
+        return self.plan_file()
+
+    # ---------------------------------------------------------------- stopping
+
+    def test_a_stop_signal_while_a_queue_worker_starts_an_agent_is_acted_on(self):
+        import signal
+        a, b = self.repo("alpha"), self.repo("beta")
+        self.crew("queue", "add", "do it", "--direct", "--workdir", str(a), "--workdir", str(b))
+        # crew.py is unchanged; only starting a process in a worker thread takes longer, as on a loaded machine.
+        slow = self.tmp / "slow_start.py"
+        slow.write_text(textwrap.dedent("""
+            import runpy, subprocess, sys, threading, time
+            real = subprocess.Popen
+            class SlowStart(real):
+                def __init__(self, *a, **kw):
+                    super().__init__(*a, **kw)
+                    if kw.get("start_new_session") and threading.current_thread() is not threading.main_thread():
+                        time.sleep(1.5)
+            subprocess.Popen = SlowStart
+            sys.argv = sys.argv[1:]
+            runpy.run_path(sys.argv[0], run_name="__main__")
+        """))
+        run = subprocess.Popen(
+            [sys.executable, str(slow), str(HERE / "crew.py"), "--config", str(self.cfg), "queue", "run"],
+            env={**self.env, "FAKE_SLEEP": "20"}, stdout=subprocess.PIPE, text=True)
+        try:
+            for line in run.stdout:
+                if "[t1]" in line:
+                    break
+            time.sleep(0.5)  # a worker thread has started its agent and not yet put it on record
+            run.send_signal(signal.SIGTERM)
+            try:
+                run.communicate(timeout=12)
+            except subprocess.TimeoutExpired:
+                self.fail("crew did not stop: it is waiting for an agent it never killed, and ignores signals now")
+            self.assertEqual(run.returncode, 143)
+            self.assertEqual(self.agents_alive(), [])  # the agent that was being started was killed too
+        finally:
+            if run.poll() is None:
+                run.kill()
+            for pid in self.agents_alive():
+                os.kill(pid, signal.SIGKILL)
+        items = json.loads((self.home / "queue.json").read_text())["items"]
+        self.assertEqual({i["status"] for i in items}, {"paused"})
+
+    def test_a_stop_signal_behind_an_ignored_one_is_not_lost(self):
+        code = textwrap.dedent(f"""
+            import os, signal, sys, time
+            sys.path.insert(0, {str(HERE)!r})
+            import crew
+            signal.signal(signal.SIGINT, signal.SIG_IGN)               # crew started by `sh -c 'crew ... &'`
+            signal.signal(signal.SIGTERM, lambda n, f: sys.exit(143))  # what crew's own handler does
+            with crew._signals_held():                                 # e.g. while an agent is being killed
+                os.kill(os.getpid(), signal.SIGINT)
+                os.kill(os.getpid(), signal.SIGTERM)
+                time.sleep(0.2)
+            print("carried on")
+        """)
+        r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 143, r.stdout + r.stderr)  # the SIGTERM took effect when the block ended
+        self.assertNotIn("carried on", r.stdout)
+
+    def test_a_stop_signal_that_a_queue_worker_thread_receives_is_acted_on(self):
+        import ctypes
+        import platform
+        import signal
+        tgkill = {"x86_64": 234, "aarch64": 131}.get(platform.machine()) if sys.platform.startswith("linux") else None
+        if tgkill is None:
+            self.skipTest("needs tgkill(2) to choose the thread a signal goes to")
+        a, b = self.repo("alpha"), self.repo("beta")
+        self.crew("queue", "add", "do it", "--direct", "--agent", "Sol", "--workdir", str(a))  # goes to codex
+        self.crew("queue", "add", "do it", "--direct", "--agent", "Astra", "--workdir", str(b))  # to claude
+        run = subprocess.Popen(
+            [sys.executable, str(HERE / "crew.py"), "--config", str(self.cfg), "queue", "run"],
+            env={**self.env, "FAKE_SLEEP": "20"}, stdout=subprocess.PIPE, text=True)
+        try:
+            for _ in range(100):
+                if len(self.workers()) == 2:  # both at work, so no task ends by itself for 20 s
+                    break
+                time.sleep(0.1)
+            else:
+                self.fail("the two agents did not start side by side")
+            # The system gives a signal to a worker thread when that thread has just started a child and
+            # reaches the signal before the main thread wakes (seen under load). Done on purpose here.
+            thread = next(int(t) for t in os.listdir(f"/proc/{run.pid}/task") if int(t) != run.pid)
+            self.assertEqual(ctypes.CDLL(None).syscall(tgkill, run.pid, thread, int(signal.SIGTERM)), 0)
+            try:
+                run.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                self.fail("crew did not stop: its main thread is asleep until a task ends by itself")
+            self.assertEqual(run.returncode, 143)
+            self.assertEqual(self.agents_alive(), [])
+        finally:
+            if run.poll() is None:
+                run.kill()
+            for pid in self.agents_alive():
+                os.kill(pid, signal.SIGKILL)
+
+    def test_two_different_stop_signals_at_once_give_no_traceback(self):
+        import signal
+        root = self.repo()
+        run = subprocess.Popen(
+            [sys.executable, str(HERE / "crew.py"), "--config", str(self.cfg), "do", "x", "--workdir", str(root)],
+            env={**self.env, "FAKE_SLEEP": "30"}, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            for _ in range(200):
+                if self.workers():
+                    break
+                time.sleep(0.1)
+            else:
+                self.fail("no worker started")
+            worker_pid = self.workers()[-1]["pid"]
+            os.kill(run.pid, signal.SIGSTOP)  # so that both are waiting when crew next runs, whatever the timing
+            time.sleep(0.2)
+            os.kill(run.pid, signal.SIGHUP)
+            os.kill(run.pid, signal.SIGTERM)
+            os.kill(run.pid, signal.SIGCONT)
+            out, err = run.communicate(timeout=40)
+        finally:
+            if run.poll() is None:
+                run.kill()
+        self.assertNotIn("Traceback", err)
+        self.assertNotIn("race condition", err)
+        self.assertIn(run.returncode, (129, 143))
+        with self.assertRaises(ProcessLookupError):
+            os.kill(worker_pid, 0)  # and the stop itself was complete
+
+    def test_crew_in_the_background_of_a_terminal_is_not_stopped_by_its_probes(self):
+        try:
+            import pty
+            master, slave = pty.openpty()
+        except (ImportError, OSError) as e:
+            self.skipTest(f"no pseudo-terminal here: {e}")
+        root = self.repo()
+        # What an interactive shell does for `crew ... &`: this process leads the terminal's session and stays
+        # in the foreground; crew is a process group of its own (a background job) with the terminal as stdin.
+        job = self.tmp / "background_job.py"
+        job.write_text(textwrap.dedent("""
+            import fcntl, os, signal, subprocess, sys, termios
+            fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+            crew = subprocess.Popen(sys.argv[1:], preexec_fn=lambda: os.setpgid(0, 0))
+            _, status = os.waitpid(crew.pid, os.WUNTRACED)
+            if os.WIFSTOPPED(status):
+                print("STOPPED by signal", os.WSTOPSIG(status), flush=True)
+                os.killpg(crew.pid, signal.SIGKILL)
+                sys.exit(99)
+            sys.exit(os.WEXITSTATUS(status) if os.WIFEXITED(status) else 98)
+        """))
+        try:
+            r = subprocess.run(
+                [sys.executable, str(job), sys.executable, str(HERE / "crew.py"), "--config", str(self.cfg),
+                 "do", "x", "--workdir", str(root)],
+                stdin=slave, capture_output=True, text=True, start_new_session=True, timeout=120,
+                env={**self.env, "FAKE_PROBE_READS_TERMINAL": "1"})
+        finally:
+            os.close(master)
+            os.close(slave)
+        self.assertNotIn("STOPPED", r.stdout, r.stdout + r.stderr)  # job control stopped crew at `claude auth status`
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.latest_plan(root)["tasks"][0]["status"], "done")
+
+    def test_no_process_crew_starts_is_given_the_terminal(self):
+        import ast
+        tree = ast.parse((HERE / "crew.py").read_text())
+        starts = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                  and isinstance(n.func.value, ast.Name) and n.func.value.id == "subprocess"
+                  and n.func.attr in ("run", "Popen", "call", "check_call", "check_output")]
+        self.assertGreater(len(starts), 8)
+        bare = [n.lineno for n in starts if not {"stdin", "input"} & {k.arg for k in n.keywords}]
+        self.assertEqual(bare, [], "crew.py starts a process at these lines without stdin= or input=")
+        self.assertNotIn("os.system(", (HERE / "crew.py").read_text())
+
+    def test_a_run_whose_output_reader_went_away_does_not_exit_0(self):
+        root = self.repo()
+        self.crew("plan", "x", "--workdir", str(root))
+        plan = self.plan_file()
+        rc = self.crew_with_no_reader("run", str(plan))
+        self.assertNotEqual(crew.plan_state(json.loads(plan.read_text())), "done")
+        self.assertEqual(rc, 141)  # 128 + SIGPIPE, never 0: exit 0 is for a plan that is done
+        self.assertEqual(self.agents_alive(), [])
+        r = self.crew("run", str(plan))  # and nothing was left in the way of a resume
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.crew_with_no_reader("plans", "--all"), 0)  # a listing cut short is still exit 0
+
+    # ---------------------------------------------------------------- finding a checkout's plans
+
+    def test_plans_and_profile_are_still_found_after_the_remote_changes(self):
+        for n, change in enumerate((("set-url", "origin", "git@github.com:me/renamed.git"),
+                                    ("rename", "origin", "upstream"), ("remove", "origin"))):
+            with self.subTest(change=change):
+                root = self.repo(f"proj{n}")
+                sh(root, "git", "remote", "add", "origin", f"git@github.com:me/proj{n}.git")
+                self.set_profile(root, notes=["MY EDIT"])
+                plan = self.paused(root)
+                n0 = len(self.workers())
+                sh(root, "git", "remote", *change)
+                r = self.crew("plans", "--workdir", str(root))
+                self.assertIn(str(plan), r.stdout)  # this checkout's plan, under the name it had
+                self.assertIn(f"`crew run {plan}` continues it", self.crew("clean").stdout)
+                shown = self.crew("config", "--workdir", str(root)).stdout
+                self.assertIn("MY EDIT", shown)  # the profile that was edited for this checkout came along
+                r = self.crew("run", "--workdir", str(root))
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                self.assertIn(f"resuming {plan}", r.stdout)
+                self.assertEqual(len(self.workers()), n0 + 1)  # t2 only: t1 was not repeated
+                done = json.loads(plan.read_text())
+                self.assertEqual(sorted(self.files_on(root, done["git"]["branch"])), ["README.md", "t1.txt", "t2.txt"])
+
+    def test_run_by_path_follows_a_plan_that_moved_when_a_remote_was_added(self):
+        root = self.repo()
+        old = self.paused(root)
+        sh(root, "git", "remote", "add", "origin", "git@github.com:me/proj.git")
+        r = self.crew("run", str(old), check=False)  # this very command moves the file it was given
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        new = self.plan_file()
+        self.assertNotEqual(new, old)
+        self.assertIn(f"is now {new}", r.stdout)
+        self.assertTrue(all(t["status"] == "done" for t in json.loads(new.read_text())["tasks"]))
+        r = self.crew("run", str(old), check=False)  # and the path printed earlier keeps working afterwards
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("nothing to do", r.stdout)
+
+    def test_a_stale_copy_of_a_finished_plan_is_refused(self):
+        root = self.repo()
+        original = self.paused(root)
+        stale = self.tmp / "mine" / "plan-copy.json"
+        stale.parent.mkdir()
+        shutil.copy(original, stale)  # made while the plan was paused
+        r = self.crew("run", str(original))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)  # the plan finishes; its copy and pointer go
+        self.crew("clean", "--all")
+        n0 = len(self.workers())
+        branch = json.loads(original.read_text())["git"]["branch"]
+        tip = sh(root, "git", "rev-parse", branch)
+        r = self.crew("run", str(stale), check=False)
+        self.assertEqual(r.returncode, 2, r.stdout)
+        self.assertIn("belongs to another plan", r.stdout)
+        self.assertEqual(len(self.workers()), n0)  # no task was done a second time on the finished branch
+        self.assertEqual(sh(root, "git", "rev-parse", branch), tip)
+        original.unlink()  # once the original is gone, the file is nobody's copy
+        r = self.crew("run", str(stale))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    # ---------------------------------------------------------------- values no check foresaw
+
+    def test_out_of_range_and_wrong_typed_values_are_errors_not_tracebacks(self):
+        root = self.repo()
+
+        def no_traceback(r, what, codes=(0, 1, 2)):
+            self.assertNotIn("Traceback", r.stdout + r.stderr, what)
+            self.assertIn(r.returncode, codes, f"{what}\n{r.stdout}{r.stderr}")
+            return r
+
+        def cfg_raw(extra, literal):  # 1e999 is valid JSON, and json.loads reads it as infinity
+            self.write_cfg(extra)
+            self.cfg.write_text(self.cfg.read_text().replace('"@"', literal))
+
+        for extra, literal in (({"providers": {"claude": {"max_parallel": "@"}}}, "1e999"),
+                               ({"providers": {"codex": {"timeout_sec": "@"}}}, "1e999"),
+                               ({"verify": {"timeout_sec": "@"}}, "1e12"),
+                               ({"verify": {"fix_rounds": "@"}}, "1e999"),
+                               ({"split": {"min_runs": "@"}}, "1e999"),
+                               ({"split": {"cooldown_minutes": "@"}}, "NaN"),
+                               ({"planner": {"max_tasks": "@"}}, "1" + "0" * 400),
+                               ({"git": {"branch_prefix": "@"}}, "true")):
+            cfg_raw(extra, literal)
+            r = no_traceback(self.crew("do", "x", "--workdir", str(root), check=False), f"{extra} = {literal}", (2,))
+            self.assertIn("error: config: ", r.stdout)
+        cfg_raw({"verify": {"fixer": "@"}}, "[]")  # not an agent's name: the first agent fixes, as for a wrong name
+        no_traceback(self.crew("usage"), "verify.fixer = []", (0,))
+        self.write_cfg({})
+        self.assertEqual(self.workers(), [])  # none of those ran anything
+
+        self.home.mkdir(parents=True, exist_ok=True)
+        (self.home / "state.json").write_text('{"cooldown_until": {"claude": 1e300, "codex": 1e999}}')
+        (self.home / "usage.jsonl").write_text(
+            '{"ts": %f, "provider": "claude", "tokens": 1e999, "seconds": 1e999, "ok": true, "project": "p"}\n'
+            % time.time())
+        no_traceback(self.crew("usage"), "state and usage log", (0,))
+        (self.home / "state.json").unlink()
+        (self.home / "queue.json").write_text('{"items": null, "next_id": 1e999}')
+        r = no_traceback(self.crew("queue", "list"), "queue items = null", (0,))
+        self.assertIn("not a list", r.stdout)
+        no_traceback(self.crew("queue", "add", "x", "--workdir", str(root)), "queue next_id = 1e999", (0,))
+        (self.home / "queue.json").unlink()
+
+        plan = self.paused(root)  # t1's work is in the copy, its commit not made yet
+        good = plan.read_text()
+        n0 = len(self.workers())
+        edits = {"committing = true": lambda p: p["tasks"][0].update(committing=True),
+                 "committing = {}": lambda p: p["tasks"][0].update(committing={"a": 1}),
+                 "commit = 5": lambda p: p["tasks"][0].update(commit=5),
+                 "untracked_before = true": lambda p: p["tasks"][0].update(untracked_before=True),
+                 "untracked_before.untracked = true": lambda p: p["tasks"][0]["untracked_before"].update(untracked=True),
+                 "status removed": lambda p: p["tasks"][0].pop("status"),
+                 "status = []": lambda p: p["tasks"][0].update(status=[]),
+                 "git.untracked_base = true": lambda p: p["git"].update(untracked_base=True),
+                 "git.tip = true": lambda p: p["git"].update(tip=True)}
+        for what, edit in edits.items():
+            p = json.loads(good)
+            edit(p)
+            plan.write_text(json.dumps(p))
+            r = no_traceback(self.crew("run", str(plan), check=False), what, (2,))
+            self.assertIn("error: ", r.stdout, what)
+        self.assertEqual(len(self.workers()), n0)  # refused before anything ran
+        plan.write_text(good)
+        r = self.crew("run", str(plan))  # and the plan itself was not harmed by being refused
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_an_error_no_check_foresaw_is_one_line_and_stops_cleanly(self):
+        code = textwrap.dedent(f"""
+            import sys
+            sys.path.insert(0, {str(HERE)!r})
+            import crew
+            def broken(*a, **kw):
+                raise RuntimeError("boom")
+            crew.print_split = broken
+            sys.exit(crew.main(["--config", {str(self.cfg)!r}, "usage"]))
+        """)
+        r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=self.env, timeout=60)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertNotIn("Traceback", r.stdout + r.stderr)
+        self.assertIn("error: RuntimeError: boom", r.stdout)
+        self.assertIn("this is a defect in crew", r.stdout)
+        r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60,
+                           env={**self.env, "CREW_TRACEBACK": "1"})
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("Traceback", r.stderr)  # on request, the whole trace
+
+    def test_a_queue_item_without_an_absolute_workdir_is_not_run(self):
+        started_in = self.tmp / "somewhere"
+        started_in.mkdir()
+        self.home.mkdir(parents=True, exist_ok=True)
+        for workdir in ("", "somewhere", "."):
+            (self.home / "queue.json").write_text(json.dumps({"next_id": 2, "items": [
+                {"id": "q1", "key": "k", "name": "n", "workdir": workdir, "goal": "do it", "status": "queued",
+                 "plan": None}]}))
+            r = subprocess.run([sys.executable, str(HERE / "crew.py"), "--config", str(self.cfg), "queue", "run"],
+                               capture_output=True, text=True, env=self.env, cwd=started_in, timeout=120)
+            self.assertIn("malformed", r.stdout, workdir)
+            self.assertEqual(self.calls(), [], workdir)  # no planner, no agent
+            self.assertEqual(os.listdir(started_in), [], workdir)  # nothing was done where crew happened to start
 
 
 class TestQueue(CrewTest):

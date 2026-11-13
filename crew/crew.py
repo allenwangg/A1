@@ -24,6 +24,7 @@ import copy
 import fnmatch
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -33,8 +34,10 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor
+from concurrent.futures import wait as wait_for_futures
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -46,7 +49,7 @@ except ImportError:  # Windows: thread locks only
 if sys.version_info < (3, 9):
     sys.exit("crew needs Python 3.9 or newer")
 
-VERSION = "3.6"
+VERSION = "3.7"
 HERE = Path(__file__).resolve().parent
 CREW_HOME = Path(os.path.expanduser(os.environ.get("CREW_HOME") or "~/.crew"))
 PROVIDERS = ("claude", "codex")
@@ -256,15 +259,34 @@ def slugify(s: str, n: int = 40) -> str:
 
 
 def fmt_time(ts: float) -> str:
-    return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+    try:
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+    except (OverflowError, OSError, ValueError):  # a timestamp from a damaged state file
+        return "a time too far off to show"
 
 
 def num(v, default: float = 0.0) -> float:
-    """A float from untrusted JSON: real numbers only (not bools, strings or None)."""
-    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else default
+    """A float from untrusted JSON: real, finite numbers only (not bools, strings or None, and not
+    1e999, NaN or an integer too large for a float: all of those are valid JSON)."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return default
+    try:
+        f = float(v)
+    except OverflowError:
+        return default
+    return f if math.isfinite(f) else default
+
+
+def is_sha(v) -> bool:
+    return isinstance(v, str) and re.fullmatch(r"[0-9a-f]{7,64}", v) is not None
+
+
+def str_list(v) -> bool:
+    return isinstance(v, list) and all(isinstance(x, str) for x in v)
 
 
 MAX_JSON_DEPTH = 100  # crew's own files nest a handful of levels; deeper is corruption or an attack
+MAX_TIMEOUT_SEC = 2_000_000  # about 23 days; the operating system's wait call overflows not far above it
 
 
 def _read_json(path: Path):
@@ -357,6 +379,13 @@ def load_config(explicit: Path | None, overrides: dict | None = None) -> dict:
     for sec, k in numeric:
         if k in cfg[sec] and num(cfg[sec][k], None) is None:
             raise ValueError(f"config: {sec}.{k} must be a number")
+    timeouts = [("verify", cfg["verify"]), ("setup", cfg["setup"])] + [
+        (f"providers.{p}", cfg["providers"][p]) for p in PROVIDERS if isinstance(cfg["providers"].get(p), dict)]
+    for where, sec in timeouts:
+        if num(sec.get("timeout_sec"), 0) > MAX_TIMEOUT_SEC:
+            raise ValueError(f"config: {where}.timeout_sec must be at most {MAX_TIMEOUT_SEC} (seconds)")
+    if not isinstance(cfg["git"].get("branch_prefix", ""), str):
+        raise ValueError('config: git.branch_prefix must be a string like "crew/"')
     if not isinstance(cfg["planner"].get("model") or {}, dict):
         raise ValueError('config: planner.model must be an object like {"claude": "opus"}')
     if not isinstance(cfg["split"].get("target_share") or {}, dict) or not all(
@@ -390,7 +419,7 @@ def load_config(explicit: Path | None, overrides: dict | None = None) -> dict:
         raise ValueError("config: split.mode must be by_role, balanced or fixed")
     if split.get("metric") not in ("tasks", "tokens", "seconds"):
         raise ValueError("config: split.metric must be tasks, tokens or seconds")
-    if cfg["verify"].get("fixer") not in agents:
+    if not isinstance(cfg["verify"].get("fixer"), str) or cfg["verify"]["fixer"] not in agents:
         cfg["verify"]["fixer"] = next(iter(agents))
     for p in PROVIDERS:
         pc = cfg["providers"].setdefault(p, {})
@@ -433,6 +462,9 @@ def git(root: Path, *args: str, timeout: float = 120, track: bool = False,
         return subprocess.CompletedProcess(argv, rc, out, err)
     try:
         # surrogateescape: non-UTF-8 file names survive the round trip back into `git add`
+        if stdin is None:  # never the terminal crew was started from (see login_status)
+            return subprocess.run(argv, capture_output=True, text=True, errors="surrogateescape", timeout=timeout,
+                                  stdin=subprocess.DEVNULL)
         return subprocess.run(argv, capture_output=True, text=True, errors="surrogateescape", timeout=timeout,
                               input=stdin)
     except (OSError, subprocess.TimeoutExpired) as e:
@@ -871,12 +903,37 @@ def _migrate_key(root: Path, key: str) -> None:
         log(f"note: {running} plan(s) of {root} are running and stay in {plans_dir(old)} until they stop")
 
 
+def _profile_of_checkout(root: Path, key: str) -> tuple[str, dict] | None:
+    """(old name, profile) that this checkout had under another key, newest first; None if it had none."""
+    files = [f for f in (CREW_HOME / "projects").glob("*.json") if f.stem != key]
+    for f in sorted(files, key=lambda f: f.stat().st_mtime if f.exists() else 0, reverse=True):
+        try:
+            prof = load_profile(f.stem)
+        except (ValueError, OSError):
+            continue
+        if prof and prof["project"].get("root") == str(root):
+            return str(prof["project"].get("name") or f.stem), prof
+    return None
+
+
 def ensure_profile(root: Path, *, force: bool = False, quiet: bool = False) -> tuple[str, dict]:
     key, name = project_identity(root)
     _migrate_key(root, key)
     prof = None if force else load_profile(key)
+    earlier = None if prof is not None or profile_path(key).exists() else _profile_of_checkout(root, key)
+    if earlier is not None and not force:
+        # `origin` was renamed, re-pointed or removed, so this checkout has a new name. What was detected
+        # and edited for it under the old one still describes it: carry it over instead of starting again.
+        # The old profile stays (another checkout of the old remote may use it, and so do earlier plans).
+        was, prof = earlier
+        prof["project"]["name"] = name
+        with file_lock("profiles"):
+            _write_json(profile_path(key), prof)
+        log(f"note: {root} was known to crew as {was}; its profile was copied to {profile_path(key)}, and "
+            "its earlier plans are still found by `crew plans` and `crew run`. If a different project is "
+            "in that folder now, `crew init --force` detects it afresh.")
     if prof is None:
-        raw = {}
+        raw = earlier[1] if earlier is not None else {}  # --force: detect again, keep the earlier overrides
         if profile_path(key).exists():  # keep overrides even if the project section is broken
             with contextlib.suppress(ValueError, OSError):
                 raw = _read_json(profile_path(key))
@@ -1041,7 +1098,10 @@ def login_status(cfg: dict, p: str) -> tuple[bool, str]:
     if p not in _AUTH_CACHE:
         sub = ["auth", "status"] if p == "claude" else ["login", "status"]
         try:
-            r = subprocess.run([provider_cfg(cfg, p)["cmd"], *sub], capture_output=True,
+            # No terminal for a probe (here and in the others below): `claude auth status` and `claude --help`
+            # touch the terminal they are given, and from a background job (`crew ... &`) that stops the
+            # whole job, crew included, with the plan lock held and no timeout able to fire.
+            r = subprocess.run([provider_cfg(cfg, p)["cmd"], *sub], capture_output=True, stdin=subprocess.DEVNULL,
                                text=True, timeout=60, env=provider_env(p))
             _AUTH_CACHE[p] = (r.returncode == 0, short((r.stdout or r.stderr).strip(), 100))
         except (OSError, subprocess.TimeoutExpired) as e:
@@ -1070,7 +1130,8 @@ def contract_problem(cfg: dict, which: str) -> str:
         problem = ""
         for args, needles in CONTRACT[which]:
             try:
-                r = subprocess.run([cmd, *args], capture_output=True, text=True, timeout=60, env=provider_env(p))
+                r = subprocess.run([cmd, *args], capture_output=True, stdin=subprocess.DEVNULL, text=True,
+                                   timeout=60, env=provider_env(p))
                 text = r.stdout + r.stderr
             except (OSError, subprocess.TimeoutExpired) as e:
                 problem = f"`{os.path.basename(cmd)} {' '.join(args)}` failed: {e}"
@@ -1173,7 +1234,7 @@ def _descendants(pid: int) -> list[int]:
     CLI started in their own session (e.g. Claude's bwrap sandbox)."""
     try:
         out = subprocess.run(["ps", "-A", "-o", "pid=", "-o", "ppid="], capture_output=True,
-                             text=True, timeout=10).stdout
+                             stdin=subprocess.DEVNULL, text=True, timeout=10).stdout
     except (OSError, subprocess.TimeoutExpired):
         return []
     children: dict[int, list[int]] = {}
@@ -1207,18 +1268,19 @@ def _signals_held():
     finally:
         for signum, old in held.items():
             signal.signal(signum, signal.SIG_DFL if old is None else old)
-        if pending:
-            old = held[pending[0]]
+        for signum in pending:  # in order; one that was being ignored changes nothing and hides none behind it
+            old = held[signum]
             if callable(old):
-                old(pending[0], None)  # what the signal would have done: SystemExit or KeyboardInterrupt
+                old(signum, None)  # what the signal would have done: SystemExit or KeyboardInterrupt
             elif old in (None, signal.SIG_DFL):
-                os.kill(os.getpid(), pending[0])
+                os.kill(os.getpid(), signum)
 
 
 def _kill_group(proc: subprocess.Popen) -> None:
     """Stop a CLI and everything it started: SIGTERM, a grace period, then SIGKILL."""
     if os.name == "nt":
-        subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True)
+        subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True,
+                       stdin=subprocess.DEVNULL)
         with contextlib.suppress(OSError):
             proc.kill()
         return
@@ -1236,7 +1298,7 @@ def _proc_start(pid: int) -> str:
     """Start time of a process (to tell it apart from a later one with the same pid)."""
     try:
         return subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True,
-                              timeout=10).stdout.strip()
+                              stdin=subprocess.DEVNULL, timeout=10).stdout.strip()
     except (OSError, subprocess.TimeoutExpired):
         return ""
 
@@ -1323,6 +1385,11 @@ def _exec(cmd: list[str], stdin_text: str | bytes, cwd: Path, timeout: float,
                 with ACTIVE_LOCK:
                     ACTIVE.add(proc)
                 _register_child(proc.pid)
+            # A worker thread (`queue run`) can't hold signals. If crew was told to stop while this child
+            # was being started, stop_all() listed the children to kill before this one was among them:
+            # it sets STOPPING first, so a child it missed always sees it here and is killed below.
+            if STOPPING.is_set():
+                raise Interrupted()
             out, err = proc.communicate(stdin_text if isinstance(stdin_text, bytes) else
                                         stdin_text.encode("utf-8", "replace"), timeout=timeout)
             rc = proc.returncode
@@ -1365,7 +1432,7 @@ def claude_sandbox_ready() -> bool:
         elif sys.platform.startswith("linux") and shutil.which("bwrap") and shutil.which("socat"):
             with contextlib.suppress(OSError, subprocess.TimeoutExpired):
                 ok = subprocess.run(["bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "true"],
-                                    capture_output=True, timeout=20).returncode == 0
+                                    capture_output=True, stdin=subprocess.DEVNULL, timeout=20).returncode == 0
         _SANDBOX_READY.append(ok)
     return _SANDBOX_READY[0]
 
@@ -1386,8 +1453,8 @@ def codex_sandbox_problem(cfg: dict) -> str:
             with tempfile.TemporaryDirectory(prefix="crew-probe-") as d:
                 try:
                     r = subprocess.run([cmd, "sandbox", "-P", ":workspace", "-C", d, "--", "sh", "-c", "exit 7"],
-                                       capture_output=True, text=True, errors="replace", timeout=60,
-                                       env=provider_env("codex"))
+                                       capture_output=True, stdin=subprocess.DEVNULL, text=True, errors="replace",
+                                       timeout=60, env=provider_env("codex"))
                     if r.returncode != 7:
                         problem = f"codex sandbox does not work here: {short(r.stderr or r.stdout, 200) or r.returncode}"
                 except (OSError, subprocess.TimeoutExpired) as e:
@@ -1770,11 +1837,14 @@ def new_plan_path(key: str, goal: str) -> Path:
 
 
 def plans_for(key: str, root: Path | None = None) -> list[Path]:
-    """This project's plans, oldest first; with root, only those for that checkout."""
+    """This project's plans, oldest first; with root, the plans of that checkout, whichever folder they
+    are in. A checkout's plans are under the name it had when they were made: that name changes when a
+    remote is added while a plan runs (the plan stays put until it stops), and when `origin` is renamed,
+    re-pointed or removed (crew moves nothing then)."""
     out = []
     dirs = [plans_dir(key)]
-    if root is not None and _path_key(root) != key:
-        dirs.append(plans_dir(_path_key(root)))  # plans that were running when the project got its new name
+    if root is not None:
+        dirs += sorted(d for d in (CREW_HOME / "plans").glob("*") if d.is_dir() and d != plans_dir(key))
 
     def mtime(p: Path) -> float:
         with contextlib.suppress(OSError):
@@ -2034,6 +2104,17 @@ class Run:
         if not isinstance(plan.setdefault("checks", {}), dict):
             raise ValueError(f"{plan_path}: 'checks' must be an object")
         self.order = validate_plan(cfg, plan)
+        for t in plan["tasks"]:  # what crew itself records on a task is read back from disk like the rest
+            snap = t.get("untracked_before")
+            wrong = [k for k, ok in (
+                ("status", isinstance(t.get("status", "pending"), str) and ("status" in t or "committing" not in t)),
+                ("commit", t.get("commit") is None or is_sha(t["commit"])),
+                ("committing", "committing" not in t or is_sha(t["committing"])),
+                ("untracked_before", snap is None or (isinstance(snap, dict) and all(str_list(v) for v in snap.values()))),
+            ) if not ok]
+            if wrong:
+                raise ValueError(f"{plan_path}: task {t['id']}: {wrong[0]!r} is not what crew records there; "
+                                 "restore the file, or start a new plan")
         self.root = Path(plan["workdir"])
         if not self.root.is_dir():
             raise ValueError(f"workdir not found: {self.root}")
@@ -2064,7 +2145,9 @@ class Run:
                   and Path(g["worktree"]).resolve().is_relative_to(CREW_HOME.resolve() / "worktrees")
                   and g["branch"] != g.get("start")
                   and g["branch"].startswith(tuple({self.cfg["git"].get("branch_prefix") or "crew/",
-                                                    "crew/", "crew-"} - {""})))
+                                                    "crew/", "crew-"} - {""}))
+                  and (g.get("tip") is None or is_sha(g["tip"]))
+                  and (g.get("untracked_base") is None or str_list(g["untracked_base"])))
             if not ok:
                 raise ValueError(f"{plan_path}: invalid git block (needs a crew branch, base commit and worktree)")
         self.git = g
@@ -2134,9 +2217,16 @@ class Run:
         made_for = g.get("owner") if isinstance(g.get("owner"), str) else ""
         for claimed in dict.fromkeys((owner, made_for)):
             other = _plan_claiming(claimed, wt) if claimed and claimed != me else None
-            if other is not None and (wt.exists() or plan_state(other) == "paused"):
-                raise ValueError(f"crew's copy {wt} (branch {g['branch']}) belongs to another plan, {claimed}. "
-                                 f"Finish that plan with `crew run {claimed}`, or start a new plan for this goal.")
+            if other is None:
+                continue
+            # The file this git block was written for still exists and still records itself as the owner:
+            # this file is a copy of it, and stays refused whatever state the original is in. Run after
+            # the original has finished, a copy made earlier would do its tasks again on the finished branch.
+            a_copy = claimed == made_for and other["git"].get("owner") == claimed
+            if a_copy or wt.exists() or plan_state(other) == "paused":
+                raise ValueError(f"crew's copy {wt} (branch {g['branch']}) belongs to another plan, {claimed}"
+                                 f"{', which this file is a copy of' if a_copy else ''}. Continue that plan with "
+                                 f"`crew run {claimed}`, or start a new plan for this goal.")
         if made_for != me:
             g["owner"] = me
             self.save()
@@ -3066,10 +3156,15 @@ def _load_queue_data() -> dict:
 
 def load_queue() -> list[dict]:
     items = _load_queue_data().get("items", [])
+    if not isinstance(items, list):
+        log(f"warning: ignoring the items in {_queue_path()}: they are not a list")
+        return []
+    # workdir: an absolute path, as queue_add writes it. An empty or relative one would resolve against
+    # whatever directory `crew queue run` was started in, and the goal would be run there.
     ok = [i for i in items if isinstance(i, dict) and all(isinstance(i.get(k), str) for k in
                                                           ("id", "key", "workdir", "goal", "status"))
-          and (i.get("plan") is None or isinstance(i.get("plan"), str))]
-    if isinstance(items, list) and len(ok) != len(items):
+          and os.path.isabs(i["workdir"]) and (i.get("plan") is None or isinstance(i.get("plan"), str))]
+    if len(ok) != len(items):
         log(f"warning: ignoring {len(items) - len(ok)} malformed item(s) in {_queue_path()}")
     return ok
 
@@ -3185,9 +3280,16 @@ def _queue_run(explicit: Path | None, jobs: int, use_git: bool, retry_failed: bo
     pool = ThreadPoolExecutor(max_workers=max(1, jobs))
     futures = [pool.submit(worker, g) for g in by_project.values()]
     try:
-        for f in as_completed(futures):
-            with contextlib.suppress(Interrupted):  # a worker stopped because crew is stopping
-                f.result()
+        # Waited for half a second at a time, not for as long as it takes: Python acts on a signal only
+        # when its main thread next runs. A stop signal that the system hands to a worker thread (it
+        # does when that thread has just started a child and gets to the signal first) doesn't wake a
+        # main thread that is asleep here, and would go unanswered until some task ended by itself.
+        waiting = set(futures)
+        while waiting:
+            done, waiting = wait_for_futures(waiting, timeout=0.5, return_when=FIRST_COMPLETED)
+            for f in done:
+                with contextlib.suppress(Interrupted):  # a worker stopped because crew is stopping
+                    f.result()
     except BaseException:
         stop_all()
         for f in futures:
@@ -3209,6 +3311,26 @@ def _plan_or_none(path: Path) -> dict | None:
     if isinstance(plan, dict) and isinstance(plan.get("tasks"), list) and all(isinstance(t, dict) for t in plan["tasks"]):
         return plan
     return None
+
+
+def _where_plan_is(path: Path) -> Path:
+    """`path`, or where crew has since moved that plan. _migrate_key moves a project's plans out of the
+    folder named after its path when the project gets a remote, so a path crew printed earlier (or the
+    one this very command was given) can be gone. The plan it meant is the file of the same name whose
+    workdir is the checkout that folder was named after."""
+    path = Path(path)
+    try:
+        was = path.resolve().parent
+        if path.exists() or was.parent != (CREW_HOME / "plans").resolve():
+            return path
+        for d in sorted((CREW_HOME / "plans").iterdir()):
+            plan = _plan_or_none(d / path.name) if (d / path.name).is_file() else None
+            if plan and isinstance(plan.get("workdir"), str) and _path_key(Path(plan["workdir"])) == was.name:
+                log(f"note: {path} is now {d / path.name} (its project got a new name); resuming it there")
+                return d / path.name
+    except OSError:
+        pass
+    return path
 
 
 def _plan_claiming(path: str, wt: Path) -> dict | None:
@@ -3382,7 +3504,8 @@ def doctor(cfg: dict, root: Path | None) -> int:
             problems += 1
             continue
         try:
-            ver = subprocess.run([pc["cmd"], "--version"], capture_output=True, text=True, timeout=60).stdout.strip()
+            ver = subprocess.run([pc["cmd"], "--version"], capture_output=True, stdin=subprocess.DEVNULL, text=True,
+                                 timeout=60).stdout.strip()
         except (OSError, subprocess.TimeoutExpired) as e:
             ver = f"version check failed: {e}"
         ok, detail = login_status(cfg, p)
@@ -3623,11 +3746,18 @@ def main(argv: list[str] | None = None) -> int:
         CREW_HOME = CREW_HOME.resolve()
     stop_signals = [getattr(signal, s) for s in ("SIGINT", "SIGTERM", "SIGHUP") if hasattr(signal, s)]
 
+    def stopping_already(signum, frame):
+        """A stop request while crew is already stopping: nothing more to do."""
+
     def on_stop(signum, frame):
         # SIGTERM/SIGHUP become SystemExit, so running agents are stopped with crew. One request is
         # enough: a second one (closing a terminal sends two hang-ups) must not cut the stopping short.
+        # Later ones get a handler that does nothing, not SIG_IGN: a second signal that has already
+        # arrived and is waiting its turn must still find a function, or Python reports "Signal N
+        # ignored due to race condition" with a traceback.
         for s in stop_signals:
-            signal.signal(s, signal.SIG_IGN)
+            if signal.getsignal(s) != signal.SIG_IGN:
+                signal.signal(s, stopping_already)
         if signum == signal.SIGINT:
             raise KeyboardInterrupt
         sys.exit(128 + signum)
@@ -3706,7 +3836,7 @@ def main(argv: list[str] | None = None) -> int:
             return run_plan(pcfg, out, dry_run=args.dry_run, use_git=not args.no_git)
         if args.cmd == "run":
             if args.plan:
-                plan_path = args.plan
+                plan_path = _where_plan_is(args.plan)
                 data = _read_json(plan_path)
                 if not isinstance(data, dict) or not isinstance(data.get("workdir"), str):
                     raise ValueError(f"{plan_path}: not a crew plan (needs goal, workdir, tasks)")
@@ -3719,6 +3849,7 @@ def main(argv: list[str] | None = None) -> int:
                     raise ValueError(f"no plans for {root} yet: run `crew plan \"goal\"` first")
                 log(f"resuming {plan_path}")
             pcfg, _ = context_for(root, args.config)
+            plan_path = _where_plan_is(plan_path)  # context_for moves a project's plans when it got a remote
             return run_plan(pcfg, plan_path, dry_run=args.dry_run, retry_failed=args.retry_failed,
                             use_git=not args.no_git)
         if args.cmd == "queue":
@@ -3759,7 +3890,16 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
     except BrokenPipeError:  # output piped into e.g. `head`
         sys.stderr.close()
-        return 0
+        with contextlib.suppress(OSError, ValueError):
+            # What is still buffered must not fail a second time when Python flushes at exit: that
+            # would replace the exit code below with 120.
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        if args.cmd in ("plan", "go", "do", "run") or (args.cmd == "queue" and args.qcmd == "run"):
+            # The run stopped where its output was lost, as a rule with work left: never exit 0. Like the
+            # other ways of being stopped from outside, it reports the signal's number.
+            stop_all()
+            return 128 + int(getattr(signal, "SIGPIPE", 13))
+        return 0  # a listing cut short by its reader
     except (ValueError, OSError) as e:
         log(f"error: {e}")
         return 2
@@ -3767,6 +3907,15 @@ def main(argv: list[str] | None = None) -> int:
         stop_all()
         log("\ninterrupted; unfinished tasks stay pending, so re-running resumes them")
         return 130
+    except Exception as e:  # a value in one of crew's files that no check foresaw, or a bug: one line, not a traceback
+        stop_all()
+        frames = traceback.extract_tb(e.__traceback__)
+        at = ([f for f in frames if f.filename == __file__] or frames)[-1]
+        if os.environ.get("CREW_TRACEBACK"):
+            traceback.print_exc()
+        log(f"error: {type(e).__name__}: {e} (crew.py line {at.lineno}, in {at.name}). If one of crew's files "
+            "was edited by hand, check it. Otherwise this is a defect in crew: CREW_TRACEBACK=1 shows the trace.")
+        return 2
     return 2
 
 

@@ -83,7 +83,8 @@ found and fixed. Do not relax them for convenience. `ASSURANCE.md` holds the evi
 5. **Nothing is "done" without evidence.** Task status comes from the agent's structured
    verdict (`WORKER_SCHEMA`); a CLI exit 0 is not success. Plan state is `done` only if every
    task is done, no check regressed on the verified tip (`checks.final_tip`), and setup
-   succeeded. `run_plan` exits 0 only for `done`.
+   succeeded. `run_plan` exits 0 only for `done`. A run that loses the reader of its output
+   (`BrokenPipeError`) stops its agents and exits 128 + SIGPIPE; only a listing exits 0 then.
 6. **One writer at a time.** `file_lock()` (fcntl + thread lock) guards each plan run, `queue
    run`, the queue, state, ledger, profiles and pid files. Writes go through `_write_json`
    (tmp + fsync + rename). `reap_orphans()` kills CLIs a dead crew left behind, matched by pid
@@ -93,7 +94,12 @@ found and fixed. Do not relax them for convenience. `ASSURANCE.md` holds the evi
    a copied plan file is refused after the pointer is gone. Plans outside `~/.crew/plans` get a
    path hash in their branch name (`_branch_name`). A plan's lock and pid file are named after
    its path (`plan_lock_name`), so `_migrate_key` moves a plan file only while holding that
-   lock, after reaping its pid file, and `plans_for` looks in the old folder too.
+   lock, after reaping its pid file. A project's name comes from its `origin`, which the user
+   can change at any time, so a checkout's plans are found by their `workdir` in every plans
+   folder (`plans_for(key, root)`), its profile is carried to the new name
+   (`_profile_of_checkout`), and `main()` follows a plan that was moved (`_where_plan_is`). A
+   plan whose `git.owner` names another file that still exists and still records itself as
+   owner is a copy of that file, and is refused whatever state the original is in.
 7. **Nothing read from disk or a CLI is trusted.** Validate types (`num()`, `load_config`,
    `load_profile`, `validate_plan`, the plan `git` block), reject control characters in task
    fields, decode subprocess output with `errors="surrogateescape"` (git) or `"replace"`, treat
@@ -101,7 +107,13 @@ found and fixed. Do not relax them for convenience. `ASSURANCE.md` holds the evi
    only from the provider's own error message (`LIMIT_RE`), never from raw stdout. `_read_json`
    is the only reader of crew's files and bounds their nesting (`MAX_JSON_DEPTH`), because
    `deepcopy` and `json.dumps` overflow on depth that `json.loads` accepts. Pointer and pid
-   files are read with `errors="replace"` and checked before use.
+   files are read with `errors="replace"` and checked before use. Valid JSON is not valid
+   input: `num()` takes finite numbers only (`1e999`, `NaN` and an integer too large for a
+   float all parse), timeouts are capped (`MAX_TIMEOUT_SEC`), what crew itself records in a
+   plan (`commit`, `committing`, `untracked_before`, `git.tip`, `git.untracked_base`) is
+   type-checked when the plan is loaded, and a queue item needs an absolute `workdir`.
+   `main()` ends with a last resort that turns any other exception into one line and exit 2.
+   It is never the fix for a known bad value: the test harness fails any test that reaches it.
 8. **Codex `error` events are not failures.** Success is `turn.completed` and no `turn.failed`
    with exit 0; "Reconnecting..." notices are diagnostics.
 9. **Every subprocess has a timeout, runs in its own session, and is killed as a tree.**
@@ -110,6 +122,15 @@ found and fixed. Do not relax them for convenience. `ASSURANCE.md` holds the evi
    a stop signal can't land between a child's start and its record or cut a kill short; the
    first stop signal makes crew ignore later ones. `_exec` drops a child's record only once the
    child has exited. A signal that was ignored when crew started (nohup) stays ignored.
+   Later stop signals get a handler that does nothing, not `SIG_IGN`: Python raises when a
+   signal already waiting finds `SIG_IGN`. `_signals_held()` replays every signal it held, in
+   order, so one that was being ignored hides none behind it. Worker threads (`queue run`)
+   can't hold signals, so `_exec` checks `STOPPING` again once its child is on record, and the
+   main thread waits for workers half a second at a time: Python acts on a signal only when
+   the main thread next runs, whichever thread the system handed it to. No child is given the
+   terminal: every `subprocess.run` and `Popen` in `crew.py` passes `stdin=` or `input=` (a
+   test reads the source). A background job that touches the terminal is stopped by job
+   control, and crew with it, holding the plan lock.
 10. **Credentials stay with their provider.** `provider_env()` strips the other provider's keys;
     sandboxed checks get no `SECRET_ENV` variables at all; keys are never logged or put on a
     command line (`codex-login` pipes via stdin).
@@ -122,7 +143,7 @@ found and fixed. Do not relax them for convenience. `ASSURANCE.md` holds the evi
 - Python 3.9+, standard library only. No new dependencies.
 - `crew.json` must equal `crew.DEFAULTS` (a test enforces it). Change both.
 - Every fixed defect gets a test in `test_crew.py` that reproduces it with the fake CLIs.
-  Run `python3 -m unittest test_crew` before committing (about two minutes; it needs git and
+  Run `python3 -m unittest test_crew` before committing (about four minutes; it needs git and
   spawns real subprocesses, no model calls).
 - CLI flags crew relies on are listed in `CONTRACT`; add any new flag there so `doctor` and
   `available_providers` catch a CLI that drops it.
@@ -162,6 +183,12 @@ Claude Code, Codex and Antigravity have in common.
   per-process only, and `codex sandbox` is unavailable, so checks are skipped.
 - Both CLI sandboxes allow writes under the temp directory. Repos kept under `/tmp` lose
   isolation; crew warns. (crew's own home there is refused, see law 2.)
+- A plan's lock is named after its file's path. Renaming a running plan's file, or deleting
+  its `<clone>.plan` pointer by hand, while it runs lets a second run into the same clone and
+  lets `crew clean --all` remove it. The README tells the user not to; nothing enforces it.
+- The stop-signal tests for `queue run` slow a process start or aim a signal at a thread with
+  Linux's `tgkill`; the real window is about a millisecond and was hit with unmodified timing
+  only by a reviewer's aimed script.
 - Two plan files written before 3.3 (no `git.owner`) that already name the same branch are
   refused only while one of them has a live clone; after that they share the branch.
 - SIGKILL cannot be held off. One that lands in the few milliseconds between a tracked git
