@@ -2,7 +2,7 @@
 
 crew (`crew.py`) drives the `claude` and `codex` CLIs across the owner's projects. It is one
 stdlib-only Python file plus `crew.json` (a copy of `DEFAULTS`), `README.md` and `test_crew.py`.
-These rules come from seven rounds of adversarial review; each one records a defect that was
+These rules come from eight rounds of adversarial review; each one records a defect that was
 found and fixed. Do not relax them for convenience. `ASSURANCE.md` holds the evidence.
 
 ## Laws: invariants every change must keep
@@ -24,6 +24,12 @@ found and fixed. Do not relax them for convenience. `ASSURANCE.md` holds the evi
    put on commits its submodule checkouts weren't made for (the user's own commits, or the
    branch a rebuilt clone starts from), `_sync_submodules()` moves them, without `--init`;
    otherwise the next task's `git add -u` commits a pointer change that undoes the user's.
+   A submodule that can't be put on the commit the base records when the clone is made (not
+   pushed yet) is deinitialised, never left on its remote's HEAD. One the user's commits drop
+   stays in the clone and goes into the snapshots (`_note_dropped_submodules`); deleting it
+   would be an unjournaled removal. crew's git must not change with the user's git settings
+   where crew depends on the result: the clone names its remote (`-o origin`) and the adoption
+   merge pins `merge.autoStash=false`, as commits pin `commit.gpgsign`.
 2. **Agent-modified code never runs outside a sandbox.** Setup (network, unsandboxed) runs only
    on the base commit in a fresh clone, before any agent has run there; in place (`--no-git`)
    only before the first task ever runs. Checks run inside `codex sandbox -P :workspace`, or
@@ -40,7 +46,8 @@ found and fixed. Do not relax them for convenience. `ASSURANCE.md` holds the evi
    `providers.<p>.args` only adds flags. `_claude_worker_args()` and `run_codex()` put back the
    permission mode, sandbox settings and write denials that a custom `args` leaves out, keep a
    value the config sets itself, and give Claude Bash only when the resulting settings have the
-   sandbox on and its escape hatch off.
+   sandbox on and its escape hatch off. Claude reads only the last `--settings` on its command
+   line; crew passes on only that one, with its rules in it.
    The planner is read-only: Claude `--permission-mode plan --tools Read,Grep,Glob`, Codex
    `--sandbox read-only`. Every Claude call uses `--setting-sources user` so repo settings
    (hooks, `defaultMode`, allow rules) are ignored.
@@ -52,11 +59,18 @@ found and fixed. Do not relax them for convenience. `ASSURANCE.md` holds the evi
    `safe.directory` and hosted git settings.
 3. **Journal before you act.** Any step that changes a repo or a clone is written to the plan
    file first: `git.creating`, `task.untracked_before`, `task.status = running`,
-   `task.committing`, `git.adopting`, `git.sync_submodules`, `git.removing`. `_reconcile()`
+   `task.committing`, `git.adopting`, `git.adopting_clear`, `git.sync_submodules`,
+   `git.sync_started`, `git.removing`. `_reconcile()`
    finishes or undoes what a crash cut off. A fact the resume depends on is saved in the same
    write as the step that creates it: when the clone has vanished, the tasks that lost
    uncommitted work are reset in the save that sets `git.creating`, and `_adopted()` moves
    `git.tip` and every `task.committing` marker together.
+   A step git can leave half done needs a way back that can't touch a task's work. Before the
+   adoption merge crew runs git's own test for it (`read-tree -n`) and journals that it passed
+   (`git.adopting_clear`); only then may `_undo_half_merge()` put back a merge that stopped
+   part-way, and only at the paths that merge writes. `_sync_submodules(journal=True)` records
+   the clean checkouts it is about to move (`git.sync_started`), so a move that was cut short is
+   forced through, and a checkout an agent edited never is.
    Long git commands (clone, checkout, fetch) run with `git(..., track=True)`, so they are in
    the pid file and `reap_orphans()` stops them before a resume touches the clone.
    A task counts as done only if its `crew(<id>):` commit is on the branch. Never add a
@@ -114,6 +128,8 @@ found and fixed. Do not relax them for convenience. `ASSURANCE.md` holds the evi
   `available_providers` catch a CLI that drops it.
 - Prompts give agents paths relative to the repo; absolute paths into the user's checkout are
   remapped to the clone (`worker_prompt`). Never tell an agent the user's checkout path.
+- A message that tells the user to run crew names the plan file (`crew run <file>`). A bare
+  `crew run` resumes the checkout's latest plan, which may be a different one.
 - Keep the README's "What crew guarantees" section true. If a change weakens a guarantee,
   change the README in the same commit.
 - Real-CLI smoke test after engine changes: a throwaway repo with a dirty checkout, config
@@ -151,9 +167,11 @@ Claude Code, Codex and Antigravity have in common.
 - SIGKILL cannot be held off. One that lands in the few milliseconds between a tracked git
   command starting and its pid being recorded leaves that git running unrecorded; the next run
   fails once ("another process may still be writing there") and succeeds when repeated.
-- Submodules have two tests: an update the user commits on a crew branch, and an agent swapping
-  a submodule's `.git`. Nested submodules and a submodule the user adds mid-plan are handled in
-  `_gitlinks()` but untested, and no real sandboxed worker was used to make the swap.
+- Submodules are tested for: an update, a removal and an unpushed commit of the user's, a move
+  of a checkout that was cut short, and an agent swapping a submodule's `.git`. Nested
+  submodules are untested: one whose checkout is cut after its parent's finished, one that
+  fails to initialise inside one that did, one the user adds mid-plan. No real sandboxed worker
+  was used to make the swap.
 - The `crew` skill was written from each tool's documentation. No tool has been watched loading
   it or handing work to crew through it.
 - The `tokens` metric is approximate: the two CLIs count differently.

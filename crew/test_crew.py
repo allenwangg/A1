@@ -1500,6 +1500,48 @@ class TestContainment(CrewTest):
             self.assertIs(settings["sandbox"]["enabled"], False)  # your explicit choice is kept
             self.assertNotIn("--allowedTools", c["argv"])  # but then no unprompted shell
 
+    def test_a_second_settings_flag_cannot_drop_the_sandbox(self):
+        """Claude reads only the last --settings on its command line. crew 3.4 put its sandbox rules into the
+        first one and decided the shell grant by the first one, so a second --settings ran every worker's
+        shell with no sandbox."""
+        root = self.repo()
+
+        def read_by_claude(argv):  # the settings the CLI uses: the value of the last --settings
+            return json.loads(argv[len(argv) - 1 - argv[::-1].index("--settings") + 1])
+
+        # 1. Two --settings, neither says a word about the sandbox: it must not be lost.
+        self.write_cfg({"providers": {"codex": {"enabled": False},
+                                      "claude": {"args": ["--settings", '{"env": {"A": "1"}}',
+                                                          '--settings={"env": {"B": "2"}}']}}})
+        r = self.crew("do", "x", "--workdir", str(root))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        first = self.workers()
+        self.assertTrue(first)
+        for c in first:
+            a = c["argv"]
+            settings = read_by_claude(a)
+            self.assertEqual(settings["env"], {"B": "2"})  # the one claude would have read anyway
+            sandbox = settings.get("sandbox") or {}
+            self.assertIs(sandbox.get("enabled"), True, a)
+            self.assertIs(sandbox.get("allowUnsandboxedCommands"), False)
+            deny = sandbox["filesystem"]["denyWrite"]
+            self.assertIn(str(root), deny)  # your checkout
+            self.assertTrue(any(d.endswith("/.git") for d in deny))  # the copy's git directory
+            self.assertEqual(a[a.index("--allowedTools") + 1], "Bash")
+            self.assertEqual(a.count("--settings"), 1)  # one reaches claude: the one crew checked
+
+        # 2. The last one turns the sandbox off: that choice is kept, and then there is no unprompted shell.
+        self.write_cfg({"providers": {"codex": {"enabled": False}, "claude": {"args": [
+            "--settings", '{"sandbox": {"enabled": true, "allowUnsandboxedCommands": false}}',
+            "--settings", '{"sandbox": {"enabled": false, "allowUnsandboxedCommands": true}}']}}})
+        r = self.crew("do", "y", "--workdir", str(root))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        second = self.workers()[len(first):]
+        self.assertTrue(second)
+        for c in second:
+            self.assertIs(read_by_claude(c["argv"])["sandbox"]["enabled"], False)
+            self.assertNotIn("--allowedTools", c["argv"])
+
     def test_a_submodule_git_file_replaced_by_an_agent_stops_crew(self):
         super_, s1, s2 = TestThreeThree.submodule_repo(self)
         fileenv = {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "protocol.file.allow",
@@ -1651,6 +1693,238 @@ class TestInstall(CrewTest):
         self.assertEqual(len([c for c in self.calls() if "argv" in c]), 1)  # the inner crew called no model
         key, _ = crew.project_identity(root)
         self.assertEqual(len(list((self.home / "plans" / key).glob("*.json"))), 1)  # and wrote no plan
+
+
+FAKE_GIT = r'''
+import os, signal, subprocess, sys
+real, a = os.environ["FAKE_GIT_REAL"], sys.argv[1:]
+cut = os.environ.get("FAKE_GIT_CUT", "")
+def out(repo, *args):
+    return subprocess.run([real, "-C", repo, *args], capture_output=True).stdout
+def half_way(repo, target, write=True, die="killed"):
+    """What a git that stops while it checks `target` out leaves behind: some of target's files written
+    and HEAD where it was. Killed, it also leaves its index lock, and crew is killed at the same moment;
+    giving up by itself (a full disk), it exits with an error."""
+    names = [n for n in out(repo, "diff", "--name-only", "-z", "HEAD", target).split(b"\0") if n]
+    for n in names[:max(1, len(names) // 2)] if write else []:
+        path = os.path.join(os.fsencode(repo), n)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(out(repo, "show", target + ":" + os.fsdecode(n)))
+    if die == "killed":
+        if write:
+            gitdir = os.fsdecode(out(repo, "rev-parse", "--absolute-git-dir").strip())
+            open(os.path.join(gitdir, "index.lock"), "w").close()
+        os.kill(os.getppid(), signal.SIGKILL)
+    sys.stderr.write("error: unable to write file: No space left on device\n")
+    sys.exit(128)
+if "-C" in a:
+    wt = a[a.index("-C") + 1]
+    if cut.startswith("merge") and "merge" in a and "--ff-only" in a:
+        # "merge": killed half-way; "merge-early": killed before it wrote anything; "merge-gives-up": fails half-way
+        half_way(wt, a[-1], write=cut != "merge-early", die="alone" if cut == "merge-gives-up" else "killed")
+    if cut == "submodule" and "submodule" in a and "update" in a and "--checkout" in a:
+        half_way(os.path.join(wt, "lib"), os.fsdecode(out(wt, "rev-parse", "HEAD:lib").strip()))
+os.execv(real, [real] + a)
+'''
+
+
+class TestYourCommitsAndGit(CrewTest):
+    """The 3.4 review's confirmed findings about bringing your commits into crew's copy. Each test fails
+    on 3.5, except the one that says it guards the fix."""
+
+    plan_of = TestThreeThree.plan_of
+    workers = TestThreeThree.workers
+    files_on = TestThreeThree.files_on
+    key_of = TestThreeThree.key_of
+    plans_dir_of = TestThreeThree.plans_dir_of
+    submodule_repo = TestThreeThree.submodule_repo
+    _publish_then_pause_after_t1 = TestThreeThree._publish_then_pause_after_t1
+    _latest_or_none = TestThreeThree._latest_or_none
+    FILEENV = {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "protocol.file.allow", "GIT_CONFIG_VALUE_0": "always"}
+
+    def git_cut(self, what: str) -> dict:
+        """Environment in which `git` is a stand-in that is killed half-way through one command (and takes
+        crew with it), and is the real git for everything else."""
+        d = self.tmp / "gitbin"
+        if not d.exists():
+            d.mkdir()
+            (d / "git").write_text(f"#!{sys.executable}\n{FAKE_GIT}")
+            (d / "git").chmod(0o755)
+        return {"PATH": f"{d}{os.pathsep}{os.environ['PATH']}", "FAKE_GIT_REAL": shutil.which("git"),
+                "FAKE_GIT_CUT": what}
+
+    def you_commit(self, root, branch, files, msg="mine"):
+        sh(root, "git", "checkout", "-q", branch)
+        for name, text in files.items():
+            (root / name).write_text(text)
+        sh(root, "git", "add", "-A")
+        sh(root, "git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", msg)
+        sha = sh(root, "git", "rev-parse", "HEAD").strip()
+        sh(root, "git", "checkout", "-q", "main")
+        return sha
+
+    def cut_adoption(self, root):
+        """t1 is delivered and t2 was interrupted. You commit on the crew branch, and crew is killed while git
+        is half-way through bringing that commit into the copy."""
+        self._publish_then_pause_after_t1(root)
+        g = self.plan_of(root)["git"]
+        branch, wt, tip = g["branch"], Path(g["worktree"]), g["tip"]
+        mine = self.you_commit(root, branch, {"README.md": "yours\n", "a.txt": "yours\n", "b.txt": "yours\n",
+                                              "note.txt": "yours\n"})
+        r = self.crew("run", "--workdir", str(root), env=self.git_cut("merge"), check=False)
+        self.assertEqual(r.returncode, -9, r.stdout + r.stderr)  # killed inside the merge
+        self.assertEqual(sh(wt, "git", "rev-parse", "HEAD").strip(), tip)  # which had not moved HEAD yet
+        self.assertEqual(sh(wt, "git", "status", "--porcelain"), " M README.md\n?? a.txt\n")  # but had written these
+        return branch, wt, tip, mine
+
+    def test_an_adoption_that_was_cut_short_is_taken_back_and_done_again(self):
+        root = self.repo()
+        branch, wt, tip, mine = self.cut_adoption(root)
+        r = self.crew("run", "--workdir", str(root), check=False)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)  # 3.5: exit 2 on every run, "would be overwritten"
+        self.assertIn("continuing from your own commits", r.stdout)
+        self.assertEqual([t["status"] for t in self.plan_of(root)["tasks"]], ["done", "done"])
+        self.assertEqual(sh(root, "git", "rev-parse", f"{branch}~1").strip(), mine)  # t2 sits on your commit
+        self.assertEqual(sh(root, "git", "diff", "--name-only", f"{mine}..{branch}").split(), ["t2.txt"])
+
+    def test_an_adoption_git_gives_up_on_part_way_is_not_a_dead_end(self):
+        root = self.repo()
+        self._publish_then_pause_after_t1(root)
+        branch = self.plan_of(root)["git"]["branch"]
+        mine = self.you_commit(root, branch, {"README.md": "yours\n", "a.txt": "yours\n", "note.txt": "yours\n"})
+        r = self.crew("run", "--workdir", str(root), env=self.git_cut("merge-gives-up"), check=False)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)  # git's own failure is reported, crew is not killed
+        self.assertIn("No space left on device", r.stdout)
+        r = self.crew("run", "--workdir", str(root), check=False)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)  # 3.5: exit 2 on every later run
+        self.assertEqual(sh(root, "git", "diff", "--name-only", f"{mine}..{branch}").split(), ["t2.txt"])
+
+    def test_a_cut_short_adoption_of_a_commit_you_took_back_is_not_committed_as_a_task(self):
+        root = self.repo()
+        branch, wt, tip, mine = self.cut_adoption(root)
+        sh(root, "git", "branch", "-f", branch, tip)  # you take your commit back before running crew again
+        r = self.crew("run", "--workdir", str(root))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        # 3.5 commits what the merge had written as t2's work: ["README.md", "t2.txt"], and a.txt as well when
+        # t2 had started before it was interrupted
+        self.assertEqual(sh(root, "git", "diff", "--name-only", f"{tip}..{branch}").split(), ["t2.txt"])
+        self.assertEqual(sh(root, "git", "show", f"{branch}:README.md"), "hi\n")
+
+    def test_guard_a_task_file_in_the_way_is_never_taken_back(self):
+        """Passes on 3.5 too: it guards the undo above. A task's own uncommitted edit collides with your
+        commit, and crew is killed after journaling the adoption but before git wrote anything."""
+        root = self.repo()
+        self._publish_then_pause_after_t1(root)
+        g = self.plan_of(root)["git"]
+        branch, wt = g["branch"], Path(g["worktree"])
+        (wt / "README.md").write_text("hi\nhalf an edit by the interrupted task\n")
+        (wt / "a.txt").write_text("the task's own a.txt\n")
+        mine = self.you_commit(root, branch, {"README.md": "yours\n", "a.txt": "yours\n"})
+        r = self.crew("run", "--workdir", str(root), env=self.git_cut("merge-early"), check=False)
+        self.assertEqual(r.returncode, -9, r.stdout + r.stderr)
+        self.assertEqual(self.plan_of(root)["git"].get("adopting"), mine)  # journaled, nothing merged
+        n = len(self.workers())
+        r = self.crew("run", "--workdir", str(root), check=False)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)  # a real collision: git's reason and the ways out
+        self.assertIn("would be overwritten by merge", r.stdout)
+        self.assertNotIn("put back what it had written", r.stdout)
+        self.assertEqual((wt / "README.md").read_text(), "hi\nhalf an edit by the interrupted task\n")
+        self.assertEqual((wt / "a.txt").read_text(), "the task's own a.txt\n")
+        self.assertEqual(len(self.workers()), n)
+
+    def test_a_submodule_move_that_was_cut_short_is_finished_by_the_next_run(self):
+        super_, s1, s2 = self.submodule_repo()
+        self._publish_then_pause_after_t1(super_, extra_env=self.FILEENV)
+        branch = self.plan_of(super_)["git"]["branch"]
+        sh(super_, "git", "checkout", "-q", branch)
+        sh(super_, "git", "-C", "lib", "checkout", "-q", s2)
+        sh(super_, "git", "add", "lib")
+        sh(super_, "git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "bump lib to s2")
+        mine = sh(super_, "git", "rev-parse", "HEAD").strip()
+        sh(super_, "git", "checkout", "-q", "main")
+        r = self.crew("run", "--workdir", str(super_), env={**self.FILEENV, **self.git_cut("submodule")}, check=False)
+        self.assertEqual(r.returncode, -9, r.stdout + r.stderr)  # killed while git moved lib's checkout to s2
+        wt = Path(self.plan_of(super_)["git"]["worktree"])
+        self.assertEqual(sh(wt / "lib", "git", "rev-parse", "HEAD").strip(), s1)
+        self.assertEqual((wt / "lib" / "f.txt").read_text(), "two\n")  # s2's file, half-way
+        r = self.crew("run", "--workdir", str(super_), env=self.FILEENV, check=False)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)  # 3.5: exit 2 on every run, "could not move the submodule"
+        self.assertEqual(sh(super_, "git", "diff", "--name-only", f"{mine}..{branch}").split(), ["t2.txt"])
+        self.assertEqual(sh(super_, "git", "ls-tree", branch, "lib").split()[2], s2)
+
+    def test_a_submodule_commit_you_have_not_pushed_is_not_replaced_by_its_remotes(self):
+        super_, s1, s2 = self.submodule_repo()
+        # You commit inside your lib checkout and record that in the superproject; lib's remote doesn't have it.
+        (super_ / "lib" / "f.txt").write_text("mine, not pushed\n")
+        sh(super_ / "lib", "git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-am", "local work")
+        mine = sh(super_ / "lib", "git", "rev-parse", "HEAD").strip()
+        sh(super_, "git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-am", "use my lib commit")
+        r = self.crew("go", "x", "--workdir", str(super_), env=self.FILEENV)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)  # 3.5: t1 ends "partial", exit 1
+        self.assertIn("stays empty in crew's copy", r.stdout)
+        branch = self.plan_of(super_)["git"]["branch"]
+        self.assertEqual(sh(super_, "git", "ls-tree", branch, "lib").split()[2], mine)  # 3.5: the remote's commit
+        self.assertEqual(sorted(sh(super_, "git", "diff", "--name-only", f"main..{branch}").split()),
+                         ["t1.txt", "t2.txt"])  # 3.5: crew(t1) also changes `lib`
+
+    def test_merge_autostash_does_not_turn_a_collision_into_conflict_markers(self):
+        root = self.repo()
+        self._publish_then_pause_after_t1(root)
+        g = self.plan_of(root)["git"]
+        branch, wt = g["branch"], Path(g["worktree"])
+        (wt / "README.md").write_text("hi\nhalf an edit by the interrupted task\n")
+        self.you_commit(root, branch, {"README.md": "yours\n"})
+        env = {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "merge.autoStash", "GIT_CONFIG_VALUE_0": "true"}
+        n = len(self.workers())
+        r = self.crew("run", "--workdir", str(root), env=env, check=False)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("would be overwritten by merge", r.stdout)  # 3.5: "the agent left an unfinished unmerged files"
+        self.assertEqual(len(self.workers()), n)  # 3.5 runs t2 on a file full of conflict markers
+        self.assertEqual((wt / "README.md").read_text(), "hi\nhalf an edit by the interrupted task\n")
+        self.assertEqual(sh(wt, "git", "stash", "list"), "")
+        self.assertNotEqual(self.plan_of(root)["tasks"][1]["status"], "failed")
+
+    def test_a_submodule_your_commit_removes_is_not_held_against_the_waiting_task(self):
+        super_, s1, s2 = self.submodule_repo()
+        self._publish_then_pause_after_t1(super_, extra_env=self.FILEENV)
+        plan = self.plan_of(super_)
+        branch, wt = plan["git"]["branch"], Path(plan["git"]["worktree"])
+        sh(super_, "git", "checkout", "-q", branch)
+        sh(super_, "git", "rm", "-q", "lib")
+        sh(super_, "git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "drop lib")
+        mine = sh(super_, "git", "rev-parse", "HEAD").strip()
+        sh(super_, "git", "checkout", "-q", "main")
+        r = self.crew("run", "--workdir", str(super_), env=self.FILEENV, check=False)
+        # 3.5: t2 is marked partial for "nested git repository lib/" and the copy is kept, exit 1
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual([t["status"] for t in self.plan_of(super_)["tasks"]], ["done", "done"])
+        self.assertEqual(sh(super_, "git", "diff", "--name-only", f"{mine}..{branch}").split(), ["t2.txt"])
+        self.assertFalse(wt.exists())
+
+    def test_clone_default_remote_name_does_not_stop_crew_reading_your_branch(self):
+        root = self.repo()
+        env = {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "clone.defaultRemoteName", "GIT_CONFIG_VALUE_0": "upstream"}
+        self._publish_then_pause_after_t1(root, extra_env=env)
+        branch = self.plan_of(root)["git"]["branch"]
+        self.you_commit(root, branch, {"note.txt": "yours\n"})
+        r = self.crew("run", "--workdir", str(root), env=env, check=False)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)  # 3.5: exit 2, "'origin' does not appear to be a git repository"
+        self.assertIn("continuing from your own commits", r.stdout)
+        self.assertIn("note.txt", self.files_on(root, branch))
+        self.assertIn("t2.txt", self.files_on(root, branch))
+
+    def test_messages_about_an_older_plan_name_its_file(self):
+        root = self.repo()
+        self._publish_then_pause_after_t1(root)  # plan A: paused, its copy kept
+        plan_a = sorted(self.plans_dir_of(self.key_of(root)).glob("*.json"))[-1]
+        wt = Path(json.loads(plan_a.read_text())["git"]["worktree"])
+        self.crew("do", "another goal", "--workdir", str(root))  # a newer plan: bare `crew run` now means this one
+        self.assertIn(f"`crew run {plan_a}` continues it", self.crew("clean").stdout)  # 3.5: "`crew run` continues it"
+        sh(wt, "git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "stray")
+        r = self.crew("run", str(plan_a), check=False)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn(f"`crew run {plan_a}` start over", r.stdout)  # 3.5: "`crew run` start over"
 
 
 if __name__ == "__main__":

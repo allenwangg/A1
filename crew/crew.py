@@ -46,7 +46,7 @@ except ImportError:  # Windows: thread locks only
 if sys.version_info < (3, 9):
     sys.exit("crew needs Python 3.9 or newer")
 
-VERSION = "3.5"
+VERSION = "3.6"
 HERE = Path(__file__).resolve().parent
 CREW_HOME = Path(os.path.expanduser(os.environ.get("CREW_HOME") or "~/.crew"))
 PROVIDERS = ("claude", "codex")
@@ -421,17 +421,20 @@ def model_for(cfg: dict, p: str, agent: str | None) -> str | None:
 
 # --------------------------------------------------------------------------- git
 
-def git(root: Path, *args: str, timeout: float = 120, track: bool = False) -> subprocess.CompletedProcess:
+def git(root: Path, *args: str, timeout: float = 120, track: bool = False,
+        stdin: str | None = None) -> subprocess.CompletedProcess:
     # crew's own git calls never run repo hooks or an fsmonitor program.
     argv = ["git", "-C", str(root), "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", *args]
     if track:
         # Long-running git (clone, checkout, fetch) is started like the CLIs: in its own session and
         # recorded in the run's pid file, so a crew killed part-way leaves no git racing the next run.
-        rc, out, err, _ = _exec(argv, "", Path(root), timeout, dict(os.environ))
+        rc, out, err, _ = _exec(argv, (stdin or "").encode("utf-8", "surrogateescape"), Path(root), timeout,
+                                dict(os.environ))
         return subprocess.CompletedProcess(argv, rc, out, err)
     try:
         # surrogateescape: non-UTF-8 file names survive the round trip back into `git add`
-        return subprocess.run(argv, capture_output=True, text=True, errors="surrogateescape", timeout=timeout)
+        return subprocess.run(argv, capture_output=True, text=True, errors="surrogateescape", timeout=timeout,
+                              input=stdin)
     except (OSError, subprocess.TimeoutExpired) as e:
         return subprocess.CompletedProcess(args, 1, "", str(e))
 
@@ -1299,7 +1302,8 @@ def stop_all() -> None:
         t.join()
 
 
-def _exec(cmd: list[str], stdin_text: str, cwd: Path, timeout: float, env: dict) -> tuple[int, str, str, float]:
+def _exec(cmd: list[str], stdin_text: str | bytes, cwd: Path, timeout: float,
+          env: dict) -> tuple[int, str, str, float]:
     t0 = time.time()
     if STOPPING.is_set():
         raise Interrupted()
@@ -1319,7 +1323,8 @@ def _exec(cmd: list[str], stdin_text: str, cwd: Path, timeout: float, env: dict)
                 with ACTIVE_LOCK:
                     ACTIVE.add(proc)
                 _register_child(proc.pid)
-            out, err = proc.communicate(stdin_text.encode("utf-8", "replace"), timeout=timeout)
+            out, err = proc.communicate(stdin_text if isinstance(stdin_text, bytes) else
+                                        stdin_text.encode("utf-8", "replace"), timeout=timeout)
             rc = proc.returncode
         except subprocess.TimeoutExpired:
             _kill_group(proc)
@@ -1451,13 +1456,27 @@ def _claude_worker_args(args: list[str], deny: list[str]) -> tuple[list[str], bo
     keeps a worker contained. `args` exists to add flags, so a config that sets it must not lose
     the permission mode, the sandbox or the write denials by leaving them out; a key the config
     does set is kept. Returns (flags, is the sandbox on with its escape hatch off?)."""
-    out: list[str] = []
+    flat: list[str] = []
     for a in args:  # --settings=x becomes --settings x
-        out += ["--settings", a.split("=", 1)[1]] if a.startswith("--settings=") else [a]
-    if "--permission-mode" not in out and "--dangerously-skip-permissions" not in out:
-        out = ["--permission-mode", "acceptEdits", *out]
+        flat += ["--settings", a.split("=", 1)[1]] if a.startswith("--settings=") else [a]
+    if "--permission-mode" not in flat and "--dangerously-skip-permissions" not in flat:
+        flat = ["--permission-mode", "acceptEdits", *flat]
+    # Claude reads one --settings, the last on its command line, and ignores any before it whole.
+    # Only that one is passed on: the settings crew adds its rules to, and decides the Bash grant
+    # by, are then the only settings the worker is started with.
+    out: list[str] = []
+    at, i = -1, 0
+    while i < len(flat):
+        if flat[i] == "--settings" and i + 1 < len(flat):  # the next token is its value, as the CLI pairs them
+            if at >= 0:
+                del out[at:at + 2]
+            at = len(out)
+            out += flat[i:i + 2]
+            i += 2
+        else:
+            out.append(flat[i])
+            i += 1
     data: dict = {}
-    at = next((i for i in range(len(out) - 1) if out[i] == "--settings"), -1)
     if at >= 0:
         raw = out[at + 1]
         try:
@@ -2117,7 +2136,7 @@ class Run:
             other = _plan_claiming(claimed, wt) if claimed and claimed != me else None
             if other is not None and (wt.exists() or plan_state(other) == "paused"):
                 raise ValueError(f"crew's copy {wt} (branch {g['branch']}) belongs to another plan, {claimed}. "
-                                 "Finish that plan with `crew run`, or start a new plan for this goal.")
+                                 f"Finish that plan with `crew run {claimed}`, or start a new plan for this goal.")
         if made_for != me:
             g["owner"] = me
             self.save()
@@ -2146,7 +2165,7 @@ class Run:
         if expected and self._git_fingerprint() != expected:
             raise ValueError(f"the git configuration of crew's clone {self.workdir} changed since crew set it up "
                              "(.git/config, info/attributes or info/exclude). crew stopped without running git "
-                             "there. Inspect it; `crew clean --all` and `crew run` start the clone over.")
+                             f"there. Inspect it; `crew clean --all` and `crew run {self.path}` start the clone over.")
         for lock in (self.workdir / ".git" / "index.lock", self.workdir / ".git" / "config.lock"):
             if lock.exists():
                 with contextlib.suppress(OSError):
@@ -2213,8 +2232,8 @@ class Run:
             if "checked out" in why:
                 hint = f"Switch that checkout to another branch, then `crew run {self.path}` copies the commits over."
             elif "non-fast-forward" in why or "rejected" in why:
-                hint = ("Your branch has commits that crew's copy lacks. The next `crew run` builds on them if it "
-                        "can, or tells you the two have diverged.")
+                hint = (f"Your branch has commits that crew's copy lacks. `crew run {self.path}` builds on them "
+                        "if it can, or tells you the two have diverged.")
             else:
                 hint = f"`crew run {self.path}` tries again."
             log(f"  warning: couldn't update {g['branch']} in {self.root}: {short(why, 200)}\n"
@@ -2290,7 +2309,9 @@ class Run:
             wt.parent.mkdir(parents=True, exist_ok=True)
             log(f"git: making crew's own copy of the repo for {g['branch']} at {wt} "
                 f"(from {g['base'][:10]}); your checkout is untouched")
-            r = git(root, "clone", "-q", "--no-checkout", str(root), str(wt), timeout=1800, track=True)
+            # -o: the rest of this method reads your branch through a remote called origin, whatever
+            # clone.defaultRemoteName in your git config says.
+            r = git(root, "clone", "-q", "--no-checkout", "-o", "origin", str(root), str(wt), timeout=1800, track=True)
             if r.returncode != 0:
                 raise ValueError(f"could not clone {root} into {wt}: {short(r.stderr, 300)}")
             r = git(wt, "checkout", "-q", "--detach", g["base"], timeout=1800, track=True)
@@ -2300,6 +2321,18 @@ class Run:
                 r = git(wt, "submodule", "update", "--init", "--recursive", timeout=1800, track=True)
                 if r.returncode != 0:
                     log(f"  warning: submodules didn't initialise: {short(r.stderr, 200)}")
+                # One that was cloned but could not be put on the commit this base records (it isn't on the
+                # submodule's remote: not pushed yet) is left on its remote's HEAD, and the first task's
+                # `git add -u` would commit that as a pointer change. Leave it empty, like one that
+                # could not be cloned at all.
+                for path in stale_gitlinks(wt):
+                    git(wt, "submodule", "deinit", "-f", "--", path, timeout=600)
+                    log(f"  warning: the submodule {short(path, 80)} stays empty in crew's copy: the commit your "
+                        "repo records for it could not be fetched from the submodule's remote (not pushed yet?)")
+                if stale_gitlinks(wt):
+                    raise ValueError(f"could not put the submodules of crew's copy {wt} on the commits "
+                                     f"{g['base'][:10]} records; `crew run {self.path}` starts the copy over")
+            at_base = self._gitlinks()  # the submodule checkouts this copy was made with
             crash_point("clone-made")
             self._setup(fresh=True)  # on the base commit: code the user committed
             tip = g.get("tip") or g["base"]
@@ -2332,6 +2365,7 @@ class Run:
                     t["status"] = "pending"
             g["git_fingerprint"] = self._git_fingerprint()
             g["gitlinks"] = self._gitlinks()  # nothing but crew and setup has been in this copy yet
+            self._note_dropped_submodules(at_base, g["gitlinks"])
             g.pop("creating", None)
             self.save()
         else:
@@ -2340,9 +2374,10 @@ class Run:
         cur, head, busy = current_branch(wt), head_sha(wt), git_busy(wt)
         if cur != g["branch"]:
             raise ValueError(f"crew's copy {wt} is on {cur or 'a detached HEAD'}, not {g['branch']}; inspect it, "
-                             "then `crew clean --all` and `crew run` to start the copy over")
+                             f"then `crew clean --all` and `crew run {self.path}` to start the copy over")
         if busy:
-            raise ValueError(f"crew's copy {wt} has an unfinished {busy}; `crew clean --all` and `crew run`")
+            raise ValueError(f"crew's copy {wt} has an unfinished {busy}; `crew clean --all` and "
+                             f"`crew run {self.path}`")
         tip = g.get("tip") or g["base"]
         if g.get("adopting"):  # an earlier run was stopped while fast-forwarding the copy onto your commits
             if head == g["adopting"] and head != tip:
@@ -2350,12 +2385,16 @@ class Run:
                 tip = head
                 log(f"note: continuing from your own commits on {g['branch']} ({head[:10]})")
             else:
-                g.pop("adopting", None)  # it never happened; the code below does it again if still needed
+                if head == tip and g.get("adopting_clear") is True and isinstance(g["adopting"], str) \
+                        and re.fullmatch(r"[0-9a-f]{7,64}", g["adopting"]):
+                    self._undo_half_merge(tip, g["adopting"])  # it was stopped part-way: take that back
+                g.pop("adopting", None)  # it didn't happen; the code below does it again if still needed
+                g.pop("adopting_clear", None)
                 self.save()
         if head != tip and not any("committing" in t for t in tasks):
             raise ValueError(f"crew's copy {wt} has commits crew didn't make (HEAD {head[:10]}, expected "
-                             f"{tip[:10]}). Inspect them; `crew clean --all` and `crew run` start over from "
-                             f"{g['branch']}.")
+                             f"{tip[:10]}). Inspect them; `crew clean --all` and `crew run {self.path}` start over "
+                             f"from {g['branch']}.")
         rb = git(root, "rev-parse", "--verify", "-q", f"refs/heads/{g['branch']}").stdout.strip()
         if g.get("published") and rb != g["published"]:
             g["published"] = rb or None  # you moved or deleted the branch since crew last updated it
@@ -2363,7 +2402,7 @@ class Run:
         if current_branch(root) == g["branch"]:
             log(f"note: you have {g['branch']} checked out in {root}, and git won't let crew update a "
                 "checked-out branch. New commits stay in crew's copy until you switch to another branch and "
-                "run `crew run` again.")
+                f"run `crew run {self.path}` again.")
         # The user may have committed on the crew branch in their own checkout: build on that. Both
         # comparisons run in the clone: it holds your commits (once fetched) and crew's, while your
         # repo doesn't have crew's until they are published.
@@ -2375,14 +2414,33 @@ class Run:
                                  f"{short(r.stderr, 200)}")
             if git(wt, "merge-base", "--is-ancestor", tip, rb).returncode == 0:
                 g["adopting"] = rb  # journal first: a kill right after the merge resumes by recording it
+                # git's own test for this merge, run first and changing nothing (and nothing staged: only a
+                # commit that was cut short leaves that). When it passes, nothing of a task's stands at the
+                # paths the merge writes; with that on record, a merge that is stopped part-way (a signal,
+                # a kill, a full disk) can be taken back without touching a task's work.
+                git(wt, "update-index", "-q", "--refresh", timeout=600)
+                clear = git(wt, "diff-index", "--cached", "--quiet", tip, "--", timeout=600).returncode == 0 \
+                    and git(wt, "read-tree", "-n", "-m", "-u", tip, rb, timeout=600).returncode == 0
+                if clear:
+                    g["adopting_clear"] = True
                 self.save()
-                m = git(wt, "merge", "-q", "--ff-only", rb, timeout=1800, track=True)
+                # merge.autoStash from your git config would stash a task's uncommitted work, let the merge
+                # through and hand the collision back as conflict markers.
+                m = git(wt, "-c", "merge.autoStash=false", "merge", "-q", "--ff-only", rb, timeout=1800, track=True)
                 if m.returncode:
+                    if clear and head_sha(wt) == tip:
+                        self._undo_half_merge(tip, rb)  # nothing was in its way, so it failed part-way
                     g.pop("adopting", None)
+                    g.pop("adopting_clear", None)
                     self.save()
                     g["published"] = tip  # your branch has everything crew committed; `clean` and `plans` rely on it
                     self.save()
                     why = short(" ".join(ln.strip() for ln in m.stderr.splitlines() if ln.strip()), 300)
+                    if clear:
+                        raise ValueError(f"could not bring your commits on {g['branch']} into crew's copy {wt}: "
+                                         f"{why or 'git gave no reason'}. Nothing in the copy was in the way, so git "
+                                         "stopped part-way; crew put back what it had written. "
+                                         f"`crew run {self.path}` tries again.")
                     raise ValueError(f"could not bring your commits on {g['branch']} into crew's copy {wt}: "
                                      f"{why or 'git gave no reason'}. Files left in the copy (by an interrupted task, "
                                      "or by setup) are in the way. Move or delete them there and run "
@@ -2396,28 +2454,60 @@ class Run:
                 raise ValueError(f"{g['branch']} in {root} and crew's copy have diverged: each has commits the "
                                  f"other lacks. To combine them, check the branch out in your repo and run "
                                  f"`git fetch {wt} {g['branch']}` then `git merge FETCH_HEAD`; after that "
-                                 "`crew run` continues from your branch. Or start a new plan.")
+                                 f"`crew run {self.path}` continues from your branch. Or start a new plan.")
         if g.get("sync_submodules"):  # journaled by _adopted(): repeated here until it has worked
-            self._sync_submodules()
+            self._sync_submodules(journal=True)
             g.pop("sync_submodules", None)
+            g.pop("sync_started", None)
             self.save()
         # Checked above against the record; taken again because your commits can add or drop a
         # submodule. A new one must have nothing at its `.git` yet (no --init is ever run here).
-        links = self._gitlinks(g.get("gitlinks") if isinstance(g.get("gitlinks"), dict) else None)
+        was = g.get("gitlinks") if isinstance(g.get("gitlinks"), dict) else None
+        links = self._gitlinks(was)
         if links != g.get("gitlinks"):
+            self._note_dropped_submodules(was or {}, links)
             g["gitlinks"] = links
             self.save()
         if g.get("published") != (g.get("tip") or g["base"]) and (g.get("tip") or g["base"]) != g["base"]:
             self._publish()
 
-    def _sync_submodules(self) -> None:
+    def _sync_submodules(self, journal: bool = False) -> None:
         """HEAD moved to commits this copy's submodule checkouts weren't made for (your own commits, or the
         branch a rebuilt copy starts from). A checkout left behind would be staged by the next task's
         `git add -u` as a pointer change that undoes yours, so move the checkouts to what HEAD records.
-        Only submodules that are already initialised: no --init, so nothing new is registered or cloned."""
-        wt = self.workdir
-        if not (wt / ".gitmodules").exists() or not stale_gitlinks(wt):
+        Only submodules that are already initialised: no --init, so nothing new is registered or cloned.
+
+        With `journal` (a kept copy; a copy that is being made is simply started over): the checkouts
+        that have no local changes are written to git.sync_started before git moves them. Only git
+        writes in them from then on, so one whose move was stopped part-way is forced through by the
+        next run; git's own half-written files would refuse a plain retry, every time."""
+        wt, g = self.workdir, self.git
+        if not (wt / ".gitmodules").exists():
             return
+        known = [p for p in g["sync_started"] if isinstance(p, str)] \
+            if journal and isinstance(g.get("sync_started"), list) else []
+        here = self._gitlinks() if known else {}
+        redo = [p for p in known if str(here.get(p, "")).startswith("file ")]  # still a checkout crew made
+        stale = stale_gitlinks(wt)
+        if not stale and not redo:
+            return
+        for lock in (wt / ".git" / "modules").rglob("index.lock"):  # left by a git that was killed in there
+            with contextlib.suppress(OSError):
+                lock.unlink()
+        if redo:
+            # Forced even when your branch has since gone back to the old commit: the half-written files
+            # are still in the checkout.
+            log(f"note: moving the submodule checkout(s) {', '.join(redo[:5])} did not finish last time; "
+                "finishing that")
+            git(wt, "submodule", "update", "--checkout", "--recursive", "--force", "--", *redo,
+                timeout=1800, track=True)
+            stale = stale_gitlinks(wt)
+        if journal:
+            clean = [p for p in stale if p not in known and
+                     not git(wt / p, "status", "--porcelain", "--untracked-files=no").stdout.strip()]
+            if clean:
+                g["sync_started"] = known + clean
+                self.save()
         r = git(wt, "submodule", "update", "--checkout", "--recursive", timeout=1800, track=True)
         left = stale_gitlinks(wt)
         if left:
@@ -2427,6 +2517,57 @@ class Run:
                              "before running a task, because the next commit would move the pointer(s) back. "
                              f"Fix the cause and `crew run {self.path}` again.")
 
+    def _undo_half_merge(self, tip: str, target: str) -> None:
+        """`git merge --ff-only target` stopped while it was writing files: HEAD still says `tip`, part of
+        target's files are in the copy (one perhaps half written), and git refuses to merge over them.
+        git had found the merge's paths clear before it began (git.adopting_clear), so what stands at
+        those paths now is the merge's own work: put each back as `tip` has it. Paths the merge doesn't
+        write, where a task's uncommitted work is, are not touched."""
+        wt = self.workdir
+        with contextlib.suppress(OSError):
+            (wt / ".git" / "index.lock").unlink()  # the stopped merge's
+        git(wt, "reset", "-q", timeout=600, track=True)  # the index too, if the merge got as far as writing it
+        paths = [p for p in git(wt, "diff", "--name-only", "-z", "--no-renames", tip, target, "--",
+                                timeout=600).stdout.split("\0") if p]
+        in_tip = {p for p in git(wt, "ls-tree", "-r", "-z", "--name-only", tip, timeout=600).stdout.split("\0") if p}
+        top = wt.resolve()
+        for p in paths:
+            f = wt / p
+            if p in in_tip or (top / p).parent != f.parent.resolve():  # never through a symbolic link
+                continue
+            if f.is_symlink() or f.is_file():
+                with contextlib.suppress(OSError):
+                    f.unlink()
+                    for d in f.parents:  # the directories the merge made for it, while they are empty
+                        if d == wt:
+                            break
+                        d.rmdir()
+        restore = [p for p in paths if p in in_tip]
+        if restore:
+            r = git(wt, "checkout-index", "-f", "-z", "--stdin", timeout=1800, track=True,
+                    stdin="\0".join(restore) + "\0")
+            if r.returncode != 0:
+                log(f"  warning: could not put back every file of a merge that was stopped part-way: "
+                    f"{short(r.stderr, 200)}")
+        log("note: an earlier attempt to bring your commits into crew's copy was stopped part-way; "
+            "crew put back what it had written")
+
+    def _note_dropped_submodules(self, was: dict, now: dict) -> None:
+        """Your commits dropped or moved a submodule. git takes it out of the index and leaves its checkout
+        in the copy, where it shows up as an untracked nested repository. No task put it there, so it
+        goes into the snapshot of every task that is still to be committed and into the copy's own
+        baseline; otherwise such a task is marked partial for it and the finished copy is kept for it.
+        The caller saves."""
+        left = {n + "/" for n, st in was.items() if n not in now and st != "none"} & untracked(self.workdir)
+        if not left:
+            return
+        g = self.git
+        g["untracked_base"] = sorted(set(g.get("untracked_base") or []) | left)
+        for t in self.plan["tasks"]:
+            snap = t.get("untracked_before")
+            if isinstance(snap, dict):
+                snap["untracked"] = sorted(set(snap.get("untracked") or []) | left)
+
     def _adopted(self, old: str, new: str) -> None:
         """crew's copy was fast-forwarded from crew's tip (old) to your commits (new): record it in one save."""
         g = self.git
@@ -2435,6 +2576,7 @@ class Run:
                 t["committing"] = new  # its finished work is still uncommitted, now on top of your commits
         g["tip"] = new
         g.pop("adopting", None)
+        g.pop("adopting_clear", None)
         if (self.workdir / ".gitmodules").exists():
             g["sync_submodules"] = True
         g["git_fingerprint"] = self._git_fingerprint()
@@ -2667,14 +2809,15 @@ class Run:
             task.pop("committing", None)
             self.save()
             raise ValueError(f"task {tid}: the agent {what} in {wt}. crew stopped without committing; inspect "
-                             f"the worktree, put it back on {g['branch']} at {expected[:10]}, then `crew run`.")
+                             f"the worktree, put it back on {g['branch']} at {expected[:10]}, then "
+                             f"`crew run {self.path}`.")
         new, nested = self._new_files(task.get("untracked_before") or {})
         title = " ".join(task["title"].split())[:120]
         sha, problem = git_commit(wt, f"crew({tid}): {title}\n\n{task['agent']} via {provider}, {task['status']}.", new)
         if problem and not sha and (tracked_dirty(wt) or new):
             self.save()  # keep 'committing': the next run retries this commit
             raise ValueError(f"task {tid} finished but crew could not commit its work ({problem}). The work is "
-                             f"in {wt}; fix git (e.g. remove a stale index.lock) and `crew run` again.")
+                             f"in {wt}; fix git (e.g. remove a stale index.lock) and `crew run {self.path}` again.")
         crash_point("after-commit")
         if sha:
             task["commit"] = sha
@@ -2886,7 +3029,7 @@ def run_plan(cfg: dict, plan_path: Path, *, dry_run: bool = False, retry_failed:
                     run.finish()
                 except KeyboardInterrupt:
                     where = run.workdir if run.git else run.root
-                    log(f"\ninterrupted; the work so far is in {where}, and `crew run` resumes it")
+                    log(f"\ninterrupted; the work so far is in {where}, and `crew run {plan_path}` resumes it")
                     raise
             finally:
                 _TL.pidfile = None
@@ -3111,7 +3254,7 @@ def clean(all_: bool) -> int:
             with file_lock(lock, blocking=False):
                 plan = _plan_or_none(plan_file) if plan_file else None
                 if plan and plan_state(plan) == "paused" and not all_:
-                    log(f"kept {wt} (its plan is paused; `crew run` continues it)")
+                    log(f"kept {wt} (its plan is paused; `crew run {plan_file}` continues it)")
                     continue
                 g = plan.get("git") if plan else None
                 if isinstance(g, dict) and unpublished(g):
