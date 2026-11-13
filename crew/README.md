@@ -91,7 +91,7 @@ Only one `crew queue run` can work at a time.
 
 ## What crew guarantees, and what it can't
 
-No tool driving language models can promise correct code. What crew does promise, and its test suite checks:
+No tool driving language models can promise correct code. What crew does promise, and its test suite checks (`ASSURANCE.md` records the evidence behind each promise, and `CLAUDE.md` the rules for changing crew):
 
 - **Your work is safe.** crew never modifies your checkout, your branches or your uncommitted files, and never pushes. The only change it makes to your repo is adding commits to its own `crew/...` branches. Agents work in crew's own clone. Your checkout and the clone's `.git` are read-only to them: Codex's sandbox does this by itself, and crew tells Claude's sandbox to deny writes to both, because otherwise Claude can write a repo's git directory. Before running git in the clone after an agent, crew checks that the clone's git configuration is unchanged.
 - **Crashes don't lose or repeat work.** Every step that changes anything is written to the plan file first: making the copy, each commit, removing the copy. A crash, kill or power cut at any point resumes without repeating a committed task or losing an agent's files. Crash points tested: while making the copy, after the branch is recorded, before a commit, after a commit, while removing the copy, and SIGKILL mid-task. Agent processes left running by a crew that was killed are stopped before the next run continues. If crew's copy is deleted while a task's work is uncommitted, that task runs again instead of being counted as done.
