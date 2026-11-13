@@ -49,7 +49,7 @@ except ImportError:  # Windows: thread locks only
 if sys.version_info < (3, 9):
     sys.exit("crew needs Python 3.9 or newer")
 
-VERSION = "3.8"
+VERSION = "3.9"
 HERE = Path(__file__).resolve().parent
 CREW_HOME = Path(os.path.expanduser(os.environ.get("CREW_HOME") or "~/.crew"))
 PROVIDERS = ("claude", "codex")
@@ -1341,9 +1341,13 @@ def login_status(cfg: dict, p: str) -> tuple[bool, str]:
 CONTRACT = {
     "claude": [(["--help"], ["--print", "--output-format", "--json-schema", "--setting-sources",
                              "--permission-mode", "--tools", "--allowedTools", "--disallowedTools", "--settings",
-                             "--model"])],
+                             "--model", "--strict-mcp-config"])],
     "codex": [(["exec", "--help"], ["--json", "--output-schema", "--output-last-message", "--sandbox",
-                                    "--skip-git-repo-check", "--cd", "--model", "--ignore-rules", "--config"])],
+                                    "--skip-git-repo-check", "--cd", "--model", "--ignore-rules", "--config",
+                                    "--disable"]),
+              # `--disable` of a feature the CLI doesn't know fails every call. The name is followed by the
+              # padding of the table, which tells it from `multi_agent_v2`.
+              (["features", "list"], ["multi_agent "])],
     "codex-sandbox": [(["sandbox", "--help"], ["--permission-profile", "--config"])],
 }
 _CONTRACT_CACHE: dict[str, str] = {}
@@ -1365,7 +1369,8 @@ def contract_problem(cfg: dict, which: str) -> str:
                 break
             missing = [n for n in needles if n not in text]
             if missing:
-                problem = (f"`{os.path.basename(cmd)} {' '.join(args)}` no longer lists {', '.join(missing)}; "
+                problem = (f"`{os.path.basename(cmd)} {' '.join(args)}` no longer lists "
+                           f"{', '.join(n.strip() for n in missing)}; "
                            "this CLI version doesn't match what crew expects (update crew or the CLI)")
                 break
         _CONTRACT_CACHE[key] = problem
@@ -1761,14 +1766,45 @@ def _parse_structured(res: Result) -> None:
 
 CLAUDE_SANDBOX = {"enabled": True, "autoAllowBashIfSandboxed": True, "allowUnsandboxedCommands": False}
 CODEX_SANDBOX_FLAGS = ("--sandbox", "-s", "--dangerously-bypass-approvals-and-sandbox")
+# The only tools a Claude call is offered (`--tools`; Bash is added for a worker that may have a shell). Without
+# the list a worker gets the CLI's whole default set, and much of it works outside the sandbox: Agent and
+# EnterWorktree make the CLI itself write the copy's .git, ListAgents and SendMessage reach the owner's other
+# Claude sessions, WebFetch, WebSearch and Monitor reach the network once an allow rule of the owner's permits
+# them, Workflow, ScheduleWakeup and CronCreate schedule work. MCP tools are not built in: `--strict-mcp-config`.
+CLAUDE_WORKER_TOOLS = ("Read", "Edit", "Write", "Glob", "Grep", "NotebookEdit")
+CLAUDE_PLANNER_TOOLS = ("Read", "Grep", "Glob")
 
 
-def _claude_worker_args(args: list[str], deny: list[str]) -> tuple[list[str], bool]:
+def _codex_home() -> list[str]:
+    """Where Codex keeps its login, as named and as the system resolves it."""
+    home = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+    return list(dict.fromkeys([home, os.path.realpath(home)]))
+
+
+def _hide_codex_login(data: dict) -> None:
+    """Keep Codex's stored login out of a Claude call's reach (law 10), in the settings crew passes it.
+    `sandbox.filesystem.denyRead` binds only the shell. Read, Grep and Glob obey permission rules instead:
+    plan mode lets them read outside the working directory without asking, and an allow rule of the
+    owner's (`Read(~/**)`) does in a worker. A deny rule wins over every allow rule."""
+    sb = data.setdefault("sandbox", {})
+    fs = sb.setdefault("filesystem", {}) if isinstance(sb, dict) else None
+    perms = data.setdefault("permissions", {})
+    if not isinstance(fs, dict) or not isinstance(perms, dict):
+        raise ValueError("providers.claude.args: --settings must be a JSON object whose `sandbox`, "
+                         "`sandbox.filesystem` and `permissions`, if present, are objects")
+    kept = fs.get("denyRead") if isinstance(fs.get("denyRead"), list) else []
+    fs["denyRead"] = list(dict.fromkeys([*kept, *_codex_home()]))
+    kept = perms.get("deny") if isinstance(perms.get("deny"), list) else []
+    perms["deny"] = list(dict.fromkeys([*kept, *(f"Read(/{p}/**)" for p in _codex_home())]))  # //: an absolute path
+
+
+def _claude_worker_args(args: list[str], deny: list[str]) -> tuple[list[str], bool, set[str] | None]:
     """The worker flags for Claude: crew's `--settings`, then the configured `args`. `args` exists to
     add flags, so a config that sets it must not lose the permission mode, the sandbox or the write
     denials by leaving them out; a key the config does set is kept. crew's own flags come first: a
     flag at the end of `args` that is missing its value then has nothing of crew's to swallow, and
-    ends in the CLI's own error. Returns (flags, is every shell command sandboxed?)."""
+    ends in the CLI's own error. Returns (flags, is every shell command sandboxed?, the tools a
+    `--tools` in `args` names, or None)."""
     flat: list[str] = []
     for a in args:  # --settings=x becomes --settings x
         flat += ["--settings", a.split("=", 1)[1]] if a.startswith("--settings=") else [a]
@@ -1776,7 +1812,7 @@ def _claude_worker_args(args: list[str], deny: list[str]) -> tuple[list[str], bo
     # Only that one is passed on: the settings crew adds its rules to, and decides the Bash grant
     # by, are then the only settings the worker is started with.
     rest: list[str] = []
-    raw, i = None, 0
+    raw, only, i = None, None, 0
     while i < len(flat):
         if flat[i] == "--settings":
             # Without a value the CLI takes the next token for one: crew's own flag, or a file of that name
@@ -1786,6 +1822,18 @@ def _claude_worker_args(args: list[str], deny: list[str]) -> tuple[list[str], bo
                                  "it, so crew can add its sandbox rules to it.")
             raw = flat[i + 1]
             i += 2
+        elif flat[i] == "--tools" or flat[i].startswith("--tools="):
+            # Claude adds up every --tools on its command line, so one here would add to crew's list. It is
+            # taken out and can only narrow that list. It takes every token up to the next flag.
+            j = i + 1
+            if flat[i] == "--tools":
+                while j < len(flat) and not flat[j].startswith("-"):
+                    j += 1
+            values = flat[i + 1:j] if flat[i] == "--tools" else [flat[i].split("=", 1)[1]]
+            names = {n for v in values for n in re.split(r"[,\s]+", v) if n}
+            if names != {"default"}:
+                only = (only or set()) | (names - {"default"})
+            i = j
         else:
             rest.append(flat[i])
             i += 1
@@ -1809,12 +1857,11 @@ def _claude_worker_args(args: list[str], deny: list[str]) -> tuple[list[str], bo
     fs["denyWrite"] = list(dict.fromkeys([*kept, *deny]))
     # The other provider's stored login stays out of this worker's reach (law 10): the sandbox limits
     # writes, not reads, and whatever a worker reads goes to its own model provider.
-    kept = fs.get("denyRead") if isinstance(fs.get("denyRead"), list) else []
-    fs["denyRead"] = list(dict.fromkeys([*kept, os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")]))
+    _hide_codex_login(data)
     # excludedCommands run outside the sandbox. They ask first, but not once crew has allowed Bash.
     contained = sb.get("enabled") is True and sb.get("allowUnsandboxedCommands") is False \
         and not sb.get("excludedCommands")
-    return ["--settings", json.dumps(data), *rest], contained
+    return ["--settings", json.dumps(data), *rest], contained, only
 
 
 def _claude_own_settings_files() -> list[Path]:
@@ -1867,14 +1914,24 @@ def run_claude(cfg: dict, prompt: str, workdir: Path, *, schema: dict | None = N
         cmd += ["--model", model]
     if schema is not None:
         cmd += ["--json-schema", json.dumps(schema)]
+    # The owner's own MCP servers are started for every call and work outside any sandbox; an allow rule
+    # of the owner's lets a worker use them. A worker or the planner gets none (no --mcp-config of crew's).
+    cmd += ["--strict-mcp-config"]
     if read_only:
-        # Read-only tools only: plan mode alone still runs Bash that a user allow rule permits.
-        cmd += ["--permission-mode", "plan", "--tools", "Read,Grep,Glob"]
+        # Read-only tools only: plan mode alone still runs Bash that a user allow rule permits. Plan mode
+        # lets them read outside the working directory without asking, so Codex's login is denied to them.
+        settings: dict = {}
+        _hide_codex_login(settings)
+        cmd += ["--permission-mode", "plan", "--tools", ",".join(CLAUDE_PLANNER_TOOLS),
+                "--settings", json.dumps(settings)]
     else:
         # Claude's sandbox would otherwise let it write a repo's git directory; crew's copy's .git
         # and the user's own checkout are made read-only for the agent.
-        args, contained = _claude_worker_args(list(pc.get("args") or []), deny_write or [])
+        args, contained, only = _claude_worker_args(list(pc.get("args") or []), deny_write or [])
         why = claude_shell_refusal(pc, contained)
+        # The tools a task needs, and no more: the CLI's default set reaches past the sandbox.
+        tools = [t for t in (*CLAUDE_WORKER_TOOLS, *([] if why else ["Bash"])) if only is None or t in only]
+        cmd += ["--tools", ",".join(tools)]
         if not why:
             # Every shell command then runs in the sandbox without a prompt (the settings above
             # turn off its escape hatch). Never granted when the sandbox can't start.
@@ -1976,6 +2033,12 @@ def run_codex(cfg: dict, prompt: str, workdir: Path, *, schema: dict | None = No
         # for `crew` itself), and a rules file in the working tree is whatever an earlier agent left there.
         # Neither is for a worker, or for the planner, which is read-only. After `args`: the last -c wins.
         cmd += ([] if "--ignore-rules" in args else ["--ignore-rules"]) + own_config_only
+        # Codex's sub-agent tools (feature `multi_agent`, on by default) can resume any session saved in
+        # ~/.codex, the owner's own included, and send it a message: Codex itself, outside the sandbox, writes
+        # that message into the session's history as a user turn, and the owner's next `codex resume` hands
+        # it to the model as the owner's own words. That is a write outside crew's copy, from a worker and
+        # from the read-only planner alike. `--disable` wins over an `--enable` in `args` and over config.toml.
+        cmd += ["--disable", "multi_agent"]
         cmd += ["-"]  # prompt on stdin
         rc, out, err, secs = _exec(cmd, prompt, workdir, pc.get("timeout_sec", 1800), provider_env("codex"))
         text = last.read_text(errors="replace").strip() if last.exists() else ""

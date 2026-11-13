@@ -2,7 +2,7 @@
 
 crew (`crew.py`) drives the `claude` and `codex` CLIs across the owner's projects. It is one
 stdlib-only Python file plus `crew.json` (a copy of `DEFAULTS`), `README.md` and `test_crew.py`.
-These rules come from nine rounds of adversarial review; each one records a defect that was
+These rules come from ten rounds of adversarial review; each one records a defect that was
 found and fixed. Do not relax them for convenience. `ASSURANCE.md` holds the evidence.
 
 ## Laws: invariants every change must keep
@@ -70,9 +70,23 @@ found and fixed. Do not relax them for convenience. `ASSURANCE.md` holds the evi
    (`_codex_own_config_only()`): Codex loads `.codex/config.toml` from a directory it trusts,
    `codex exec` trusts the one it is started in, and a Claude worker can write that file in the
    clone. Its tool servers are started outside any sandbox.
+   Every `codex exec`, the planner's too, gets `--disable multi_agent` after the configured
+   `args`: Codex's sub-agent tools (on by default) resume any session saved in
+   `~/.codex`, the owner's own included, and Codex itself writes what they send into that
+   session's history, outside the sandbox, as a user turn. `--disable` wins over an `--enable`
+   anywhere on the line and over config.toml; `-c features.multi_agent=false` does not. A feature
+   name the CLI doesn't know fails the call, so `CONTRACT` asks `codex features list` for it.
    The planner is read-only: Claude `--permission-mode plan --tools Read,Grep,Glob`, Codex
    `--sandbox read-only`. Every Claude call uses `--setting-sources user` so repo settings
    (hooks, `defaultMode`, allow rules) are ignored.
+   A Claude worker is offered only `CLAUDE_WORKER_TOOLS` (`--tools`, plus Bash when granted), and
+   every Claude call gets `--strict-mcp-config`. Much of the CLI's default set works outside the
+   sandbox, in the CLI's own process: Agent (`isolation: "worktree"`) and EnterWorktree run
+   `git worktree add` in the clone's `.git` without asking (with husky's `core.hooksPath` that
+   rewrites `.git/config`), ListAgents and SendMessage reach the owner's other Claude sessions,
+   WebFetch, WebSearch and Monitor reach the network once an owner's allow rule permits them, and
+   the owner's MCP servers are started for every call. Claude adds up repeated `--tools`, so one
+   in `args` is taken out and can only narrow crew's list.
    crew's own state drives unsandboxed execution (the config names the CLIs and their flags,
    profiles hold setup commands), so it must sit where no sandbox can write:
    `require_safe_home()` refuses to run agents with `CREW_HOME` or the config file in a temp
@@ -216,10 +230,14 @@ found and fixed. Do not relax them for convenience. `ASSURANCE.md` holds the evi
 10. **Credentials stay with their provider.** `provider_env()` strips the other provider's keys,
     for every start of a CLI (`doctor`'s version probe and `codex-login` included);
     sandboxed checks get no `SECRET_ENV` variables at all; keys are never logged or put on a
-    command line (`codex-login` pipes via stdin). Claude workers get
-    `sandbox.filesystem.denyRead` for Codex's login store; Codex has no such setting (see below).
-11. **A worker never starts crew.** Workers load the user's own skills and instructions, which
-    include the `crew` skill that `crew install` writes. Every worker and every check runs with
+    command line (`codex-login` pipes via stdin). Claude workers and the Claude planner get
+    `sandbox.filesystem.denyRead` and a `permissions.deny` rule `Read(//<codex home>/**)` for
+    Codex's login store (`_hide_codex_login()`): denyRead binds only the shell, the deny rule binds
+    Read, Grep and Glob, which plan mode lets read outside the working directory without asking,
+    and wins over an owner's `Read(~/**)`. Codex has no such setting (see below).
+11. **A worker never starts crew.** Workers load the user's own instructions, and Codex workers
+    the user's own skills, which include the `crew` skill that `crew install` writes (a Claude
+    worker has no Skill tool, and no ListAgents or SendMessage to ask another session to run crew). Every worker and every check runs with
     `CREW_TASK` set, and `main()` refuses `plan`, `go`, `do`, `run` and `queue run` when it is.
     Codex passes its commands only the variables the owner's `shell_environment_policy` lets
     through, so crew also sets it with `-c shell_environment_policy.set.CREW_TASK`.

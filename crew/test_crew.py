@@ -26,7 +26,8 @@ from pathlib import Path
 if os.environ.get("FAKE_IGNORE_TERM"):
     _signal.signal(_signal.SIGTERM, _signal.SIG_IGN)  # an agent that won't stop on a polite signal
 LOG = os.environ["FAKE_LOG"]
-if os.environ.get("FAKE_PROBE_SLEEP") and (sys.argv[1:] in (["--help"], ["exec", "--help"], ["sandbox", "--help"])
+if os.environ.get("FAKE_PROBE_SLEEP") and (sys.argv[1:] in (["--help"], ["exec", "--help"], ["sandbox", "--help"],
+                                                             ["features", "list"])
                                             or sys.argv[1:3] in (["auth", "status"], ["login", "status"])):
     time.sleep(float(os.environ["FAKE_PROBE_SLEEP"]))  # a CLI whose login check or --help hangs
 def record(**kw):
@@ -101,7 +102,7 @@ if os.environ.get("FAKE_PROBE_READS_TERMINAL") and (a == ["--help"] or a[:2] == 
     sys.stdin.read(1)  # the real CLI touches the terminal it is given, even for these two
 if a == ["--help"]:
     help_text("--print --output-format --json-schema --setting-sources --permission-mode --tools "
-              "--allowedTools --disallowedTools --settings --model"); sys.exit(0)
+              "--allowedTools --disallowedTools --settings --model --strict-mcp-config"); sys.exit(0)
 if a[:2] == ["auth", "status"]:
     sys.exit(0)
 if a and a[0] == "--version":
@@ -134,7 +135,11 @@ import subprocess
 a = sys.argv[1:]
 if a == ["exec", "--help"]:
     help_text("--json --output-schema --output-last-message --sandbox --skip-git-repo-check --cd --model "
-              "--ignore-rules --config")
+              "--ignore-rules --config --disable")
+    sys.exit(0)
+if a == ["features", "list"]:  # the real CLI's table: name, stage, on or off
+    print("\n".join(f"{n:<24}stable   {on}" for n, on in (("multi_agent", "true"), ("multi_agent_v2", "false"))
+                    if n != os.environ.get("FAKE_HELP_MISSING", "")))
     sys.exit(0)
 if a == ["sandbox", "--help"]:
     help_text("--permission-profile --config"); sys.exit(0)
@@ -162,8 +167,17 @@ prompt = sys.stdin.read()
 # (tool servers started unsandboxed, sandbox settings, environment policy). `codex exec` trusts its own.
 obeys = [n for n, on in ((".codex/rules/default.rules", "--ignore-rules" not in a),
                          (".codex/config.toml", not untrusted(os.getcwd()))) if on and Path(n).exists()]
+def sub_agents():
+    """Does the real CLI (0.166) give the model its sub-agent tools (spawn_agent, resume_agent, send_input...)?
+    They are on by default. `--disable multi_agent` turns them off wherever it stands on the line; `--enable`
+    turns them on over `-c features.multi_agent=false`."""
+    pairs = list(zip(a, a[1:]))
+    if ("--disable", "multi_agent") in pairs:
+        return False
+    return ("--enable", "multi_agent") in pairs or not any(
+        f in ("-c", "--config") and v.replace(" ", "") == "features.multi_agent=false" for f, v in pairs)
 record(p="codex", argv=a, planner="read-only" in a, resumed="earlier attempt" in prompt, obeys=obeys,
-       reads_owner_rules="--ignore-rules" not in a)
+       reads_owner_rules="--ignore-rules" not in a, sub_agents=sub_agents())
 out = Path(a[a.index("-o") + 1])
 print(json.dumps({"type": "thread.started"}))
 if "read-only" in a:
@@ -2089,6 +2103,30 @@ class TestOnlyTheOwnersOwnSettings(CrewTest):
             self.assertIn(own, a)
             self.assertNotIn("--sandbox", a)
 
+    def test_codex_gets_no_sub_agent_tools(self):
+        """The 3.8 review: Codex's sub-agent tools are on by default, and resume_agent and send_input take any
+        session saved in ~/.codex. With the real CLI 0.166 a worker, and the read-only planner, resumed a
+        session of the owner's own in another folder and sent it a message; Codex wrote it into that session's
+        history as a user turn, and the owner's next `codex resume` gave it to the model as the owner's words."""
+        root = self.repo()
+        codex, _ = self.claude_then_codex(root)
+        for c in codex:  # the planner and the worker
+            self.assertFalse(c["sub_agents"], c["argv"])
+            self.assertEqual(c["argv"][-1], "-")
+        # an `--enable` of the owner's in args doesn't turn them back on (nor, with the real CLI, config.toml)
+        self.write_cfg({"providers": {"claude": {"enabled": False}, "codex": {"args": ["--enable", "multi_agent"]}}})
+        self.crew("do", "y", "--workdir", str(root))
+        c = self.workers("codex")[-1]
+        self.assertFalse(c["sub_agents"], c["argv"])
+
+    def test_a_codex_that_cant_turn_off_its_sub_agents_is_incompatible(self):
+        """crew turns the sub-agent tools off by the feature's name: the real CLI fails every call that
+        disables a feature it doesn't know ("Unknown feature flag")."""
+        self.assertNotIn("INCOMPATIBLE", self.crew("doctor", check=False).stdout)
+        for missing, where in (("--disable", "codex exec --help"), ("multi_agent", "codex features list")):
+            r = self.crew("doctor", env={"FAKE_HELP_MISSING": missing}, check=False)
+            self.assertIn(f"INCOMPATIBLE: `{where}` no longer lists {missing};", r.stdout)
+
     def claude_argv(self, root, settings=None, cfg=None, env=None):
         self.write_cfg({"providers": {"codex": {"enabled": False}, **({"claude": cfg} if cfg else {})}})
         if settings is not None:
@@ -3906,6 +3944,122 @@ class TestAdoptionAndSubmodules(CrewTest):
         r = self.crew("go", "x", "--workdir", str(root))
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertTrue(self.plan_of(root)["git"]["branch"].startswith("wip/"))
+
+
+class TestClaudeWorkerTools(CrewTest):
+    """What the review of 3.8's workers found: a Claude worker was offered the CLI's whole default tool set, much
+    of which works outside the sandbox, and the planner's file tools could read Codex's login. Shown with the
+    real claude 2.1.325 and a scripted model endpoint; these tests hold the flags that closed each one."""
+
+    def claude_argv(self, root, cmd, settings="{}", cfg=None, env=None):
+        """The argv of the one Claude call that `crew plan` (the planner) or `crew do` (a worker) makes."""
+        self.write_cfg({"providers": {"codex": {"enabled": False}, **({"claude": cfg} if cfg else {})}})
+        self.claude_home.mkdir(exist_ok=True)
+        (self.claude_home / "settings.json").write_text(settings)
+        n = len(self.calls())
+        r = self.crew(cmd, "x", "--workdir", str(root), env=env)
+        new = [c for c in self.calls()[n:] if c["p"] == "claude" and "argv" in c and c["planner"] == (cmd == "plan")]
+        self.assertEqual(len(new), 1, r.stdout + r.stderr)
+        return new[0]["argv"]
+
+    @staticmethod
+    def offered(argv):
+        """The tools the CLI offers this call, or None: no --tools is the CLI's whole default set. The real CLI
+        adds up every --tools on its command line, and each takes every token up to the next flag."""
+        names, seen, i = [], False, 0
+        while i < len(argv):
+            if argv[i] == "--tools" or argv[i].startswith("--tools="):
+                seen, j = True, i + 1
+                values = [argv[i].split("=", 1)[1]] if argv[i] != "--tools" else []
+                while argv[i] == "--tools" and j < len(argv) and not argv[j].startswith("-"):
+                    values.append(argv[j])
+                    j += 1
+                names += [n for v in values for n in v.replace(",", " ").split()]
+                i = j
+            else:
+                i += 1
+        return names if seen else None
+
+    def with_and_without_a_shell(self, root, settings="{}"):
+        """A worker's argv where Claude's sandbox starts (Bash granted) and where it can't (Bash taken away)."""
+        no_sandbox = {"PATH": TestOnlyTheOwnersOwnSettings.path_without_bubblewrap(self)}
+        return [self.claude_argv(root, "do", settings=settings, env=env) for env in ({}, no_sandbox)]
+
+    def test_the_codex_login_is_denied_to_claudes_file_tools_and_to_the_planner(self):
+        """`sandbox.filesystem.denyRead` binds only the shell. The planner had no settings at all: in plan mode
+        Read, Grep and Glob read ~/.codex/auth.json outside the checkout without asking, and the key went to
+        Anthropic. A worker's did too once the owner allowed `Read(~/**)`. A permission deny rule binds them,
+        and wins over every allow rule."""
+        root = self.repo()
+        codex_home = self.tmp / "codex-home"
+        rules = [f"Read(/{p}/**)" for p in dict.fromkeys([str(codex_home), os.path.realpath(codex_home)])]
+        env = {"CODEX_HOME": str(codex_home)}
+        planner = self.claude_argv(root, "plan", env=env)
+        self.assertIn("--settings", planner)  # 3.8: none, so nothing denied the planner's Read
+        settings = json.loads(planner[planner.index("--settings") + 1])
+        self.assertEqual(settings["permissions"]["deny"], rules)
+        self.assertEqual(planner.count("--settings"), 1)
+        worker = self.claude_argv(root, "do", settings='{"permissions": {"allow": ["Read(~/**)"]}}', env=env,
+                                  cfg={"args": ["--settings", '{"permissions": {"deny": ["Read(//mine/**)"]}}']})
+        settings = json.loads(worker[worker.index("--settings") + 1])
+        self.assertEqual(settings["permissions"]["deny"], ["Read(//mine/**)", *rules])  # yours kept, Codex's added
+        self.assertIn(str(codex_home), settings["sandbox"]["filesystem"]["denyRead"])  # and the shell's, as before
+        self.write_cfg({"providers": {"codex": {"enabled": False},
+                                      "claude": {"args": ["--settings", '{"permissions": ["Read"]}']}}})
+        r = self.crew("do", "x", "--workdir", str(root), check=False)
+        self.assertNotEqual(r.returncode, 0)  # settings crew can't add its rule to start no worker
+        self.assertIn("`permissions`", r.stdout)
+
+    def test_a_claude_worker_is_offered_no_tool_that_reaches_other_sessions(self):
+        """With no tool list a worker got ListAgents, and SendMessage by way of ToolSearch: they list and message
+        the owner's other Claude sessions on this machine, in the cloud and over Remote Control, which run with
+        no sandbox of crew's and no CREW_TASK. The CLI sends without asking unless the owner set
+        isolatePeerMachines. Workflow, ScheduleWakeup and CronCreate came with them."""
+        root = self.repo()
+        owner = '{"permissions": {"allow": ["ListAgents", "SendMessage", "ToolSearch", "Workflow"]}}'
+        for argv in self.with_and_without_a_shell(root, owner):
+            tools = self.offered(argv)
+            self.assertIsNotNone(tools, argv)  # 3.8: no --tools, the CLI's whole default set
+            self.assertEqual(sorted(set(tools) - {"Bash"}), sorted(crew.CLAUDE_WORKER_TOOLS), argv)
+            self.assertEqual("Bash" in tools, "--allowedTools" in argv)  # the shell only where it is granted
+            for t in ("ListAgents", "SendMessage", "ToolSearch", "Workflow", "ScheduleWakeup", "CronCreate", "Skill"):
+                self.assertNotIn(t, tools)
+        # A --tools of yours narrows crew's list and never adds to it: the CLI adds up every --tools it gets.
+        argv = self.claude_argv(root, "do", cfg={"args": ["--tools", "Read,Edit,SendMessage", "Write", "--verbose"]})
+        self.assertEqual(self.offered(argv), ["Read", "Edit", "Write"])
+        self.assertEqual(argv.count("--tools"), 1)
+        self.assertIn("--verbose", argv)  # the rest of your flags still reach the CLI
+
+    def test_a_claude_worker_has_no_tool_that_makes_the_cli_write_git(self):
+        """EnterWorktree (by way of ToolSearch) and Agent with `isolation: "worktree"` run `git worktree add` in
+        the CLI's own process, without asking: the real CLI added a branch and a worktree to the clone's .git,
+        which the sandbox denies the worker, and where setup had set core.hooksPath (husky) it rewrote
+        .git/config, so crew stopped the plan as tampered with."""
+        root = self.repo()
+        owner = '{"permissions": {"allow": ["EnterWorktree", "ExitWorktree", "Agent"]}}'
+        for argv in self.with_and_without_a_shell(root, owner):
+            tools = self.offered(argv)
+            self.assertIsNotNone(tools, argv)  # 3.8: no --tools, so Agent was offered and EnterWorktree loadable
+            for t in ("Agent", "EnterWorktree", "ExitWorktree", "ToolSearch"):
+                self.assertNotIn(t, tools)
+        self.assertEqual(self.offered(self.claude_argv(root, "plan")), list(crew.CLAUDE_PLANNER_TOOLS))
+
+    def test_a_claude_call_gets_no_network_tool_and_no_mcp_server(self):
+        """With an allow rule of the owner's for WebFetch, WebSearch or Monitor the real CLI fetched a page,
+        searched the web and opened a WebSocket for a worker, from its own process, outside the sandbox. The
+        owner's MCP servers were started for every call, the planner's included, and a worker used one the
+        owner allows."""
+        root = self.repo()
+        owner = '{"permissions": {"allow": ["WebFetch", "WebSearch", "Monitor", "mcp__owner"]}}'
+        for argv in [*self.with_and_without_a_shell(root, owner), self.claude_argv(root, "plan", settings=owner)]:
+            self.assertIn("--strict-mcp-config", argv)  # 3.8: the owner's MCP servers for every call
+            self.assertNotIn("--mcp-config", argv)  # and crew names none
+            tools = self.offered(argv)
+            self.assertIsNotNone(tools, argv)
+            for t in ("WebFetch", "WebSearch", "Monitor"):
+                self.assertNotIn(t, tools)
+        r = self.crew("doctor", env={"FAKE_HELP_MISSING": "--strict-mcp-config"}, check=False)
+        self.assertIn("no longer lists --strict-mcp-config", r.stdout)  # a CLI that drops it is caught up front
 
 
 if __name__ == "__main__":
