@@ -99,6 +99,9 @@ found and fixed. Do not relax them for convenience. `ASSURANCE.md` holds the evi
 10. **Credentials stay with their provider.** `provider_env()` strips the other provider's keys;
     sandboxed checks get no `SECRET_ENV` variables at all; keys are never logged or put on a
     command line (`codex-login` pipes via stdin).
+11. **A worker never starts crew.** Workers load the user's own skills and instructions, which
+    include the `crew` skill that `crew install` writes. Every worker and every check runs with
+    `CREW_TASK` set, and `main()` refuses `plan`, `go`, `do`, `run` and `queue run` when it is.
 
 ## Engineering rules
 
@@ -117,6 +120,24 @@ found and fixed. Do not relax them for convenience. `ASSURANCE.md` holds the evi
   `providers.claude.model = "haiku"`, `crew go` on a small goal; then confirm the checkout's
   file hashes are unchanged, the work is on a `crew/` branch, and the clone was removed.
 
+## What a tool must offer before it can be a provider
+
+A provider runs agent-written code, so adding one is a change to law 2. It needs all of:
+
+- a non-interactive run that takes the prompt off the command line and returns a verdict crew
+  can require by schema, where exit 0 alone is never read as success;
+- a sandbox crew switches on for that run, that keeps writes inside the working directory, keeps
+  `.git` read-only and has no network, and a probe that proves it works before crew trusts it;
+- a way to load only the user's own configuration, because the working directory is a clone an
+  earlier agent may have left hooks, tool servers or settings in;
+- a login check that starts no session, and a usage-limit error crew can recognise.
+
+Antigravity's `agy` 1.5 and Gemini CLI 0.68 were checked against this from their documentation
+on 2026-11-13. Neither offers the second or third, and neither could be run on the build machine,
+so they are not providers. They hand work to crew through the `crew` skill instead (`SKILL_MD`,
+`install_skill()`); the skill's frontmatter is only `name` and `description`, which is all that
+Claude Code, Codex and Antigravity have in common.
+
 ## What is known not to be covered
 
 - Codex as a worker has only been exercised with fake CLIs and mock servers (no Codex login
@@ -133,4 +154,6 @@ found and fixed. Do not relax them for convenience. `ASSURANCE.md` holds the evi
 - Submodules have two tests: an update the user commits on a crew branch, and an agent swapping
   a submodule's `.git`. Nested submodules and a submodule the user adds mid-plan are handled in
   `_gitlinks()` but untested, and no real sandboxed worker was used to make the swap.
+- The `crew` skill was written from each tool's documentation. No tool has been watched loading
+  it or handing work to crew through it.
 - The `tokens` metric is approximate: the two CLIs count differently.

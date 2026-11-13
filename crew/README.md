@@ -25,7 +25,7 @@ A planner breaks a goal into tasks and hands them to three agents, **Astra**, **
    ```
    python3 crew/crew.py install
    ```
-   This copies crew to `~/.crew/bin/crew` and writes `~/.crew/config.json` (agents, models, split), then tells you how to put it on your `PATH`.
+   This copies crew to `~/.crew/bin/crew` and writes `~/.crew/config.json` (agents, models, split), then tells you how to put it on your `PATH`. It also gives each coding tool it finds on the machine the `crew` skill (see "Hand work to crew from the tool you have open").
 3. On Linux, install `bubblewrap` and `socat` so Claude's sandbox works (`apt install bubblewrap socat`). macOS has its sandbox built in.
 4. Check everything: `crew doctor`. It reports any CLI that is missing, logged out, or a version whose flags no longer match what crew uses.
 
@@ -35,13 +35,18 @@ A planner breaks a goal into tasks and hands them to three agents, **Astra**, **
 cd ~/code/my-app
 crew init                    # detect stack, setup and checks; saved in ~/.crew/projects/
 crew go "Add dark mode to the settings page"
-crew do "Fix the typo in the footer"     # one task, no planner call (cheaper)
+crew do "Fix the typo in the footer"     # one task, no planner call (cheaper); goes to Sol
+crew do "Document the API" --agent Luna  # pick who does a direct task
+crew plan "Add dark mode"    # plan only: read the plan it saves, then `crew run`
 crew run                     # resume this checkout's latest plan
 crew run --retry-failed      # also re-run failed, partial, blocked and skipped tasks
 crew go "..." --dry-run      # plan, then only show who would get each task
 crew plans                   # this checkout's plans (crew plans --all for every project)
-crew clean                   # remove crew's copies of finished plans
+crew projects                # every project crew knows: path, stack, checks, last plan
+crew clean                   # remove crew's copies of finished plans, in every project
 ```
+
+Every command that works on a project takes `--workdir <path>`; without it crew uses the git repository your terminal is in. `--config <file>` before the command uses that config instead of `~/.crew/config.json`.
 
 When the run ends, crew prints the commands to review and merge:
 
@@ -62,11 +67,61 @@ What a run does, in order:
 
    It ends by reporting `done`, `partial` or `blocked`; only `done` lets dependent tasks run. After each task crew commits that task's work as one commit (`crew(t1): ...`), without running git hooks or signing. First it checks that the copy's git configuration is unchanged and that it is still on crew's branch, at crew's last commit, with no merge or rebase in progress. If not, crew stops without running git there.
 5. **Checks again.** A check that passed before and fails now is a regression, and crew gives Luna a fix task with the failing output (`verify.fix_rounds`, default 1). Checks that already failed before are reported, not counted. Results are tied to the commit they checked, so a resumed run re-checks anything new.
-6. **Finish.** If the plan is done, or needs your review, crew's copy is removed (unless uncommitted changes are left in it, or the branch couldn't be copied into your repo); your repo's branch keeps the work. If the plan is paused (usage limit, interrupt), the copy stays so `crew run` can continue in it. `crew clean` leaves a copy alone while its plan is paused or while it holds commits your repo doesn't have yet; `crew clean --all` removes those too, and says so when it discards commits. Re-running a finished plan does nothing and exits 0 if it's done, 1 if it needs review.
+6. **Finish.** If the plan is done, or needs your review, crew's copy is removed (unless uncommitted changes are left in it, or the branch couldn't be copied into your repo); your repo's branch keeps the work. If the plan is paused (usage limit, interrupt), the copy stays so `crew run` can continue in it. `crew clean` leaves a copy alone while its plan is paused or while it holds commits your repo doesn't have yet; `crew clean --all` removes those too, and says so when it discards commits. Both look at the copies of every project, not only the one you are in, so before `--all` check `crew plans --all` for paused plans elsewhere: their interrupted work goes too. Re-running a finished plan does nothing and exits 0 if it's done, 1 if it needs review.
+
+A task is `pending`, `running`, `done`, `partial`, `blocked`, `failed` or `skipped`. A plan, as `crew plans` shows it, is `done`, `needs-review` or `paused`; `paused` only means a task is still pending or running, so a plan that has never run is `paused` too.
 
 A plain re-run leaves `failed`, `partial` and `blocked` tasks alone. If every available provider hits its usage limit, the run stops with the current task `pending`; re-run later. If you commit on a `crew/...` branch yourself, the next run builds on your commits; if one of them moves a submodule, crew moves that submodule's checkout in its copy to match. If your branch and crew's copy each have commits the other lacks, crew stops and gives you the two git commands that merge them. If you delete a `crew/...` branch and then continue its plan, crew puts the branch back.
 
 To add a dependency, install and commit it on your own branch, then start a new plan. crew never installs from a branch that agents have changed.
+
+## Writing a plan yourself
+
+`crew run <file>` runs a plan you wrote, when you want to decide who does what:
+
+```json
+{
+  "goal": "Move the repeated plotting code into one module",
+  "workdir": "/home/you/code/notebooks",
+  "tasks": [
+    {"id": "t1", "title": "Design the module", "agent": "Astra",
+     "instructions": "Read the notebooks and write DESIGN.md: the functions the module needs and their signatures.",
+     "acceptance": "DESIGN.md exists and lists every function with its signature.", "depends_on": []},
+    {"id": "t2", "title": "Build the module", "agent": "Sol",
+     "instructions": "Implement plotting.py as DESIGN.md describes and use it in the notebooks.",
+     "acceptance": "The checks listed in your prompt still pass.", "depends_on": ["t1"]}
+  ]
+}
+```
+
+- `goal`, `workdir` (an absolute path) and `tasks` are required. Each task needs `id`, `title`, `agent`, `instructions` and `acceptance`; `depends_on` defaults to none.
+- Every agent is shown the plan's `goal`, its own task, the project brief and a short summary (600 characters) of each task it depends on. Anything more that a later task needs must be a file an earlier task leaves in the repository.
+- `crew run <file> --dry-run` checks the file and shows the branch, the setup and check commands, and which provider each task would go to. Nothing runs.
+- crew writes its progress into the file and names the branch after it, so keep it somewhere stable outside the repository and outside `/tmp`. A plan saved outside `~/.crew/plans` (this one, or any saved with `--out`) is not picked up by a bare `crew run` or listed by `crew plans`: name the file every time, `crew run <file>`.
+
+## Hand work to crew from the tool you have open
+
+`crew install` writes one skill, `crew`, for each of these tools it finds on the machine, so you can say "crew: add dark mode to the settings page" in whichever one you are using:
+
+| Tool | Where the skill goes |
+|---|---|
+| Claude Code | `~/.claude/skills/crew/SKILL.md` |
+| Codex | `~/.agents/skills/crew/SKILL.md` |
+| Antigravity (app, IDE and command line) | `~/.gemini/config/skills/crew/SKILL.md` |
+
+It is the same text in all three; `crew skill` prints it. A skill named `crew` that crew didn't write is left alone. The skill tells the tool which crew command fits, to wait for the run, to report what crew printed, and then to read the finished branch itself and say what it would question. That last step is where a third model earns its place: it reviews work that neither it nor its vendor wrote.
+
+Each tool asks before it runs crew, because crew needs the network and writes under `~/.crew`. To stop the question, add one allow rule yourself; crew never changes another tool's permissions:
+
+| Tool | Rule |
+|---|---|
+| Claude Code | `"Bash(crew *)"` under `permissions.allow` in `~/.claude/settings.json` |
+| Codex | `prefix_rule(pattern = ["crew"], decision = "allow")` in `~/.codex/rules/default.rules` |
+| Antigravity | an Allow rule `command(crew)` in its permission settings |
+
+crew refuses to start from inside one of its own tasks, so a worker that has the same skill can't start a second crew.
+
+**Why Antigravity and Gemini are not workers.** A tool does tasks for crew only if crew can switch its sandbox on for that run and prove it works, stop it loading settings, hooks and tool servers from the repository an earlier agent worked in, and read a verdict it can check. Antigravity's command-line tool (1.5) takes its permission settings from your own settings file with no per-run override, has no way to show its sandbox is active, and always loads the project's hooks and tool servers. Gemini CLI (0.68) has the same gaps and no longer serves personal Google accounts. Both were checked against their documentation on 2026-11-13; neither could be run where crew was built. They fit the other end: the place you talk to crew from.
 
 ## Several projects at once
 
@@ -87,7 +142,7 @@ A queue item ends as:
 - `paused`: a usage limit, no provider available, or an interrupt. `crew queue run` picks it up again;
 - `error`: `crew queue run --retry-failed` tries it again.
 
-Only one `crew queue run` can work at a time.
+Only one `crew queue run` can work at a time. `--jobs N` sets how many projects run at once.
 
 ## What crew guarantees, and what it can't
 
@@ -140,7 +195,7 @@ What gets detected:
 - **Static sites:** a check that every relative `href`/`src` points at a file that exists. Flask/Django `templates/` folders don't count as a static site.
 - **Rust, Go,** and `make test` / `make lint`.
 
-`overrides` accepts any key from `~/.crew/config.json`. `agents` replaces the whole crew; other keys merge. `crew config` prints the merged result for the current project. If you add a git remote after `crew init`, crew moves the profile and plans to the new name.
+`overrides` accepts any key from `~/.crew/config.json`. `agents` replaces the whole crew wherever it is set, in `~/.crew/config.json` too, so always list every agent with its `role`; other keys merge. A project's own check and setup commands belong under `project`, as above, not under `overrides`. `crew config` prints the merged result for the current project; `crew usage` shows the targets from `~/.crew/config.json` only. If you add a git remote after `crew init`, crew moves the profile and plans to the new name.
 
 ## How usage is divided
 
@@ -208,4 +263,5 @@ They use fake `claude`/`codex` executables and never call a model. They cover:
 - your own commits on a `crew/...` branch: a submodule update, a commit made while a task was mid-commit, a file that setup also generates, and a kill while crew adopts them;
 - git location variables in crew's environment, a remote added while a plan runs, a second stop signal, and deeply nested or corrupt state files;
 - your own worker flags not dropping the sandbox, and a submodule's `.git` replaced by an agent;
+- the skill `crew install` writes, crew refusing to start inside its own task, a hang-up ignored at start, settings crew doesn't know, and plans kept outside crew's folder;
 - the queue.

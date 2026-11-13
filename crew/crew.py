@@ -46,7 +46,7 @@ except ImportError:  # Windows: thread locks only
 if sys.version_info < (3, 9):
     sys.exit("crew needs Python 3.9 or newer")
 
-VERSION = "3.4"
+VERSION = "3.5"
 HERE = Path(__file__).resolve().parent
 CREW_HOME = Path(os.path.expanduser(os.environ.get("CREW_HOME") or "~/.crew"))
 PROVIDERS = ("claude", "codex")
@@ -318,6 +318,20 @@ def global_config_path() -> Path:
     return CREW_HOME / "config.json"
 
 
+_UNKNOWN_NOTED: set[tuple[str, str]] = set()
+
+
+def _note_unknown_keys(layer: dict, where: str) -> None:
+    """A key crew doesn't know changes nothing, so say so once: a misspelling, or a project's
+    checks put under `overrides`, would otherwise look like a setting that took effect."""
+    for k in sorted(set(layer) - set(DEFAULTS)):
+        if not str(k).startswith("_") and (where, str(k)) not in _UNKNOWN_NOTED:
+            _UNKNOWN_NOTED.add((where, str(k)))
+            hint = " (a project's checks and setup belong under `project` in its profile)" \
+                if k in ("checks", "setup", "notes", "stack") and where.startswith("this project") else ""
+            log(f"note: {where}: crew has no setting named {short(str(k), 40)!r}; it is ignored{hint}")
+
+
 def load_config(explicit: Path | None, overrides: dict | None = None) -> dict:
     """Built-in defaults <- ~/.crew/config.json (or --config) <- project overrides."""
     cfg = copy.deepcopy(DEFAULTS)
@@ -326,10 +340,12 @@ def load_config(explicit: Path | None, overrides: dict | None = None) -> dict:
         layer = _read_json(source)
         if not isinstance(layer, dict):
             raise ValueError(f"config {source}: not a JSON object")
+        _note_unknown_keys(layer, f"config {source}")
         cfg = deep_merge(cfg, layer)
     if overrides:
         if not isinstance(overrides, dict):
             raise ValueError("project overrides must be a JSON object")
+        _note_unknown_keys(overrides, "this project's overrides")
         cfg = deep_merge(cfg, overrides)
     cfg["_path"] = str(source.resolve()) if explicit or source.exists() else ""
     for sec in ("planner", "split", "providers", "verify", "setup", "git"):
@@ -389,7 +405,7 @@ def provider_cfg(cfg: dict, p: str) -> dict:
 
 
 def provider_env(p: str) -> dict:
-    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", CREW_TASK="1")
     for k in FOREIGN_KEYS[p]:
         env.pop(k, None)
     return env
@@ -1383,7 +1399,7 @@ def sandbox_mode(cfg: dict) -> str | None:
 
 
 def run_shell(cfg: dict, command: str, root: Path, timeout: float, *, sandboxed: bool) -> tuple[int, str, float]:
-    env = dict(os.environ, CI="1", PYTHONDONTWRITEBYTECODE="1")
+    env = dict(os.environ, CI="1", PYTHONDONTWRITEBYTECODE="1", CREW_TASK="1")
     for keys in FOREIGN_KEYS.values():
         for k in keys:
             env.pop(k, None)
@@ -3186,6 +3202,26 @@ def list_plans(key: str | None, root: Path | None = None) -> None:
             if isinstance(plan.get("git"), dict) and unpublished(plan["git"]):
                 log(f"              its latest commits are only in crew's copy; `crew run {f}` copies them into your repo")
             shown += 1
+    # Plans kept elsewhere (written by hand, or saved with --out) are known only through the pointer
+    # beside their copy, so they can be listed while that copy exists.
+    inside = (CREW_HOME / "plans").resolve()
+    for pointer in sorted((CREW_HOME / "worktrees").glob("*/*.plan")):
+        named = ""
+        with contextlib.suppress(OSError):
+            named = pointer.read_text(errors="replace").strip()
+        plan = _plan_claiming(named, Path(str(pointer)[:-len(".plan")]))
+        if plan is None or inside in Path(named).resolve().parents:
+            continue
+        if root is not None and Path(str(plan.get("workdir", ""))).resolve() != Path(root).resolve():
+            continue
+        counts = Counter(str(t.get("status", "pending")) for t in plan["tasks"])
+        proj = plan.get("project") if isinstance(plan.get("project"), dict) else {}
+        log(f"{plan_state(plan):<13} {str(proj.get('name', '')):<30} "
+            f"{short(str(plan.get('goal', '')), 50):<50} {named}")
+        log(f"              {', '.join(f'{v} {k}' for k, v in sorted(counts.items()))}; kept outside crew's plans folder")
+        if isinstance(plan.get("git"), dict) and unpublished(plan["git"]):
+            log(f"              its latest commits are only in crew's copy; `crew run {named}` copies them into your repo")
+        shown += 1
     if not shown:
         log("no plans yet")
 
@@ -3254,6 +3290,86 @@ def codex_login(cfg: dict) -> int:
     return r.returncode
 
 
+SKILL_MD = """---
+name: crew
+description: Hand a coding goal to crew, the owner's dispatcher that runs tasks on Claude Code and Codex in sandboxed copies of a repository and splits usage between the two subscriptions. Use it when the owner says "crew" or names Astra, Sol or Luna, asks to plan, queue or split work across tools or repositories, or asks what crew did or why it stopped. Do not use it for a small edit you were asked to make yourself.
+---
+
+# crew
+
+crew is a command-line tool on this machine. It plans a goal into tasks for three agents (Astra the architect, Sol the builder, Luna the verifier), runs each task on Claude Code or Codex inside that tool's sandbox, and keeps usage split between the owner's two subscriptions. It works in its own copy of the repository on a `crew/...` branch and never touches the checkout you are in.
+
+## Before anything else
+
+If your own prompt says you are Astra, Sol or Luna on a crew, you are already inside a crew task. Do not run crew: it refuses, and the work in front of you is yours.
+
+## Handing work to crew
+
+Pick one, say which and why in a line, then run it.
+
+| Situation | Command |
+|---|---|
+| One small change one agent can finish | `crew do '<goal>' --workdir <repo>` |
+| Work with several parts, or design before building | `crew go '<goal>' --workdir <repo>` |
+| The owner wants to read the plan first | `crew plan '<goal>' --workdir <repo>`, then `crew run --workdir <repo>` |
+| The same goal in several repositories | `crew queue add '<goal>' --workdir <repo1> --workdir <repo2>`, then `crew queue run` |
+
+- Always pass `--workdir` with the repository's absolute path.
+- Put the goal in single quotes with no apostrophes. One or two sentences: the outcome, and how to tell it is done.
+- `crew do` goes to Sol. Add `--agent Luna` for tests, docs and review, `--agent Astra` for design or a hard bug.
+- Agents have no network. If the goal needs a package the repository lacks, tell the owner to install and commit it first.
+- A run takes minutes. Start it and wait for it to exit. Do not start a second one for the same repository.
+
+## When it finishes
+
+crew prints the branch it made and two commands, one to review it and one to merge it.
+
+1. Report what happened in crew's own words: `done`, `needs-review` or `paused`, and any warning it printed.
+2. Read the branch's diff with the review command and tell the owner what you would question. You are not the model that wrote it, which is why your reading is worth having.
+3. Do not merge, push or delete the branch unless the owner asks.
+
+## Looking things up
+
+| Question | Command |
+|---|---|
+| Which plans exist here, and their state | `crew plans --workdir <repo>` (`--all` for every project) |
+| Continue a paused plan | `crew run --workdir <repo>`, or `crew run <plan file>` for one in particular |
+| How usage is split | `crew usage` |
+| Whether everything is installed and logged in | `crew doctor` |
+
+## Do not
+
+- Do not do the work yourself as well as, or instead of, crew once the owner has asked for crew.
+- Do not run `crew clean --all` without asking: it discards interrupted work and undelivered commits in every project.
+- Do not log a tool in, change crew's config, or pass flags that turn a sandbox off. If crew says a tool is logged out or a sandbox is missing, tell the owner what it printed.
+"""
+SKILL_MARK = "<!-- installed by crew; `crew install` replaces this file -->"
+# Where each tool that can hand work to crew looks for skills on this machine: (tool, the folder
+# that shows the tool is in use, its skills folder).
+SKILL_HOMES = (("Claude Code", ".claude", ".claude/skills"),
+               ("Codex", ".codex", ".agents/skills"),
+               ("Antigravity", ".gemini", ".gemini/config/skills"))
+
+
+def install_skill(home: Path) -> None:
+    """Give each coding tool found on this machine the same `crew` skill, so work can be handed to
+    crew from whichever one is open. A skill of that name that crew didn't write is left alone."""
+    for tool, marker, where in SKILL_HOMES:
+        if not (home / marker).is_dir():
+            log(f"skill: {tool} not found here ({home / marker}); skipped")
+            continue
+        target = home / where / "crew" / "SKILL.md"
+        try:
+            if target.exists() and SKILL_MARK not in target.read_text(errors="replace"):
+                log(f"skill: kept {target} (not written by crew)")
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(SKILL_MD + "\n" + SKILL_MARK + "\n")
+            log(f"skill: {tool} can now hand work to crew ({target})")
+        except OSError as e:
+            log(f"skill: could not write {target}: {e.strerror or e}")
+
+
 def install() -> int:
     bin_dir = CREW_HOME / "bin"
     bin_dir.mkdir(parents=True, exist_ok=True)
@@ -3270,6 +3386,7 @@ def install() -> int:
         template = HERE / "crew.json"
         cfg_path.write_text(template.read_text() if template.is_file() else json.dumps(DEFAULTS, indent=2))
         log(f"wrote config {cfg_path} (edit it to change agents, models and the split)")
+    install_skill(Path(os.path.expanduser("~")))
     local_bin = Path(os.path.expanduser("~/.local/bin"))
     on_path = [Path(p).expanduser().resolve() for p in os.environ.get("PATH", "").split(os.pathsep) if p]
     if local_bin.resolve() in on_path:
@@ -3299,7 +3416,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--version", action="version", version=f"crew {VERSION}")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("install", help="install crew into ~/.crew/bin and write a global config")
+    sub.add_parser("install", help="install crew into ~/.crew/bin, write a global config, add the crew skill")
+    sub.add_parser("skill", help="print the skill that lets Claude Code, Codex and Antigravity hand work to crew")
     d = sub.add_parser("doctor", help="check CLIs, logins and sandboxes")
     d.add_argument("--workdir", type=Path)
     sub.add_parser("codex-login", help="log Codex in with OPENAI_API_KEY")
@@ -3371,12 +3489,21 @@ def main(argv: list[str] | None = None) -> int:
             raise KeyboardInterrupt
         sys.exit(128 + signum)
     for s in stop_signals:
-        if not (s == signal.SIGINT and signal.getsignal(s) == signal.SIG_IGN):  # e.g. started with nohup or `&`
+        if signal.getsignal(s) != signal.SIG_IGN:  # one that was ignored at start stays ignored: nohup, or `&`
             signal.signal(s, on_stop)
 
+    if os.environ.get("CREW_TASK") and (args.cmd in ("plan", "go", "do", "run")
+                                        or (args.cmd == "queue" and getattr(args, "qcmd", "") == "run")):
+        # A worker has the same skills and instructions as the tool the owner uses, so it may try.
+        log("error: crew can't be started from inside one of its own tasks. If you are one of crew's "
+            "agents, the task in front of you is yours to do.")
+        return 2
     try:
         if args.cmd == "install":
             return install()
+        if args.cmd == "skill":
+            print(SKILL_MD, end="")
+            return 0
         cfg = load_config(args.config)
         init_slots(cfg)
         if args.cmd == "doctor":

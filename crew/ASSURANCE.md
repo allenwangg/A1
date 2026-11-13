@@ -1,7 +1,7 @@
 # crew: rules applied to facts
 
 A record of what crew promises, what was established while building it, and whether each
-promise holds on the evidence. Written on 2026-11-13 for crew 3.1 and updated the same day for 3.2, 3.3 and 3.4. `CLAUDE.md` states the rules
+promise holds on the evidence. Written on 2026-11-13 for crew 3.1 and updated the same day for 3.2, 3.3, 3.4 and 3.5. `CLAUDE.md` states the rules
 for changing crew; `README.md` states the promises to users. This file joins them to the facts.
 
 ## 1. Facts
@@ -20,6 +20,8 @@ owner's projects, and keeps every run on its own branch in its own clone. Branch
 - `codex` 0.166.0, never logged in. `codex sandbox` works without a login and was used for
   real; `codex exec` as a worker was only ever exercised with fake CLIs and a mock server.
 - No macOS or Windows machine was available.
+- Antigravity's command-line tool and Gemini CLI were not available: this session could not run
+  downloaded programs, so everything about them comes from their documentation.
 
 ### The owner's projects
 
@@ -41,7 +43,8 @@ and the test fixtures were built around these shapes.
 | 3.1 | Standalone clone instead of linked worktree, sandbox denies git writes, journaled clone lifecycle, checks tied to the verified commit | 3 hunters + 3 verifiers (the first attempt, 2026-11-06, died on the weekly usage limit; rerun 2026-11-13) | 11 confirmed (10 distinct), 2 refuted; all confirmed fixed in 3.2 |
 | 3.2 | Refused commits delivered on the next run, the user's branch re-read every run, one plan per clone, hashed branch names for `--out` plans, tracked git processes, refusal to run with crew's home in a temp directory | 3 hunters + 3 verifiers, 2026-11-13 | 16 confirmed, 2 refuted; 15 fixed in 3.3 and one fixed in part (see R2 gaps) |
 | 3.3 | Submodule checkouts follow the user's commits, inherited git location variables dropped, the adoption of the user's commits journaled, a vanished clone's losses journaled with the rebuild, plan files moved only under their own lock, `git.owner`, stop signals held during spawn and kill, bounded JSON nesting | none yet | |
-| 3.4 | Every submodule's `.git` checked before crew runs git in its copy; worker flags that keep a worker contained can no longer be dropped by a custom `args` | none yet | |
+| 3.4 | Every submodule's `.git` checked before crew runs git in its copy; worker flags that keep a worker contained can no longer be dropped by a custom `args` | 3 hunters + 3 verifiers, started 2026-11-13 | not finished when 3.5 was cut |
+| 3.5 | The `crew` skill for Claude Code, Codex and Antigravity, written by `crew install`; crew refuses to start inside its own task; a signal ignored at start stays ignored; unknown settings are reported; `crew plans` lists plans kept elsewhere while they have a copy | none yet | |
 
 Counts are the confirmed findings reported at the end of each round; some defects were found
 by more than one reviewer, so the distinct total is somewhat lower than their sum (about 125). Every finding a verifier confirmed was fixed and got
@@ -166,8 +169,15 @@ the detected commands for real inside `codex sandbox` on fixtures of each stack.
   the flags that turn each worker's sandbox on, and a sandboxed agent could replace a
   submodule's `.git` with a repository whose configuration crew's own git commands would obey.
   Both came out of side checks on 2026-11-13, not out of a review of crew's code.
-- **3.3 and 3.4 have not been independently attacked.** Their evidence is the 85 tests. Each of
-  the seven rounds so far found defects in the version before it.
+- **Antigravity and Gemini are not providers, by decision.** The owner asked for them to be
+  connected. Their command-line tools were checked against what law 2 needs from a provider:
+  neither lets crew enforce or prove a sandbox for one run, and neither can be told to ignore
+  hooks and tool servers left in the working directory. They hand work to crew through a skill
+  instead, which needs no trust in their sandboxes. The skill itself is untested in any real
+  tool: it was written from the three vendors' documentation.
+- **3.3, 3.4 and 3.5 have not had a finished independent review.** A review of 3.4 was running
+  when 3.5 was cut. Their evidence is the 91 tests. Each of the seven rounds so far found
+  defects in the version before it.
 - **Untested platforms:** macOS and Windows. Untested provider path: Codex as a worker with a
   real login.
 - **Refuted claims, left as they are:** that `acceptEdits` understates what Claude can do
@@ -213,3 +223,7 @@ the detected commands for real inside `codex sandbox` on fixtures of each stack.
 - A name derived from a path (a lock, a pid file) breaks when the file is moved by someone else.
 - A list of flags the user can replace is not a safeguard: add what is missing every time.
 - Whatever tells git where a repository is, and sits in the working tree, belongs to the agent.
+- A tool joins the crew only if its containment can be switched on and proven for each run;
+  otherwise it can still be the place work is handed over from.
+- A worker inherits the user's own skills and instructions, so anything those tell a tool to
+  do, a worker may try: crew must refuse itself.

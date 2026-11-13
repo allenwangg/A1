@@ -70,6 +70,11 @@ def work(prompt):
         subprocess.run(["git", "checkout", "-q", "-b", "rogue"], check=False)
     if os.environ.get("FAKE_BREAK") == tid:
         Path("broken").write_text("x")
+    if os.environ.get("FAKE_NESTED") == tid:
+        import subprocess
+        r = subprocess.run([sys.executable, os.environ["FAKE_NESTED_CREW"], "--config", os.environ["FAKE_NESTED_CFG"],
+                            "do", "inner goal", "--workdir", os.getcwd()], capture_output=True, text=True)
+        Path(os.environ["FAKE_NESTED_OUT"]).write_text(f"{r.returncode}\n{r.stdout}{r.stderr}")
     if os.environ.get("FAKE_SUBGIT") == tid:
         import subprocess
         os.remove("lib/.git")  # the submodule's one-line git file ...
@@ -161,8 +166,8 @@ class CrewTest(unittest.TestCase):
         self.env = dict(os.environ, CREW_HOME=str(self.home), FAKE_LOG=str(self.log), CREW_ALLOW_TEMP_HOME="1",
                         GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t",
                         GIT_COMMITTER_EMAIL="t@t")
-        for k in ("ANTHROPIC_API_KEY", "CODEX_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"):
-            self.env.pop(k, None)
+        for k in ("ANTHROPIC_API_KEY", "CODEX_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "CREW_TASK"):
+            self.env.pop(k, None)  # CREW_TASK: this suite may itself be running as a check inside a crew task
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -1513,6 +1518,41 @@ class TestContainment(CrewTest):
         self.assertEqual(len(self.workers()), n)  # and before any agent starts
 
 
+class TestSayWhatIsIgnored(CrewTest):
+    """Settings that change nothing, and plans crew can't find, are said out loud (crew 3.5)."""
+
+    def test_unknown_config_keys_are_reported(self):
+        root = self.repo()
+        self.crew("init", "--workdir", str(root))
+        key, _ = crew.project_identity(root)
+        path = self.home / "projects" / f"{key}.json"
+        prof = json.loads(path.read_text())
+        prof["overrides"] = {"checks": {"test": "false"}, "split": {"mode": "fixed"}}
+        path.write_text(json.dumps(prof))
+        r = self.crew("config", "--workdir", str(root))
+        self.assertIn("no setting named 'checks'", r.stdout)
+        self.assertIn("belong under `project`", r.stdout)
+        self.assertNotIn("'split'", r.stdout)  # a real key is not reported
+        self.write_cfg({"splt": {"mode": "fixed"}, "_comment": "mine"})
+        r = self.crew("usage")
+        self.assertIn("no setting named 'splt'", r.stdout)
+        self.assertNotIn("_comment", r.stdout)
+
+    def test_plans_lists_a_plan_kept_elsewhere_while_it_has_a_copy(self):
+        root = self.repo()
+        out = self.tmp / "mine" / "p.json"
+        self.crew("go", "x", "--workdir", str(root), "--out", str(out), env={"CREW_CRASH_AT": "before-commit"},
+                  check=False)  # paused, its copy kept
+        for args in (("plans", "--workdir", str(root)), ("plans", "--all")):
+            r = self.crew(*args)
+            self.assertIn(str(out.resolve()), r.stdout, args)
+            self.assertIn("kept outside crew's plans folder", r.stdout)
+        other = self.repo("other")
+        self.assertNotIn(str(out.resolve()), self.crew("plans", "--workdir", str(other)).stdout)
+        self.crew("run", str(out))  # finishes; the copy and its pointer go
+        self.assertNotIn(str(out.resolve()), self.crew("plans", "--all").stdout)
+
+
 class TestQueue(CrewTest):
     def test_two_projects_run_in_parallel_on_both_providers(self):
         a, b = self.repo("alpha"), self.repo("beta")
@@ -1545,6 +1585,72 @@ class TestInstall(CrewTest):
         self.assertIn("PATH", r.stdout)
         r = subprocess.run([str(self.home / "bin" / "crew"), "--version"], env=env, capture_output=True, text=True)
         self.assertIn(crew.VERSION, r.stdout)
+
+    def test_install_gives_each_tool_it_finds_the_crew_skill(self):
+        home = self.tmp / "userhome"
+        for d in (".claude", ".gemini"):  # Claude Code and Antigravity are in use here; Codex is not
+            (home / d).mkdir(parents=True)
+        mine = home / ".claude" / "skills" / "crew" / "SKILL.md"
+        env = dict(self.env, HOME=str(home), PATH="/usr/bin:/bin")
+        r = subprocess.run([sys.executable, str(HERE / "crew.py"), "install"], env=env, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        for where in (".claude/skills", ".gemini/config/skills"):
+            text = (home / where / "crew" / "SKILL.md").read_text()
+            self.assertTrue(text.startswith("---\nname: crew\ndescription: "))
+            self.assertIn("crew go '<goal>' --workdir <repo>", text)
+        self.assertFalse((home / ".agents").exists())  # nothing written for a tool that isn't there
+        self.assertIn("Codex not found", r.stdout)
+        mine.write_text("my own skill\n")  # a skill of that name crew didn't write is never replaced
+        r = subprocess.run([sys.executable, str(HERE / "crew.py"), "install"], env=env, capture_output=True, text=True)
+        self.assertEqual(mine.read_text(), "my own skill\n")
+        self.assertIn("not written by crew", r.stdout)
+
+    def test_the_skill_fits_every_tool_that_reads_it(self):
+        head, _, body = crew.SKILL_MD.partition("\n---\n")
+        fields = dict(line.split(": ", 1) for line in head.splitlines()[1:])
+        self.assertEqual(sorted(fields), ["description", "name"])  # only what all three tools accept
+        self.assertEqual(fields["name"], "crew")  # must match the folder name
+        self.assertLessEqual(len(fields["description"]), 1024)
+        r = self.crew("skill")
+        self.assertEqual(r.stdout, crew.SKILL_MD)
+        known = self.crew("--help").stdout  # every command the skill names exists
+        for cmd in ("do", "go", "plan", "run", "queue", "plans", "usage", "doctor", "clean"):
+            self.assertIn(f"crew {cmd}", body)
+            self.assertIn(cmd, known)
+
+    def test_a_hang_up_ignored_at_start_stays_ignored(self):
+        import signal
+        root = self.repo()
+        run = subprocess.Popen(  # what `nohup crew ...` does: SIGHUP is already ignored when crew starts
+            [sys.executable, str(HERE / "crew.py"), "--config", str(self.cfg), "do", "x", "--workdir", str(root)],
+            env={**self.env, "FAKE_SLEEP": "3"}, stdout=subprocess.PIPE, text=True,
+            preexec_fn=lambda: signal.signal(signal.SIGHUP, signal.SIG_IGN))
+        try:
+            for _ in range(200):
+                if [c for c in self.calls() if "argv" in c]:
+                    break
+                time.sleep(0.1)
+            run.send_signal(signal.SIGHUP)  # the terminal closes
+            out, _ = run.communicate(timeout=60)
+        finally:
+            if run.poll() is None:
+                run.kill()
+        self.assertEqual(run.returncode, 0, out)  # crew carried on and finished
+        self.assertEqual(self.latest_plan(root)["tasks"][0]["status"], "done")
+
+    def test_crew_refuses_to_start_inside_its_own_task(self):
+        root = self.repo()
+        out = self.tmp / "nested.txt"
+        r = self.crew("do", "x", "--workdir", str(root),
+                      env={"FAKE_NESTED": "t1", "FAKE_NESTED_CREW": str(HERE / "crew.py"),
+                           "FAKE_NESTED_CFG": str(self.cfg), "FAKE_NESTED_OUT": str(out)})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)  # the outer task itself is fine
+        code, _, said = out.read_text().partition("\n")
+        self.assertEqual(code, "2")
+        self.assertIn("can't be started from inside one of its own tasks", said)
+        self.assertEqual(len([c for c in self.calls() if "argv" in c]), 1)  # the inner crew called no model
+        key, _ = crew.project_identity(root)
+        self.assertEqual(len(list((self.home / "plans" / key).glob("*.json"))), 1)  # and wrote no plan
 
 
 if __name__ == "__main__":
