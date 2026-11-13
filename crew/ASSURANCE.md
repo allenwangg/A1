@@ -33,15 +33,15 @@ and the test fixtures were built around these shapes.
 
 | Version | What changed | Review round | Outcome |
 |---|---|---|---|
-| 1.0 | Planner, three agents, two providers, usage split, cooldowns | 4 reviewers + 4 verifiers | ~23 confirmed defects, all fixed |
-| 1.1 | Sandboxed Claude workers, read-only planner, user settings only | 2 reviewers + 2 verifiers | ~14 confirmed, all fixed |
-| 2.0 | Global install, per-project profiles, detected setup/checks, branch per run, queue across projects | 4 + 4 | ~28 confirmed, all fixed |
-| 2.1 | Locks, CLI contract check, journaled task state, `crew do` | fault-injection hunt, 4 + 4 | ~35 confirmed, all fixed |
-| 3.0 | Separate worktree per plan, journaled commits, orphan reaping, setup only on base commit | 4 + 4 | ~29 confirmed, all fixed |
+| 1.0 | Planner, three agents, two providers, usage split, cooldowns | 4 reviewers + 4 verifiers | 13 confirmed defects, all fixed |
+| 1.1 | Sandboxed Claude workers, read-only planner, user settings only | 2 reviewers + 2 verifiers | 10 confirmed, all fixed |
+| 2.0 | Global install, per-project profiles, detected setup/checks, branch per run, queue across projects | 4 + 4 | 21 confirmed, all fixed |
+| 2.1 | Locks, CLI contract check, journaled task state, `crew do` | fault-injection hunt, 4 + 4 | 30 confirmed, all fixed |
+| 3.0 | Separate worktree per plan, journaled commits, orphan reaping, setup only on base commit | 4 + 4 | about 25 confirmed, all fixed |
 | 3.1 | Standalone clone instead of linked worktree, sandbox denies git writes, journaled clone lifecycle, checks tied to the verified commit | 3 hunters | **did not run**: weekly usage limit; relaunched 2026-11-13 |
 
-Counts are confirmed findings per round; several defects were reported by more than one
-reviewer, so the distinct total is lower. Every finding a verifier confirmed was fixed and got
+Counts are the confirmed findings reported at the end of each round; some defects were found
+by more than one reviewer, so the distinct total is somewhat lower than their sum (about 100). Every finding a verifier confirmed was fixed and got
 a test. Findings the verifiers refuted were left alone, and are listed in section 4.
 
 ### Real runs (Claude haiku workers, Codex sandbox for checks)
