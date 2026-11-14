@@ -2,7 +2,7 @@
 
 crew (`crew.py`) drives the `claude` and `codex` CLIs across the owner's projects. It is one
 stdlib-only Python file plus `crew.json` (a copy of `DEFAULTS`), `README.md` and `test_crew.py`.
-These rules come from ten rounds of adversarial review; each one records a defect that was
+These rules come from eleven rounds of adversarial review; each one records a defect that was
 found and fixed. Do not relax them for convenience. `ASSURANCE.md` holds the evidence.
 
 ## Laws: invariants every change must keep
@@ -14,6 +14,9 @@ found and fixed. Do not relax them for convenience. `ASSURANCE.md` holds the evi
    checkout and never in a linked worktree: Claude's sandbox can write a linked worktree's
    shared `.git`. Claude workers get `sandbox.filesystem.denyWrite` for the clone's `.git` and
    the user's repo root; Codex's `workspace-write` keeps `.git` read-only on its own.
+   In the user's checkout crew's `git status` runs with `--no-optional-locks` (`tracked_dirty`): a plain one
+   takes `.git/index.lock` to write back refreshed stat data, and a stop that kills git meanwhile
+   (`subprocess.run` answers SystemExit with SIGKILL) leaves the lock, which blocks the user's own git.
    The branch in the user's repo is the user's to move or delete: read it fresh on every run
    (`rb`), correct `git.published` from it, and compare ancestry inside the clone, which holds
    both sides once fetched. The user's repo doesn't have crew's commits until they are published.
@@ -74,11 +77,25 @@ found and fixed. Do not relax them for convenience. `ASSURANCE.md` holds the evi
    `args`: Codex's sub-agent tools (on by default) resume any session saved in
    `~/.codex`, the owner's own included, and Codex itself writes what they send into that
    session's history, outside the sandbox, as a user turn. `--disable` wins over an `--enable`
-   anywhere on the line and over config.toml; `-c features.multi_agent=false` does not. A feature
-   name the CLI doesn't know fails the call, so `CONTRACT` asks `codex features list` for it.
+   anywhere on the line and over config.toml; `-c features.multi_agent=false` does not. It gets
+   `--disable multi_agent_v2` too: the second version's `collaboration` tools are off by default,
+   but the owner's own config.toml turns them on, and the README says the sub-agent tools are off
+   whatever the owner's settings say. A feature name the CLI doesn't know fails the call, so
+   `CONTRACT` asks `codex features list` for each.
+   The owner's own hooks and tool servers are off too: each CLI runs them itself, outside the sandbox,
+   in the directory it works in. A formatter hook (`npx prettier --write`) ran what a worker left in
+   the clone's `node_modules`, a server started with `npx -y <package>` ran a package a worker left
+   there, without `CREW_TASK`, and the planner's formatter hook rewrote the user's checkout. Every
+   Claude call's `--settings` gets `disableAllHooks: true`, forced (`_no_hooks()`; hooks come from the
+   owner's settings, plugins and a `--settings` in `args`). Every `codex exec` gets `--disable hooks`
+   and `-c mcp_servers.<name>.enabled=false` for each server `codex mcp list --json` names
+   (`_codex_mcp_off()`). `-c mcp_servers={}` doesn't clear the table and a `-c` for a server Codex
+   doesn't have fails the call, so the list is made in the call's own directory with its `-c`/`-p`
+   flags and crew's (a trusted project's servers are listed only inside it). A list crew can't read,
+   or a name `-c` can't address (it splits at every dot), means Codex is not run.
    The planner is read-only: Claude `--permission-mode plan --tools Read,Grep,Glob`, Codex
-   `--sandbox read-only`. Every Claude call uses `--setting-sources user` so repo settings
-   (hooks, `defaultMode`, allow rules) are ignored.
+   `--sandbox read-only`, and neither runs the owner's hooks. Every Claude call uses
+   `--setting-sources user` so repo settings (hooks, `defaultMode`, allow rules) are ignored.
    A Claude worker is offered only `CLAUDE_WORKER_TOOLS` (`--tools`, plus Bash when granted), and
    every Claude call gets `--strict-mcp-config`. Much of the CLI's default set works outside the
    sandbox, in the CLI's own process: Agent (`isolation: "worktree"`) and EnterWorktree run
@@ -95,10 +112,13 @@ found and fixed. Do not relax them for convenience. `ASSURANCE.md` holds the evi
    `safe.directory` and hosted git settings.
 3. **Journal before you act.** Any step that changes a repo or a clone is written to the plan
    file first: `git.creating`, `task.untracked_before`, `task.status = running`,
-   `task.committing`, `git.adopting`, `git.adopting_clear`, `git.adopting_gone`, `git.sync_submodules`,
-   `git.sync_started`, `git.removing`. `_reconcile()`
-   finishes or undoes what a crash cut off. A fact the resume depends on is saved in the same
-   write as the step that creates it: when the clone has vanished, the tasks that lost
+   `task.committing`, `git.adopting`, `git.adopting_clear`, `git.adopting_gone`, `git.adopting_present`,
+   `git.sync_submodules`, `git.sync_started`, `git.removing` (by `finish()`, and by `clean()` under the plan's lock).
+   `_reconcile()` finishes or undoes what a crash cut off. rmtree takes a folder's files before its
+   subfolders: a removal cut short leaves `.git` with tracked files gone around it, and a run that
+   resumed there committed them as deleted. A copy that was being removed loses its tasks'
+   uncommitted work like one that vanished, so `_prepare_worktree` resets those tasks for `removing`
+   too. A fact the resume depends on is saved in the same write as the step that creates it: when the clone has vanished, the tasks that lost
    uncommitted work are reset in the save that sets `git.creating`, and `_adopted()` moves
    `git.tip` and every `task.committing` marker together.
    A step git can leave half done needs a way back that can't touch a task's work. Before the
@@ -110,7 +130,14 @@ found and fixed. Do not relax them for convenience. `ASSURANCE.md` holds the evi
    file that is missing from the working tree counts as up to date for git: where the user's
    commits change one, crew refuses the merge as a collision, and where they delete it too, it
    is journaled (`git.adopting_gone`) and the undo leaves it deleted. And git lets a merge write
-   over ignored files, so the undo never removes a file git ignores.
+   over ignored files: what stands at the paths the merge adds is journaled in the same save as
+   `adopting_clear` (`git.adopting_present`; only ignored files pass git's test), and the undo
+   leaves those and removes everything else there, ignored or not. Left in place, a file the merge
+   wrote at an ignored path became a task's work once your commit or the task stopped ignoring it.
+   A journal without `adopting_present` comes from an older crew: the undo then leaves any file git
+   ignores at an added path, as 3.8 and 3.9 did. 3.6 and 3.7 ran git's test alone, so in their
+   journal a missing tracked file that the merge changes may be a task's deletion: the undo leaves
+   it missing, and the next attempt refuses the merge as a collision and names it.
    `_sync_submodules(journal=True)` records the clean checkouts it is about to move
    (`git.sync_started`), so a move that was cut short is forced through, and a checkout an agent
    edited never is. Clean means no tracked change and no untracked file but generated ones: git
@@ -128,7 +155,9 @@ found and fixed. Do not relax them for convenience. `ASSURANCE.md` holds the evi
    without running git. Files inside a submodule's folder are another repository's, and git in
    the clone never lists them: `_inside_submodules()` does (snapshot key `inside`,
    `git.inside_base` after setup). A task that leaves new ones is marked partial and the clone
-   is kept; unseen, they went with the clone while the task was called done.
+   is kept; unseen, they went with the clone while the task was called done. A commit that
+   `_reconcile()` recovers goes through the same accounting as one `_commit_task()` makes
+   (`_committed()`): a stop between `git commit` and that accounting made a partial task done.
 5. **Nothing is "done" without evidence.** Task status comes from the agent's structured
    verdict (`WORKER_SCHEMA`); a CLI exit 0 is not success. Plan state is `done` only if every
    task is done, no check regressed on the verified tip (`checks.final_tip`), and setup
@@ -137,18 +166,28 @@ found and fixed. Do not relax them for convenience. `ASSURANCE.md` holds the evi
    stopped while they ran) is `paused`, never `done`. Without git `final_tip` is None before and
    after, so the results themselves must be there, and they are dropped in the save that starts a
    task in place. Checks that ran before the work and can't be run after it are recorded
-   (`checks.skipped`) and said, not passed over in silence.
+   (`checks.skipped`) and said, not passed over in silence. The baseline is taken only before any
+   task has started. Checks that couldn't run then (none in the profile, verification off, no
+   sandbox) get an empty `checks.baseline` once a task has run, so every check that fails counts:
+   run on the plan's own work, the baseline called what that work broke "already failing".
    A run that loses its output stops its agents and exits 128 + SIGPIPE. `log()` raises `OutputLost`
    for every way a write can fail (a closed pipe, a terminal that is gone, a full disk). Only a
    listing whose reader left exits 0; a command that changes something (`queue add`, `init`) never
-   does, and it changes state before it announces it. A line printed while crew is stopping or
+   does, and it changes state before it announces it. `OutputLost` is an `OSError`: a `log()` inside
+   a `try` that catches `OSError` hides the lost output and lets the caller go on as if the line had
+   been read (`_where_plan_is` did, and `queue run` pointed a paused item at no file and planned it
+   again). A line printed while crew is stopping or
    reporting an error goes through `say()`: if it can't be printed, the stop, its exit code and the
    queue's bookkeeping must still happen (Ctrl-C on `crew ... | tee log` stops tee too).
 6. **One writer at a time.** `file_lock()` (fcntl + thread lock) guards each plan run, `queue
    run`, the queue, state, ledger, profiles and pid files. Writes go through `_write_json`
    (tmp + fsync + rename). `reap_orphans()` kills CLIs a dead crew left behind, matched by pid
-   and start time. Each clone belongs to one plan file, named by `<clone>.plan`:
-   `_claim_copy()` writes it on every run and refuses a clone another live plan owns; `clean`
+   and start time. A plan run records its children in the plan's pid file; what is started outside one (the
+   planner, the probes) goes in the crew process's own, `locks/crew-<pid>-<start>.pids` (`process_pidfile()`),
+   and `plan`, `go`, `do`, `run` and `queue run` reap those of crews that are gone (`reap_dead_crews()`).
+   `new_plan_path` hands a name out once per process: `queue run` picks each item's file before its planner
+   runs, in parallel threads, and two checkouts of one remote can share a plans folder by then.
+   Each clone belongs to one plan file, named by `<clone>.plan`: `_claim_copy()` writes it on every run and refuses a clone another live plan owns; `clean`
    reads it first to find a clone's plan. The plan also records its own path as `git.owner`, so
    a copied plan file is refused after the pointer is gone. Plans outside `~/.crew/plans` get a
    path hash in their branch name (`_branch_name`). A plan's lock and pid file are named after
@@ -165,22 +204,30 @@ found and fixed. Do not relax them for convenience. `ASSURANCE.md` holds the evi
    path and never by inode: a folder that was moved with a link left behind is the same plan,
    a hard link is still a copy. A path is not a repository either: a plan under another name is
    a checkout's only if the repository has the commit it records (`other_repository`), and a
-   profile is carried to a new name only then (`first_commit`, else the path's plans). A profile
-   shared by several checkouts lists them in `roots`. `queue run` groups items by checkout (same
+   profile is carried to a new name only then (`first_commit`, else the path's plans).
+   `_migrate_key` asks the same before it moves a path-named profile or plan to a remote's name (a
+   project without a remote and the one with a remote that replaced it share the path's name), and
+   `queue run` refuses an item's plan that the repository at its folder has none of the commits of.
+   A profile shared by several checkouts lists them in `roots`, and `crew init --force` keeps them.
+   A checkout's own profile at a name `origin` comes back to is older than the copy crew made under
+   the name in between: `_newer_copy_of_checkout` copies that one back if it was changed since,
+   as `_migrate_key` does when `origin` is added back after being removed. `queue run` groups items by checkout (same
    key or same workdir), and follows a moved plan with `_where_plan_is` like `main()` does.
 7. **Nothing read from disk or a CLI is trusted.** Validate types (`num()`, `load_config`,
    `load_profile`, `validate_plan`, the plan `git` block), reject control characters in task
    fields, decode subprocess output with `errors="surrogateescape"` (git) or `"replace"`, treat
    a reply crew can't parse as a failed attempt (never a traceback), and detect usage limits
    only from the provider's own error message (`LIMIT_RE`), never from raw stdout. `_read_json`
-   is the only reader of crew's files and bounds their nesting (`MAX_JSON_DEPTH`), because
+   is the only reader of crew's files, names the file in every error `json.loads` raises (an integer
+   of more than 4300 digits is a plain `ValueError` that names none) and bounds their nesting (`MAX_JSON_DEPTH`), because
    `deepcopy` and `json.dumps` overflow on depth that `json.loads` accepts. Pointer and pid
    files are read with `errors="replace"` and checked before use. Valid JSON is not valid
    input: `num()` takes finite numbers only (`1e999`, `NaN` and an integer too large for a
-   float all parse), timeouts are capped (`MAX_TIMEOUT_SEC`), a switch is a JSON boolean (the
+   float all parse), timeouts are capped (`MAX_TIMEOUT_SEC`) and positive (zero killed every check before and after
+   the work, so a check an agent broke counted as already failing), a switch is a JSON boolean (the
    string `"false"` is true to Python), what crew itself records in a
    plan (`commit`, `committing`, `untracked_before`, `git.tip`, `git.untracked_base`) is
-   type-checked when the plan is loaded, and a queue item needs an absolute `workdir`.
+   type-checked when the plan is loaded, and a queue item needs an absolute `workdir`, and an absolute `plan` when it names one.
    So does a plan (`plan_workdir`), and a profile's `root`. A plan's `workdir` must also be the
    top folder of its repository (`git clone` of a folder inside one fails). A switch is a
    boolean and nothing else: settings are read by truth value and `"false"` is a true string,
@@ -270,7 +317,8 @@ A provider runs agent-written code, so adding one is a change to law 2. It needs
 - a sandbox crew switches on for that run, that keeps writes inside the working directory, keeps
   `.git` read-only and has no network, and a probe that proves it works before crew trusts it;
 - a way to load only the user's own configuration, because the working directory is a clone an
-  earlier agent may have left hooks, tool servers or settings in;
+  earlier agent may have left hooks, tool servers or settings in, and a way to turn off the user's
+  own hooks and tool servers for the run, because the tool runs them outside its sandbox there;
 - a login check that starts no session, and a usage-limit error crew can recognise.
 
 Antigravity's `agy` 1.5 and Gemini CLI 0.68 were checked against this from their documentation
@@ -314,8 +362,12 @@ Claude Code, Codex and Antigravity have in common.
   submodules are untested: one whose checkout is cut after its parent's finished, one that
   fails to initialise inside one that did, one the user adds mid-plan. No real sandboxed worker
   was used to make the swap.
-- A file the stopped adoption merge wrote at a path git ignores stays in the clone after the
-  undo. git never lists it, so it is never committed, and a repeated merge writes over it.
+- An ignored file that stood at a path the adoption merge adds may have been written over by
+  the merge before it was stopped; the undo leaves what is there (git can't bring the old one
+  back). An adoption journaled by an older crew (no `git.adopting_present`) is undone as 3.9 did
+  it: what its merge wrote at an ignored path stays. One that 3.6 or 3.7 started, where your
+  commits and a waiting task both deleted a file and you then take your commits back, gets that
+  file back.
 - The `crew` skill was written from each tool's documentation. No tool has been watched loading
   it or handing work to crew through it.
 - Reads. Both sandboxes limit writes and the network, not reads. A Codex worker and a check can
@@ -330,3 +382,7 @@ Claude Code, Codex and Antigravity have in common.
   change of `origin` it is copied to whatever repository is at that path, with a note. Plans in
   the folder of the checkout's current name are not compared at all, as before 3.7.
 - The `tokens` metric is approximate: the two CLIs count differently.
+- Hooks were turned off and tried with the real CLIs from the owner's Claude settings, a `--settings`
+  in `args`, a `--plugin-dir` plugin and the owner's trusted Codex `hooks.json`. Whether
+  `disableAllHooks` also turns off hooks in Claude's managed settings (the machine's policy), and
+  whether `codex mcp list` names the servers a Codex plugin brings, was not tried.

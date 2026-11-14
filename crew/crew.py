@@ -49,7 +49,7 @@ except ImportError:  # Windows: thread locks only
 if sys.version_info < (3, 9):
     sys.exit("crew needs Python 3.9 or newer")
 
-VERSION = "3.9"
+VERSION = "3.10"
 HERE = Path(__file__).resolve().parent
 CREW_HOME = Path(os.path.expanduser(os.environ.get("CREW_HOME") or "~/.crew"))
 PROVIDERS = ("claude", "codex")
@@ -365,6 +365,8 @@ def _read_json(path: Path):
         raise ValueError(f"{path}: invalid JSON ({e})") from None
     except UnicodeDecodeError as e:  # a ValueError too, but one whose own text doesn't say which file
         raise ValueError(f"{path}: not valid {e.encoding} text (byte {e.start}); crew's files are JSON") from None
+    except ValueError as e:  # an integer of more digits than Python converts (4300): its text names no file
+        raise ValueError(f"{path}: invalid JSON ({e})") from None
     except RecursionError:
         raise ValueError(f"{path}: invalid JSON (nested too deeply)") from None
     # Bound nesting here, without recursing, so nothing downstream (deep_merge's deepcopy,
@@ -490,6 +492,10 @@ def load_config(explicit: Path | None, overrides: dict | None = None) -> dict:
     for where, sec in timeouts:
         if num(sec.get("timeout_sec"), 0) > MAX_TIMEOUT_SEC:
             raise ValueError(f"config: {where}.timeout_sec must be at most {MAX_TIMEOUT_SEC} (seconds)")
+        # Nor zero or less: every check was then killed before it started, before the work and after it,
+        # so a check the agent broke counted as one that already failed and the plan was called done.
+        if num(sec.get("timeout_sec"), 1) <= 0:
+            raise ValueError(f"config: {where}.timeout_sec must be a positive number of seconds")
     if cfg["planner"].get("provider", "claude") not in PROVIDERS:
         raise ValueError("config: planner.provider must be claude or codex")
     prefix = cfg["git"].get("branch_prefix", "crew/")
@@ -618,7 +624,11 @@ def resolve_workdir(arg: Path | None) -> Path:
 
 
 def tracked_dirty(root: Path) -> bool:
-    return bool(git(root, "status", "--porcelain", "--untracked-files=no").stdout.strip())
+    # --no-optional-locks: this also runs in your checkout (planned_at), where a plain `git status` takes
+    # .git/index.lock to write back the stat data it refreshed. A SIGTERM to crew while it held the lock
+    # killed git (subprocess.run answers SystemExit with SIGKILL) and left the lock: your next `git add`
+    # or `git commit` failed until you deleted it.
+    return bool(git(root, "--no-optional-locks", "status", "--porcelain", "--untracked-files=no").stdout.strip())
 
 
 def untracked(root: Path) -> set[str]:
@@ -1050,6 +1060,13 @@ def _path_key(root: Path) -> str:
 _MIGRATION_NOTED: set[str] = set()
 
 
+def _describes_another_repository(root: Path, prof: dict) -> bool:
+    """True when a profile that records this path was made for a repository other than the one there now:
+    it holds none of the commits crew recorded for that one (`first_commit`, else the path's plans)."""
+    seen = prof["project"].get("first_commit")
+    return other_repository(root, [seen] if is_sha(seen) else _commits_planned_at(root))
+
+
 def _migrate_key(root: Path, key: str) -> None:
     """A remote was added after `crew init`: move the path-keyed profile and plans to the new key.
     A plan that is running stays put (its lock and pid file are named after its path, and its run
@@ -1060,7 +1077,14 @@ def _migrate_key(root: Path, key: str) -> None:
     moved = running = 0
     aside = None
     with file_lock("profiles"):
-        if profile_path(old).exists():
+        # The path is not the repository. A remote-less project that used to be in this folder has its
+        # profile and plans under the path's name too, and a different repository, with a remote, may sit
+        # here now: moved to its name, they were taken for its own (its setup commands run, the old plan
+        # continued and delivered into it). They stay where they are; _profile_of_checkout says why.
+        was_here = None
+        with contextlib.suppress(ValueError, OSError):
+            was_here = load_profile(old)
+        if profile_path(old).exists() and not (was_here and _describes_another_repository(root, was_here)):
             # A profile already at the new name is this checkout's own when it records this path and no
             # other: `origin` was removed and has come back, and ensure_profile left the old-name profile in
             # place when it copied it. The copy is the one in use since, with whatever was edited since: it wins.
@@ -1083,7 +1107,7 @@ def _migrate_key(root: Path, key: str) -> None:
             plans_dir(key).mkdir(parents=True, exist_ok=True)
             for f in sorted(plans_dir(old).glob("*.json")):
                 dest, lock = plans_dir(key) / f.name, plan_lock_name(f)
-                if dest.exists():
+                if dest.exists() or other_repository(root, _plan_commits(_plan_or_none(f) or {})):
                     continue
                 if lock_held_here(lock):  # this very run: file_lock is re-entrant within a thread
                     running += 1
@@ -1124,12 +1148,38 @@ def _profile_of_checkout(root: Path, key: str) -> tuple[str, dict] | None:
         if not prof or str(root) not in (prof["project"].get("root"), *prof["project"].get("roots", [])):
             continue
         was = str(prof["project"].get("name") or f.stem)
-        seen = prof["project"].get("first_commit")
-        if other_repository(root, [seen] if is_sha(seen) else _commits_planned_at(root)):
+        if _describes_another_repository(root, prof):
             log(f"note: {root} was known to crew as {was}, but the repository there now has none of that "
                 f"project's commits: a different project is in that folder, so the profile {f} is not used for it.")
             continue
         return was, prof
+    return None
+
+
+def _newer_copy_of_checkout(root: Path, key: str, prof: dict) -> tuple[str, dict] | None:
+    """(name, profile) when `prof`, the profile at `key` and this checkout's alone, is older than the copy
+    crew made of it under another name when `origin` changed, and that copy has been changed since: the copy
+    is this checkout's alone too (its `root`, no `roots`) and describes the same repository. None otherwise."""
+    def mtime(f: Path) -> float:
+        with contextlib.suppress(OSError):
+            return f.stat().st_mtime
+        return 0.0
+
+    def settings(p: dict) -> tuple:
+        return ({k: v for k, v in p["project"].items() if k not in ("name", "root", "roots", "key")},
+                p.get("overrides", {}))
+    since = mtime(profile_path(key))
+    for f in sorted(((CREW_HOME / "projects").glob("*.json")), key=mtime, reverse=True):
+        if mtime(f) <= since:
+            break
+        try:
+            other = load_profile(f.stem) if f.stem != key else None
+        except (ValueError, OSError):
+            continue
+        if not other or other["project"].get("root") != str(root) or other["project"].get("roots") \
+                or _describes_another_repository(root, other):
+            continue
+        return None if settings(other) == settings(prof) else (str(other["project"].get("name") or f.stem), other)
     return None
 
 
@@ -1145,6 +1195,19 @@ def ensure_profile(root: Path, *, force: bool = False, quiet: bool = False) -> t
             if str(root) not in prof["project"].get("roots", []):
                 prof["project"]["roots"] = [*prof["project"].get("roots", []), str(root)]
                 _write_json(profile_path(key), prof)
+    elif prof is not None and not prof["project"].get("roots"):
+        # This checkout's own profile, from before `origin` last changed: `origin` has come back to this name.
+        # The copy crew made under the name in between is the one in use since, with whatever was edited
+        # there. As in _migrate_key, that one wins; a profile other checkouts share is left as it is.
+        with file_lock("profiles"):
+            newer = _newer_copy_of_checkout(root, key, prof)
+            if newer is not None:
+                was, prof = newer
+                prof["project"].update(name=name, root=str(root))
+                _write_json(profile_path(key), prof)
+        if newer is not None:
+            log(f"note: {root} was known to crew as {was} until now; the profile it had there was copied to "
+                f"{profile_path(key)}, over the older one from before that name.")
     earlier = None if prof is not None or profile_path(key).exists() else _profile_of_checkout(root, key)
     if earlier is not None and not force:
         # `origin` was renamed, re-pointed or removed, so this checkout has a new name. What was detected
@@ -1160,11 +1223,21 @@ def ensure_profile(root: Path, *, force: bool = False, quiet: bool = False) -> t
             "in that folder now, `crew init --force` detects it afresh.")
     if prof is None:
         raw = earlier[1] if earlier is not None else {}  # --force: detect again, keep the earlier overrides
+        others: list[str] = []
         if profile_path(key).exists():  # keep overrides even if the project section is broken
             with contextlib.suppress(ValueError, OSError):
                 raw = _read_json(profile_path(key))
+                # ... and the other checkouts on record: dropped, one whose `origin` changes later started
+                # with a fresh profile and no word, as if it had never used this one.
+                was = raw.get("project") if isinstance(raw, dict) else None
+                if isinstance(was, dict):
+                    listed = was.get("roots") if isinstance(was.get("roots"), list) else []
+                    others = list(dict.fromkeys(r for r in [was.get("root"), *listed]
+                                                if isinstance(r, str) and os.path.isabs(r) and r != str(root)))
         overrides = raw.get("overrides") if isinstance(raw, dict) and isinstance(raw.get("overrides"), dict) else {}
         prof = {"project": detect_project(root, name), "overrides": overrides}
+        if others:
+            prof["project"]["roots"] = others
         with file_lock("profiles"):
             _write_json(profile_path(key), prof)
         if not quiet:
@@ -1346,8 +1419,11 @@ CONTRACT = {
                                     "--skip-git-repo-check", "--cd", "--model", "--ignore-rules", "--config",
                                     "--disable"]),
               # `--disable` of a feature the CLI doesn't know fails every call. The name is followed by the
-              # padding of the table, which tells it from `multi_agent_v2`.
-              (["features", "list"], ["multi_agent "])],
+              # padding of the table, which tells it from `multi_agent_v2`, listed as well; `hooks` also starts a
+              # line, which tells it from `plugin_hooks`.
+              (["features", "list"], ["multi_agent ", "multi_agent_v2 ", "\nhooks "]),
+              # The MCP servers Codex would start, so that each can be turned off (`_codex_mcp_off`).
+              (["mcp", "list", "--help"], ["--json"])],
     "codex-sandbox": [(["sandbox", "--help"], ["--permission-profile", "--config"])],
 }
 _CONTRACT_CACHE: dict[str, str] = {}
@@ -1363,7 +1439,7 @@ def contract_problem(cfg: dict, which: str) -> str:
         for args, needles in CONTRACT[which]:
             try:
                 _, out, err = _probe([cmd, *args], provider_env(p))
-                text = out + err
+                text = "\n" + out + err
             except (OSError, subprocess.TimeoutExpired) as e:
                 problem = f"`{os.path.basename(cmd)} {' '.join(args)}` failed: {e}"
                 break
@@ -1535,8 +1611,60 @@ def _proc_start(pid: int) -> str:
         return ""
 
 
+PROCESS_PIDS: Path | None = None  # set by main(): this crew's own pid file (see _pidfile)
+
+
 def _pidfile() -> Path | None:
-    return getattr(_TL, "pidfile", None)
+    # A plan run records its children next to the plan's lock. What is started outside one (the planner of
+    # `plan`, `go` and `queue run`, the login and sandbox probes) goes in this crew's own file: recorded
+    # nowhere, a planner outlived a crew killed with SIGKILL, and every run after it, until it finished.
+    return getattr(_TL, "pidfile", None) or PROCESS_PIDS
+
+
+def _start_tag(started: str) -> str:
+    return hashlib.sha1(started.encode()).hexdigest()[:8]
+
+
+def process_pidfile() -> Path | None:
+    """locks/crew-<pid>-<start>.pids: named after this process and its start time, so a later crew can tell
+    whether the crew that wrote it is still running."""
+    started = _proc_start(os.getpid())
+    return CREW_HOME / "locks" / f"crew-{os.getpid()}-{_start_tag(started)}.pids" if started else None
+
+
+def reap_dead_crews() -> None:
+    """Stop what crews that are gone started outside a plan run, as run_plan does for a plan's pid file."""
+    if os.name == "nt" or (in_temp_dir(CREW_HOME) and not os.environ.get("CREW_ALLOW_TEMP_HOME")):
+        return  # a pid file where agents' sandboxes can write is not crew's own record (require_safe_home)
+    for pf in sorted((CREW_HOME / "locks").glob("crew-*.pids")):
+        m = re.fullmatch(r"crew-(\d+)-([0-9a-f]{8})\.pids", pf.name)
+        if not m or pf == PROCESS_PIDS:
+            continue
+        try:
+            os.kill(int(m.group(1)), 0)
+            alive = True
+        except ProcessLookupError:
+            alive = False
+        except OSError:
+            alive = True
+        if alive:
+            started = _proc_start(int(m.group(1)))
+            if not started or _start_tag(started) == m.group(2):
+                continue  # that crew is still running (or `ps` can't tell): what it started is its own
+        with contextlib.suppress(FileNotFoundError):  # another crew starting now got there first
+            reap_orphans(pf)
+        with contextlib.suppress(OSError), file_lock("pids"):
+            pf.unlink()
+
+
+def _drop_process_pidfile() -> None:
+    """At exit: this crew's own pid file goes once nothing it started is left on record."""
+    pf = PROCESS_PIDS
+    if pf is None or not pf.exists():
+        return
+    with contextlib.suppress(OSError), file_lock("pids"):
+        if not pf.read_text(errors="replace").strip():
+            pf.unlink()
 
 
 def _register_child(pid: int) -> None:
@@ -1651,7 +1779,8 @@ def _exec(cmd: list[str], stdin_text: str | bytes, cwd: Path, timeout: float,
     return rc, dec(out), dec(err), time.time() - t0
 
 
-def _probe(cmd: list[str], env: dict | None = None, timeout: float = 60, stdin_text: str = "") -> tuple[int, str, str]:
+def _probe(cmd: list[str], env: dict | None = None, timeout: float = 60, stdin_text: str = "",
+           cwd: Path | None = None) -> tuple[int, str, str]:
     """Run one of crew's short helper commands (a login check, `--help`, a sandbox test) and return
     (exit code, stdout, stderr). It goes through _exec like every other child: in its own session, on
     record, killed as a tree, and stopped with crew. `queue run` makes these calls in worker threads,
@@ -1659,7 +1788,7 @@ def _probe(cmd: list[str], env: dict | None = None, timeout: float = 60, stdin_t
     each if a CLI hung, before it stopped. Raises OSError if the command can't be started and
     subprocess.TimeoutExpired if it takes longer than `timeout`, as subprocess.run would."""
     try:
-        cwd = Path.cwd()
+        cwd = cwd or Path.cwd()
     except OSError:  # the directory crew was started in has been deleted
         cwd = Path(os.sep)
     rc, out, err, _ = _exec(cmd, stdin_text, cwd, timeout, dict(os.environ) if env is None else env)
@@ -1798,6 +1927,16 @@ def _hide_codex_login(data: dict) -> None:
     perms["deny"] = list(dict.fromkeys([*kept, *(f"Read(/{p}/**)" for p in _codex_home())]))  # //: an absolute path
 
 
+def _no_hooks(data: dict) -> None:
+    """Turn off every hook a Claude call would run, in the settings crew passes it (law 2). Hooks come from the
+    owner's ~/.claude/settings.json, from installed plugins and from a --settings in `args`, and the CLI runs
+    them itself, outside the sandbox, in the directory it works in: a formatter hook such as
+    `npx prettier --write` runs whatever an agent left in crew's copy's node_modules, a Stop hook running
+    `npm test` runs the scripts an agent edited, and in the planner a formatter rewrites the user's checkout.
+    Forced, not defaulted: a hook in `args` is the same door."""
+    data["disableAllHooks"] = True
+
+
 def _claude_worker_args(args: list[str], deny: list[str]) -> tuple[list[str], bool, set[str] | None]:
     """The worker flags for Claude: crew's `--settings`, then the configured `args`. `args` exists to
     add flags, so a config that sets it must not lose the permission mode, the sandbox or the write
@@ -1858,6 +1997,7 @@ def _claude_worker_args(args: list[str], deny: list[str]) -> tuple[list[str], bo
     # The other provider's stored login stays out of this worker's reach (law 10): the sandbox limits
     # writes, not reads, and whatever a worker reads goes to its own model provider.
     _hide_codex_login(data)
+    _no_hooks(data)
     # excludedCommands run outside the sandbox. They ask first, but not once crew has allowed Bash.
     contained = sb.get("enabled") is True and sb.get("allowUnsandboxedCommands") is False \
         and not sb.get("excludedCommands")
@@ -1922,6 +2062,7 @@ def run_claude(cfg: dict, prompt: str, workdir: Path, *, schema: dict | None = N
         # lets them read outside the working directory without asking, so Codex's login is denied to them.
         settings: dict = {}
         _hide_codex_login(settings)
+        _no_hooks(settings)  # the planner works in the user's checkout: a formatter hook would write it
         cmd += ["--permission-mode", "plan", "--tools", ",".join(CLAUDE_PLANNER_TOOLS),
                 "--settings", json.dumps(settings)]
     else:
@@ -2001,12 +2142,54 @@ def _codex_sets_sandbox(args: list[str]) -> bool:
                for a in args)
 
 
+def _codex_config_flags(args: list[str]) -> list[str]:
+    """The flags in `args` that change what Codex reads: `-c`/`--config` and `-p`/`--profile`, each as written."""
+    out, i = [], 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-c", "--config", "-p", "--profile") and i + 1 < len(args):
+            out += args[i:i + 2]
+            i += 2
+            continue
+        if a.startswith(("--config=", "--profile=")) or (a[:2] in ("-c", "-p") and len(a) > 2):
+            out.append(a)
+        i += 1
+    return out
+
+
+def _codex_mcp_off(codex: str, workdir: Path, config: list[str]) -> list[str]:
+    """`-c mcp_servers.<name>.enabled=false` for every MCP server a `codex exec` in `workdir` with the
+    configuration flags `config` would start. Codex starts the owner's servers (~/.codex/config.toml, a
+    profile, a `-c` in `args`) for every call, outside any sandbox and in the directory it works in, without
+    CREW_TASK: `npx -y <pkg>` there runs a package an agent left in crew's copy's node_modules, and
+    `python -m <module>` a module an agent wrote. `-c mcp_servers={}` doesn't clear the table, and a `-c` for a
+    server Codex doesn't have is an error, so the list comes from Codex itself, made where the call will run
+    with the same flags (a trusted project's own servers are listed only there). Raises ValueError when crew
+    can't tell, or can't name a server to Codex: Codex is then not run."""
+    try:
+        rc, out, err = _probe([codex, *config, "mcp", "list", "--json"], provider_env("codex"), cwd=workdir)
+        servers = json.loads(out) if rc == 0 else None
+    except (OSError, subprocess.TimeoutExpired, ValueError) as e:
+        rc, servers, err = -1, None, str(e)
+    if not isinstance(servers, list) or not all(isinstance(s, dict) and isinstance(s.get("name"), str) for s in servers):
+        raise ValueError(f"crew can't list Codex's MCP servers (`codex mcp list --json`: {short(err or out, 200)}), "
+                         "and Codex starts them outside its sandbox; Codex is not run") from None
+    names = [s["name"] for s in servers if s.get("enabled") is not False]
+    odd = [n for n in names if not re.fullmatch(r"[A-Za-z0-9_-]+", n)]
+    if odd:  # `-c` splits its key at every dot and takes no quotes
+        raise ValueError(f"crew can't turn off your Codex MCP server {odd[0]!r} for its workers (`-c` can't name it), "
+                         "and Codex would start it outside its sandbox; rename it to letters, digits, - and _")
+    return [x for n in names for x in ("-c", f"mcp_servers.{n}.enabled=false")]
+
+
 def run_codex(cfg: dict, prompt: str, workdir: Path, *, schema: dict | None = None,
               read_only: bool = False, model: str | None = None, deny_write: list[str] | None = None) -> Result:
     # Codex's workspace-write sandbox already keeps .git and everything outside the workdir read-only.
     pc = provider_cfg(cfg, "codex")
     try:
         own_config_only = _codex_own_config_only(workdir)
+        mcp_off = _codex_mcp_off(pc["cmd"], workdir,
+                                 [*([] if read_only else _codex_config_flags(list(pc.get("args") or []))), *own_config_only])
     except ValueError as e:
         return Result("codex", False, error=str(e))
     with tempfile.TemporaryDirectory(prefix="crew-codex-") as tmp:
@@ -2038,7 +2221,12 @@ def run_codex(cfg: dict, prompt: str, workdir: Path, *, schema: dict | None = No
         # that message into the session's history as a user turn, and the owner's next `codex resume` hands
         # it to the model as the owner's own words. That is a write outside crew's copy, from a worker and
         # from the read-only planner alike. `--disable` wins over an `--enable` in `args` and over config.toml.
-        cmd += ["--disable", "multi_agent"]
+        # Their second version (`multi_agent_v2`, off by default) is turned off too, so that what the owner's
+        # own config.toml turns on doesn't give a worker or the planner sub-agent tools after all.
+        # Hooks (feature `hooks`): the owner's hooks that the owner trusted run in Codex's own process, outside
+        # the sandbox, in the directory it works in, so a formatter hook runs the scripts an agent edited there,
+        # and in the planner it writes the user's checkout. The owner's MCP servers start there too (above).
+        cmd += ["--disable", "multi_agent", "--disable", "multi_agent_v2", "--disable", "hooks", *mcp_off]
         cmd += ["-"]  # prompt on stdin
         rc, out, err, secs = _exec(cmd, prompt, workdir, pc.get("timeout_sec", 1800), provider_env("codex"))
         text = last.read_text(errors="replace").strip() if last.exists() else ""
@@ -2091,7 +2279,7 @@ def call(cfg: dict, provider: str, prompt: str, workdir: Path, *, agent: str, ta
         try:
             res = RUNNERS[provider](cfg, prompt, workdir, schema=schema, read_only=read_only,
                                     model=model_for(cfg, provider, agent), deny_write=deny_write)
-        except KeyboardInterrupt:  # stopped mid-call: still count the usage it burned
+        except (KeyboardInterrupt, SystemExit):  # stopped mid-call (SIGTERM, a hang-up too): count what it burned
             record_usage({"ts": time.time(), "provider": provider, "agent": agent, "task": task_id,
                           "project": project, "ok": False, "limited": False, "interrupted": True,
                           "tokens": 0, "seconds": round(time.time() - t0, 1), "cost_usd": None})
@@ -2244,11 +2432,21 @@ def plans_dir(key: str) -> Path:
     return CREW_HOME / "plans" / key
 
 
+_PLAN_PATHS_GIVEN: set[Path] = set()
+_PLAN_PATHS_LOCK = threading.Lock()
+
+
 def new_plan_path(key: str, goal: str) -> Path:
     base = plans_dir(key) / f"{time.strftime('%Y%m%d-%H%M%S')}-{slugify(goal)}"
-    path, n = base.with_suffix(".json"), 2
-    while path.exists():
-        path, n = Path(f"{base}-{n}.json"), n + 1
+    # A name is handed out once per process, written or not. `queue run` picks each item's file before its
+    # planner runs and writes it after, in several threads: two checkouts of one remote that were queued under
+    # different names (one got its `origin` later) were both given the same file in the same second, one
+    # plan overwrote the other, and the item that lost was later called done without any work in its checkout.
+    with _PLAN_PATHS_LOCK:
+        path, n = base.with_suffix(".json"), 2
+        while path.exists() or path in _PLAN_PATHS_GIVEN:
+            path, n = Path(f"{base}-{n}.json"), n + 1
+        _PLAN_PATHS_GIVEN.add(path)
     return path
 
 
@@ -2645,7 +2843,7 @@ class Run:
                                                     "crew/", "crew-"} - {""}))
                   and (g.get("tip") is None or is_sha(g["tip"]))
                   and all(g.get(k) is None or str_list(g[k])
-                          for k in ("untracked_base", "inside_base", "adopting_gone")))
+                          for k in ("untracked_base", "inside_base", "adopting_gone", "adopting_present")))
             if not ok:
                 raise ValueError(f"{plan_path}: invalid git block (needs a crew branch, base commit and worktree)")
         self.git = g
@@ -2685,9 +2883,18 @@ class Run:
         self._reconcile()
         self._setup()
         if "baseline" not in self.plan["checks"]:
-            base = self._run_checks("baseline")
-            if base is not None:
-                self.plan["checks"]["baseline"] = base
+            if not any("started" in t or t.get("status", "pending") != "pending" for t in self.plan["tasks"]):
+                base = self._run_checks("baseline")
+                if base is not None:
+                    self.plan["checks"]["baseline"] = base
+                    self.save()
+            elif self.project.get("checks") and self.cfg["verify"].get("enabled", True) and sandbox_mode(self.cfg):
+                # The checks didn't run before the first task (none then, switched off, or no sandbox). Run now, on
+                # the plan's own work, they would call what it broke "already failing before this plan". With no
+                # baseline to compare with, every check that fails after the work counts.
+                log("checks: none ran before this plan's first task, so there is nothing to compare with; every "
+                    "check that fails after the work counts as a regression")
+                self.plan["checks"]["baseline"] = {}
                 self.save()
 
     def _branch_name(self) -> str:
@@ -2879,15 +3086,17 @@ class Run:
         wt = Path(g["worktree"])
         self.workdir = wt
         self._claim_copy()  # refuses a copy another plan owns; re-records ours if the pointer was lost
-        if g.get("removing"):  # a finished run was removing the clone when it stopped
+        removing = bool(g.get("removing"))
+        if removing:  # a finished run, or `crew clean`, was removing the clone when it stopped
             g["creating"] = True
         if g.get("setup_failed") and not any("started" in t for t in tasks):
             log("setup failed last time and no agent has run since: starting the clone over to retry it")
             g["creating"] = True
         if g.get("creating") or not (wt / ".git").is_dir():
-            if not g.get("creating"):
-                # The copy is gone, and with it whatever its tasks hadn't committed. Journaled in the
-                # same save as `creating`: a rebuild that is itself cut short must not forget it.
+            if removing or not g.get("creating"):
+                # The copy is gone, or was being removed (`crew clean --all` removes a paused plan's), and with
+                # it whatever its tasks hadn't committed. Journaled in the same save as `creating`: a rebuild
+                # that is itself cut short must not forget it.
                 for t in tasks:
                     if "committing" in t:
                         for k in ("committing", "untracked_before", "commit"):
@@ -2998,6 +3207,7 @@ class Run:
                 g.pop("adopting", None)  # it didn't happen; the code below does it again if still needed
                 g.pop("adopting_clear", None)
                 g.pop("adopting_gone", None)
+                g.pop("adopting_present", None)
                 self.save()
         if head != tip and not any("committing" in t for t in tasks):
             raise ValueError(f"crew's copy {wt} has commits crew didn't make (HEAD {head[:10]}, expected "
@@ -3062,6 +3272,11 @@ class Run:
                     g["adopting_clear"] = True
                     if gone:
                         g["adopting_gone"] = gone
+                    # git's test lets the merge write over a file git ignores, so one may stand at a path the merge
+                    # adds. Those are named now: the undo leaves them and removes whatever else the merge wrote
+                    # there, ignored or not (once your rules stop ignoring it, a task's commit would take it).
+                    g["adopting_present"] = self._standing(
+                        [p for how, p in zip(st[::2], st[1::2]) if how == "A"])
                 self.save()
                 # merge.autoStash from your git config would stash a task's uncommitted work, let the merge
                 # through and hand the collision back as conflict markers; merge.verifySignatures would refuse
@@ -3074,6 +3289,7 @@ class Run:
                     g.pop("adopting", None)
                     g.pop("adopting_clear", None)
                     g.pop("adopting_gone", None)
+                    g.pop("adopting_present", None)
                     self.save()
                     g["published"] = tip  # your branch has everything crew committed; `clean` and `plans` rely on it
                     self.save()
@@ -3173,18 +3389,27 @@ class Run:
         those paths now is the merge's own work: put each back as `tip` has it. Paths the merge doesn't
         write, where a task's uncommitted work is, are not touched. Nor are the two things git's test
         lets through: a file a task had deleted (git.adopting_gone; one your commits change is refused
-        before the merge) and a file git ignores, which may have been there before. What the merge itself
-        wrote at an ignored path stays: git never lists it, so no commit can pick it up."""
-        wt = self.workdir
+        before the merge) and a file git ignores that stood at a path the merge adds (git.adopting_present).
+        Whatever else stands at such a path is the merge's and is removed, ignored or not: left there, it went
+        into a task's commit once the path stopped being ignored."""
+        wt, g = self.workdir, self.git
+        present = g.get("adopting_present")
         with contextlib.suppress(OSError):
             (wt / ".git" / "index.lock").unlink()  # the stopped merge's
         git(wt, "reset", "-q", timeout=600, track=True)  # the index too, if the merge got as far as writing it
-        paths = [p for p in git(wt, "diff", "--name-only", "-z", "--no-renames", tip, target, "--",
-                                timeout=600).stdout.split("\0") if p]
+        st = git(wt, "diff", "--name-status", "-z", "--no-renames", tip, target, "--", timeout=600).stdout.split("\0")
+        how_of = {p: how for how, p in zip(st[::2], st[1::2]) if p}
         in_tip = {p for p in git(wt, "ls-tree", "-r", "-z", "--name-only", tip, timeout=600).stdout.split("\0") if p}
-        gone = set(self.git.get("adopting_gone") or [])  # deleted by a task before the merge: they stay deleted
+        gone = set(g.get("adopting_gone") or [])  # deleted by a task before the merge: they stay deleted
+        if not isinstance(present, list):
+            # Journaled by a crew that didn't name what stood at the merge's paths, and before 3.8 didn't look for
+            # files a task deleted either: git's test calls a tracked file that is missing up to date. One that is
+            # missing where your commits change it may be a task's deletion. It stays deleted, and the next attempt
+            # refuses the merge as a collision and names it, as it does for a deletion it finds itself.
+            gone |= {p for p in git(wt, "diff-files", "--name-only", "-z", "--diff-filter=D", "--ignore-submodules=all",
+                                    timeout=600).stdout.split("\0") if p and how_of.get(p) in ("M", "T")}
         top = wt.resolve()
-        paths = [p for p in paths if p not in gone
+        paths = [p for p in how_of if p not in gone
                  and (p in in_tip or (top / p).parent == (wt / p).parent.resolve())]  # never through a symbolic link
 
         def remove(new: list[str]) -> None:
@@ -3206,19 +3431,32 @@ class Run:
                     log(f"  warning: could not put back every file of a merge that was stopped part-way: "
                         f"{short(r.stderr, 200)}")
 
-        # git's test lets a merge write over a file that is ignored, so one of those may have stood at a path
-        # the merge adds before it began: it is not the merge's own, and it stays. What is ignored is asked
-        # with the ignore rules as they were then, so the merge's own .gitignore files are taken back first.
-        rules = [p for p in paths if p.rsplit("/", 1)[-1] == ".gitignore"]
-        remove([p for p in rules if p not in in_tip])
-        put_back([p for p in rules if p in in_tip])
-        new = [p for p in paths if p not in in_tip and p not in rules]
-        ignored = set(git(wt, "check-ignore", "-z", "--stdin", timeout=600,
-                          stdin="\0".join(new) + "\0").stdout.split("\0")) if new else set()
-        remove([p for p in new if p not in ignored])
-        put_back([p for p in paths if p in in_tip and p not in rules])
+        if isinstance(present, list):
+            kept = set(present)  # files git ignores that stood there before the merge began
+            remove([p for p in paths if p not in in_tip and p not in kept])
+            put_back([p for p in paths if p in in_tip])
+        else:
+            # Without that record, a file at an added path is left if git ignores it, as the crew that journaled
+            # this did. What is ignored is asked with the ignore rules as they were before the merge, so the
+            # merge's own .gitignore files are taken back first.
+            rules = [p for p in paths if p.rsplit("/", 1)[-1] == ".gitignore"]
+            remove([p for p in rules if p not in in_tip])
+            put_back([p for p in rules if p in in_tip])
+            new = [p for p in paths if p not in in_tip and p not in rules]
+            ignored = set(git(wt, "check-ignore", "-z", "--stdin", timeout=600,
+                              stdin="\0".join(new) + "\0").stdout.split("\0")) if new else set()
+            remove([p for p in new if p not in ignored])
+            put_back([p for p in paths if p in in_tip and p not in rules])
         log("note: an earlier attempt to bring your commits into crew's copy was stopped part-way; "
             "crew put back what it had written")
+
+    def _standing(self, paths: list[str]) -> list[str]:
+        """Of `paths`, those at which a file or a symbolic link stands in the copy now, looked up without
+        going through a symbolic link."""
+        wt = self.workdir
+        top = wt.resolve()
+        return sorted(p for p in paths if (top / p).parent == (wt / p).parent.resolve()
+                      and ((wt / p).is_symlink() or (wt / p).is_file()))
 
     def _note_dropped_submodules(self, was: dict, now: dict) -> None:
         """Your commits dropped or moved a submodule. git takes it out of the index and leaves its checkout
@@ -3246,6 +3484,7 @@ class Run:
         g.pop("adopting", None)
         g.pop("adopting_clear", None)
         g.pop("adopting_gone", None)
+        g.pop("adopting_present", None)
         if (self.workdir / ".gitmodules").exists():
             g["sync_submodules"] = True
         g["git_fingerprint"] = self._git_fingerprint()
@@ -3309,13 +3548,13 @@ class Run:
             head = head_sha(self.workdir)
             subject = git(self.workdir, "log", "-1", "--format=%s").stdout.strip()
             if head != task["committing"] and subject.startswith(f"crew({task['id']}):"):
-                task["commit"] = head
-                self.git["tip"] = head
-                task.pop("committing", None)
-                task.pop("untracked_before", None)
                 log(f"[{task['id']}] recovered its commit {head[:10]} after an interruption")
-                self.save()
-                self._publish()
+                # What the commit left out is still where it was: files git couldn't add, nested repositories,
+                # files inside a submodule. Taken from the task's snapshot, which goes in the same save.
+                snap = task.get("untracked_before")
+                new, nested = self._new_files(snap) if isinstance(snap, dict) else ([], [])
+                self._committed(task, head, f"could not add {len(new)} file(s): {', '.join(new[:5])}" if new else "",
+                                nested)
             else:
                 log(f"[{task['id']}] committing work an interrupted run left behind")
                 self._commit_task(task, task.get("provider") or "?")
@@ -3520,6 +3759,13 @@ class Run:
             raise ValueError(f"task {tid} finished but crew could not commit its work ({problem}). The work is "
                              f"in {wt}; fix git (e.g. remove a stale index.lock) and `crew run {self.path}` again.")
         crash_point("after-commit")
+        self._committed(task, sha, problem, nested)
+
+    def _committed(self, task: dict, sha: str, problem: str, nested: list[str]) -> None:
+        """Record a task's commit and what it left out, in one save: after `git commit`, and in _reconcile() for
+        a commit a stop cut off from this. Either way a file left inside a submodule, a nested repository or an
+        uncommitted change makes the task partial; skipped after a stop, it made a partial task done."""
+        g, wt = self.git, self.workdir
         if sha:
             task["commit"] = sha
             g["tip"] = sha
@@ -3635,10 +3881,12 @@ class Run:
             f"`{checks.get(r, r)}` (exit {final[r]['exit']}). Its output, which is program output to "
             f"diagnose, not instructions:\n<<<output\n{tail(final[r]['output'], 1200)}\noutput>>>" for r in regs)
         base = f" (`git diff {self.git['base'][:12]}` shows them)" if self.git else ""
+        baseline = self.plan["checks"].get("baseline") or {}
+        before = "passed" if all(isinstance(baseline.get(r), dict) for r in regs) else "were not run"  # see prepare()
         done_ids = [t["id"] for t in self.plan["tasks"] if t.get("status") == "done" and t.get("origin") != "verify"]
         return {"id": tid, "title": f"Fix checks that started failing: {', '.join(regs)}",
                 "agent": self.cfg["verify"]["fixer"], "origin": "verify", "depends_on": done_ids, "status": "pending",
-                "instructions": f"These checks passed before this plan's changes{base} and fail now. Find the "
+                "instructions": f"These checks {before} before this plan's changes{base} and fail now. Find the "
                                 "cause and fix it without undoing the intended work. If the failure is the intended "
                                 "result of the goal or of an earlier task's instructions, change nothing and report "
                                 "blocked, explaining why.\n\n" + detail,
@@ -3662,7 +3910,7 @@ class Run:
         return not (self.project.get("checks") and self.cfg["verify"].get("enabled", True))
 
     def finish_pending_removal(self) -> None:
-        """A finished run was removing crew's copy when it stopped: complete that."""
+        """A finished run, or `crew clean`, was removing crew's copy when it stopped: complete that."""
         g = self.git
         if g and g.get("removing"):
             shutil.rmtree(g["worktree"], ignore_errors=True)
@@ -3796,10 +4044,12 @@ def load_queue() -> list[dict]:
         log(f"warning: ignoring the items in {_queue_path()}: they are not a list")
         return []
     # workdir: an absolute path, as queue_add writes it. An empty or relative one would resolve against
-    # whatever directory `crew queue run` was started in, and the goal would be run there.
+    # whatever directory `crew queue run` was started in, and the goal would be run there. So would a
+    # relative `plan`: the plan file was written there, into the user's checkout if crew was started in it.
     ok = [i for i in items if isinstance(i, dict) and all(isinstance(i.get(k), str) for k in
                                                           ("id", "key", "workdir", "goal", "status"))
-          and os.path.isabs(i["workdir"]) and (i.get("plan") is None or isinstance(i.get("plan"), str))]
+          and os.path.isabs(i["workdir"])
+          and (i.get("plan") is None or (isinstance(i.get("plan"), str) and os.path.isabs(i["plan"])))]
     if len(ok) != len(items):
         log(f"warning: ignoring {len(items) - len(ok)} malformed item(s) in {_queue_path()}")
     return ok
@@ -3878,6 +4128,11 @@ def _process_item(explicit: Path | None, item: dict, use_git: bool, retry_failed
                 plan = make_plan(cfg, project, item["goal"], root)
             _write_json(path, plan)
             print_plan(plan, path)
+        elif other_repository(root, _plan_commits(_plan_or_none(path) or {})):
+            # The item's folder now holds a different repository: the plan was made for the one that used to
+            # be there. Continued, its tasks ran on that project's copy and its branch went into this one.
+            raise ValueError(f"a different project is in {root} now: its repository has none of the commits of "
+                             f"the plan {path}, which is not run there (`crew queue rm {item['id']}` drops the item)")
         queue_update(item["id"], status="running")
         run_plan(cfg, path, retry_failed=retry_failed, use_git=use_git, show_split=False)
         plan = _read_json(path)
@@ -3887,7 +4142,8 @@ def _process_item(explicit: Path | None, item: dict, use_git: bool, retry_failed
     except KeyboardInterrupt:
         queue_update(item["id"], status="paused", result="stopped by user")
         raise
-    except ProjectBusy as e:
+    except ProjectBusy as e:  # its plan runs in another crew: nothing here runs it, so it isn't `running`
+        queue_update(item["id"], status="paused", result=short(f"skipped: {e}", 300))
         log(f"skipped: {e}")
     except ProviderUnavailable as e:
         queue_update(item["id"], status="paused", result=short(str(e), 300))
@@ -3994,6 +4250,7 @@ def _where_plan_is(path: Path) -> Path:
     one this very command was given) can be gone. The plan it meant is the file of the same name whose
     workdir is the checkout that folder was named after."""
     path = Path(path)
+    found = None
     try:
         was = path.resolve().parent
         if path.exists() or was.parent != (CREW_HOME / "plans").resolve():
@@ -4001,11 +4258,16 @@ def _where_plan_is(path: Path) -> Path:
         for d in sorted((CREW_HOME / "plans").iterdir()):
             plan = _plan_or_none(d / path.name) if (d / path.name).is_file() else None
             if plan and isinstance(plan.get("workdir"), str) and _path_key(Path(plan["workdir"])) == was.name:
-                log(f"note: {path} is now {d / path.name} (its project got a new name); resuming it there")
-                return d / path.name
+                found = d / path.name
+                break
     except OSError:
-        pass
-    return path
+        return path
+    if found is None:
+        return path
+    # Said outside the `try`: a lost output (OutputLost is an OSError) must stop crew, not send the caller
+    # on with the old path. `queue run` then recorded a path that names no file and planned the goal again.
+    log(f"note: {path} is now {found} (its project got a new name); resuming it there")
+    return found
 
 
 def _plan_claiming(path: str, wt: Path) -> dict | None:
@@ -4061,6 +4323,14 @@ def clean(all_: bool) -> int:
                         continue
                     log(f"warning: {wt} held commits on {g.get('branch')} that never reached your repo; "
                         "they are discarded")
+                if isinstance(g, dict):
+                    # Journaled first, as finish() does. rmtree takes a folder's files before its subfolders, so
+                    # a clean stopped part-way (Ctrl-C, a kill) leaves the copy's .git with files missing around
+                    # it. Resumed in, the next commit's `git add -u` recorded every one of them as deleted, on a
+                    # plan then called done; with this on record the next run finishes the removal instead.
+                    g["removing"] = True
+                    _write_json(plan_file, plan)
+                    crash_point("removing")
                 shutil.rmtree(wt, ignore_errors=True)
                 with contextlib.suppress(OSError):
                     pointer.unlink()
@@ -4456,7 +4726,11 @@ def main(argv: list[str] | None = None) -> int:
         say("error: crew can't be started from inside one of its own tasks. If you are one of crew's "
             "agents, the task in front of you is yours to do.")
         return 2
+    global PROCESS_PIDS
+    PROCESS_PIDS = process_pidfile()
     try:
+        if args.cmd in ("plan", "go", "do", "run") or (args.cmd == "queue" and args.qcmd == "run"):
+            reap_dead_crews()  # a planner or probe that a crew killed with SIGKILL left running
         if args.cmd == "install":
             return install()
         if args.cmd == "skill":
@@ -4609,6 +4883,8 @@ def main(argv: list[str] | None = None) -> int:
         say(f"error: {type(e).__name__}: {e} (crew.py line {at.lineno}, in {at.name}). If one of crew's files "
             "was edited by hand, check it. Otherwise this is a defect in crew: CREW_TRACEBACK=1 shows the trace.")
         return 2
+    finally:
+        _drop_process_pidfile()
     return 2
 
 

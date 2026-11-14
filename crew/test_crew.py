@@ -111,6 +111,22 @@ if a and a[0] == "--version":
 prompt = sys.stdin.read()
 record(p="claude", argv=a, planner="plan" in a, resumed="earlier attempt" in prompt, prompt=prompt[-3000:],
        lean="only\nruns checks" in prompt or "only runs checks" in prompt)
+def run_hooks():
+    """What the real CLI (2.1.325) does with hooks: it runs them itself, outside its sandbox, in the directory it
+    works in. They come from the owner's settings (CLAUDE_CONFIG_DIR) and from the last --settings, unless the
+    settings it was given turn them all off (`disableAllHooks`)."""
+    import subprocess
+    flag = json.loads(a[len(a) - a[::-1].index("--settings")]) if "--settings" in a else {}
+    if not isinstance(flag, dict) or flag.get("disableAllHooks") is True:
+        return
+    try:
+        own = json.loads((Path(os.environ["CLAUDE_CONFIG_DIR"]) / "settings.json").read_text())
+    except (KeyError, OSError, ValueError):
+        own = {}
+    for data in (own, flag):
+        for groups in ((data.get("hooks") if isinstance(data, dict) else None) or {}).values():
+            for h in (h for g in groups for h in g.get("hooks", []) if h.get("type") == "command"):
+                subprocess.run(h["command"], shell=True, stdin=subprocess.DEVNULL)
 if os.environ.get("FAKE_CLAUDE_GARBAGE") and "plan" not in a:
     print(json.dumps({"type": "result", "is_error": False, "result": {"oops": 1}, "usage": [1, 2],
                       "permission_denials": ["x"], "errors": 5}))
@@ -119,11 +135,14 @@ if os.environ.get("FAKE_CLAUDE_LIMIT"):
     print(json.dumps({"type": "result", "is_error": True, "result": "Claude AI usage limit reached", "usage": {}}))
     sys.exit(1)
 if "plan" in a:
+    time.sleep(float(os.environ.get("FAKE_PLAN_SLEEP", "0")))  # a planner still at work
     pl = plan()
+    run_hooks()
     print(json.dumps({"type": "result", "is_error": False, "result": json.dumps(pl), "structured_output": pl,
                       "usage": {"input_tokens": 10, "output_tokens": 10}}))
     sys.exit(0)
 status, summary = work(prompt)
+run_hooks()
 print(json.dumps({"type": "result", "is_error": False, "result": summary,
                   "structured_output": {"status": status, "summary": summary},
                   "usage": {"input_tokens": 10, "output_tokens": 10}}))
@@ -138,9 +157,18 @@ if a == ["exec", "--help"]:
               "--ignore-rules --config --disable")
     sys.exit(0)
 if a == ["features", "list"]:  # the real CLI's table: name, stage, on or off
-    print("\n".join(f"{n:<24}stable   {on}" for n, on in (("multi_agent", "true"), ("multi_agent_v2", "false"))
+    print("\n".join(f"{n:<24}stable   {on}" for n, on in (("hooks", "true"), ("multi_agent", "true"),
+                                                          ("multi_agent_v2", "false"), ("plugin_hooks", "false"))
                     if n != os.environ.get("FAKE_HELP_MISSING", "")))
     sys.exit(0)
+if a == ["mcp", "list", "--help"]:
+    help_text("--json"); sys.exit(0)
+if "mcp" in a and a[a.index("mcp") + 1:] == ["list", "--json"]:  # the owner's MCP servers (FAKE_CODEX_MCP)
+    if os.environ.get("FAKE_RECORD_MCP"):
+        record(p="codex", mcp_list=a)
+    if os.environ.get("FAKE_CODEX_MCP_LIST_FAILS"):
+        print("Error: failed to load bootstrap configuration", file=sys.stderr); sys.exit(1)
+    print(os.environ.get("FAKE_CODEX_MCP", "[]")); sys.exit(0)
 if a == ["sandbox", "--help"]:
     help_text("--permission-profile --config"); sys.exit(0)
 if a[:2] == ["login", "status"]:
@@ -176,15 +204,41 @@ def sub_agents():
         return False
     return ("--enable", "multi_agent") in pairs or not any(
         f in ("-c", "--config") and v.replace(" ", "") == "features.multi_agent=false" for f, v in pairs)
+def owner_mcp_servers():
+    """The real CLI (0.166) starts every MCP server the owner's configuration names (FAKE_CODEX_MCP, as
+    `codex mcp list --json` prints them) for each call, outside its sandbox, in the directory it works in,
+    unless the call turns it off with `-c mcp_servers.<name>.enabled=false`."""
+    off = {v for f, v in zip(a, a[1:]) if f in ("-c", "--config")}
+    for s in json.loads(os.environ.get("FAKE_CODEX_MCP", "[]")):
+        if s.get("enabled") is not False and f"mcp_servers.{s['name']}.enabled=false" not in off:
+            t = s["transport"]
+            subprocess.run([t["command"], *t.get("args", [])], stdin=subprocess.DEVNULL)
+def owner_hooks():
+    """The owner's trusted hooks (FAKE_CODEX_HOOKS: their commands): the real CLI runs them itself, outside its
+    sandbox, in the directory it works in, while feature `hooks` (on by default) is on. `--disable` wins."""
+    if ("--disable", "hooks") not in list(zip(a, a[1:])):
+        for c in json.loads(os.environ.get("FAKE_CODEX_HOOKS", "[]")):
+            subprocess.run(c, shell=True, stdin=subprocess.DEVNULL)
+def sub_agents_v2():
+    """Their second version (`multi_agent_v2`, the `collaboration` tools): off by default, on with the owner's
+    `[features] multi_agent_v2 = true` in config.toml (FAKE_V2_ON stands for it) or an `--enable` in args.
+    `--disable multi_agent_v2` wins over both, as it does in the real CLI (0.166)."""
+    pairs = list(zip(a, a[1:]))
+    if ("--disable", "multi_agent_v2") in pairs:
+        return False
+    return bool(os.environ.get("FAKE_V2_ON")) or ("--enable", "multi_agent_v2") in pairs
 record(p="codex", argv=a, planner="read-only" in a, resumed="earlier attempt" in prompt, obeys=obeys,
-       reads_owner_rules="--ignore-rules" not in a, sub_agents=sub_agents())
+       reads_owner_rules="--ignore-rules" not in a, sub_agents=sub_agents(), sub_agents_v2=sub_agents_v2())
+owner_mcp_servers()
 out = Path(a[a.index("-o") + 1])
 print(json.dumps({"type": "thread.started"}))
 if "read-only" in a:
+    time.sleep(float(os.environ.get("FAKE_PLAN_SLEEP", "0")))
     out.write_text(json.dumps(plan()))
 else:
     status, summary = work(prompt)
     out.write_text(json.dumps({"status": status, "summary": summary}))
+owner_hooks()
 print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 10, "cached_input_tokens": 0,
                                                      "output_tokens": 10}}))
 record(p="codex", end=True)
@@ -2127,6 +2181,26 @@ class TestOnlyTheOwnersOwnSettings(CrewTest):
             r = self.crew("doctor", env={"FAKE_HELP_MISSING": missing}, check=False)
             self.assertIn(f"INCOMPATIBLE: `{where}` no longer lists {missing};", r.stdout)
 
+    def test_codex_gets_no_sub_agent_tools_of_the_second_version_either(self):
+        """README: Codex's sub-agent tools are turned off "whatever your own settings say". With the owner's own
+        `[features] multi_agent_v2 = true`, the real CLI 0.166 gave a 3.9 worker and the read-only planner the
+        second version's `collaboration` tools (spawn_agent, send_message, list_agents ...): 3.9 passed only
+        `--disable multi_agent`."""
+        root = self.repo()
+        self.env["FAKE_V2_ON"] = "1"  # the owner's config.toml turns them on
+        codex, _ = self.claude_then_codex(root)
+        for c in codex:  # the planner and the worker
+            self.assertFalse(c["sub_agents_v2"], c["argv"])  # 3.9: True for both
+            self.assertFalse(c["sub_agents"], c["argv"])
+            self.assertEqual(c["argv"][-1], "-")
+        self.write_cfg({"providers": {"claude": {"enabled": False}, "codex": {"args": ["--enable", "multi_agent_v2"]}}})
+        self.crew("do", "y", "--workdir", str(root))
+        c = self.workers("codex")[-1]
+        self.assertFalse(c["sub_agents_v2"], c["argv"])
+        # Disabled by name, like the first version: a CLI that doesn't know the name fails every call.
+        r = self.crew("doctor", env={"FAKE_HELP_MISSING": "multi_agent_v2"}, check=False)
+        self.assertIn("INCOMPATIBLE: `codex features list` no longer lists multi_agent_v2;", r.stdout)
+
     def claude_argv(self, root, settings=None, cfg=None, env=None):
         self.write_cfg({"providers": {"codex": {"enabled": False}, **({"claude": cfg} if cfg else {})}})
         if settings is not None:
@@ -4060,6 +4134,643 @@ class TestClaudeWorkerTools(CrewTest):
                 self.assertNotIn(t, tools)
         r = self.crew("doctor", env={"FAKE_HELP_MISSING": "--strict-mcp-config"}, check=False)
         self.assertIn("no longer lists --strict-mcp-config", r.stdout)  # a CLI that drops it is caught up front
+
+
+class TestTheOwnersHooksAndToolServers(CrewTest):
+    """What the review of 3.9's containment found: the CLIs run the owner's own hooks, and Codex starts the owner's
+    own MCP servers, in their own process, outside the sandbox, in the directory they work in. With the real
+    claude 2.1.325 and codex 0.166.0 and a scripted model endpoint, a formatter hook (`npx prettier`) and a server
+    started with `npx -y <package>` ran what a worker had left in crew's copy, and in the read-only planner a
+    formatter hook rewrote the user's checkout. The fake CLIs here do what the real ones did."""
+
+    def setUp(self):
+        super().setUp()
+        self.mark = self.tmp / "ran-outside-the-sandbox"
+        # Your own format script, committed: run in your checkout, it rewrites README.md.
+        self.root = self.repo(files={"README.md": "hi\n", "format.sh": "printf rewritten > README.md\n"})
+        # What a worker leaves in crew's copy: its own version of that script, and a package in node_modules.
+        script = f"echo agent-code > {self.mark}\n"
+        self.agent = {"FAKE_EDIT": json.dumps({"format.sh": script, "node_modules/.bin/mcp-tool": script})}
+
+    def assert_contained(self, r):
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual({"an agent's file ran outside the sandbox": self.mark.exists(),
+                          "your checkout was written": sh(self.root, "git", "status", "--porcelain") != ""},
+                         {"an agent's file ran outside the sandbox": False, "your checkout was written": False})
+        self.assertEqual({t["status"] for t in self.latest_plan(self.root)["tasks"]}, {"done"})
+
+    def test_the_owners_claude_hooks_run_for_no_worker_and_no_planner(self):
+        hook = {"type": "command", "command": "sh format.sh 2>/dev/null || true"}
+        self.claude_home.mkdir(exist_ok=True)
+        (self.claude_home / "settings.json").write_text(json.dumps(
+            {"hooks": {"PostToolUse": [{"matcher": "Write|Edit", "hooks": [hook]}], "Stop": [{"hooks": [hook]}]}}))
+        self.write_cfg({"providers": {"codex": {"enabled": False}}})
+        # 3.9: the planner's hook rewrote README.md in your checkout, and a worker's ran the agent's script
+        self.assert_contained(self.crew("go", "x", "--workdir", str(self.root), env=self.agent))
+        for c in [c for c in self.calls() if "argv" in c]:  # the planner and both workers
+            self.assertIs(json.loads(c["argv"][c["argv"].index("--settings") + 1])["disableAllHooks"], True)
+        # hooks in a --settings of your worker flags are the same door, whatever that file says about them
+        self.write_cfg({"providers": {"codex": {"enabled": False}, "claude": {"args": ["--settings", json.dumps(
+            {"disableAllHooks": False, "hooks": {"Stop": [{"hooks": [hook]}]}})]}}})
+        self.claude_home.joinpath("settings.json").write_text("{}")
+        r = self.crew("do", "y", "--workdir", str(self.root), env=self.agent)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertFalse(self.mark.exists())
+
+    def test_the_owners_trusted_codex_hooks_run_for_no_worker_and_no_planner(self):
+        self.write_cfg({"providers": {"claude": {"enabled": False}}, "planner": {"provider": "codex"}})
+        env = {**self.agent, "FAKE_CODEX_HOOKS": json.dumps(["sh format.sh 2>/dev/null || true"])}
+        # 3.9: the read-only planner's hook rewrote README.md in your checkout, a worker's ran the agent's script
+        self.assert_contained(self.crew("go", "x", "--workdir", str(self.root), env=env))
+        # an `--enable hooks` of yours doesn't turn them back on
+        self.write_cfg({"providers": {"claude": {"enabled": False}, "codex": {"args": ["--enable", "hooks"]}}})
+        r = self.crew("do", "y", "--workdir", str(self.root), env=env)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertFalse(self.mark.exists())
+        # a Codex that can't turn its hooks off is caught up front (`plugin_hooks` is not `hooks`)
+        r = self.crew("doctor", env={"FAKE_HELP_MISSING": "hooks"}, check=False)
+        self.assertIn("INCOMPATIBLE: `codex features list` no longer lists hooks;", r.stdout)
+
+    def test_the_owners_codex_mcp_servers_start_for_no_worker_and_no_planner(self):
+        def server(name):  # `npx -y @acme/mcp-tool` runs the package in the working directory's node_modules
+            return {"name": name, "enabled": True, "transport": {"type": "stdio", "command": "sh", "args": [
+                "-c", "test -f node_modules/.bin/mcp-tool && sh node_modules/.bin/mcp-tool; true"]}}
+        self.write_cfg({"providers": {"claude": {"enabled": False},
+                                      "codex": {"args": ["-p", "work", "-c", 'model="m"']}},
+                        "planner": {"provider": "codex"}})
+        env = {**self.agent, "FAKE_CODEX_MCP": json.dumps([server("acme"), {**server("off"), "enabled": False}]),
+               "FAKE_RECORD_MCP": "1"}
+        self.assert_contained(self.crew("go", "x", "--workdir", str(self.root), env=env))  # 3.9: the second task ran it
+        execs = [c for c in self.calls() if c["p"] == "codex" and "argv" in c]
+        lists = [c for c in self.calls() if c.get("mcp_list")]
+        self.assertEqual(len(execs), 3)
+        self.assertEqual(len(lists), 3)  # one list per call, made where the call runs, with what it reads
+        for x, ls in zip(execs, lists):
+            self.assertEqual(ls["cwd"], x["cwd"])
+            i = x["argv"].index("-c", x["argv"].index("--disable"))
+            self.assertEqual(x["argv"][i:i + 2], ["-c", "mcp_servers.acme.enabled=false"])
+            self.assertNotIn("mcp_servers.off.enabled=false", x["argv"])  # one that is off stays as it is
+            self.assertIn(next(v for v in x["argv"] if v.startswith("projects={")), ls["mcp_list"])
+            self.assertEqual(ls["mcp_list"][:4] == ["-p", "work", "-c", 'model="m"'], not x["planner"])
+        # A server crew can't name to Codex, or a list crew can't read: Codex is not run at all.
+        for knob in ({"FAKE_CODEX_MCP": json.dumps([server("we.ird")])}, {"FAKE_CODEX_MCP_LIST_FAILS": "1"}):
+            n = len([c for c in self.calls() if "argv" in c])
+            r = self.crew("do", "y", "--workdir", str(self.root), env={**self.agent, **knob})
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("MCP server", r.stdout)
+            self.assertEqual(len([c for c in self.calls() if "argv" in c]), n)
+            self.assertFalse(self.mark.exists())
+
+
+class TestCrashesAndDelivery(CrewTest):
+    """The 3.9 review's confirmed findings about crashes and delivery. Each test fails on 3.9."""
+
+    plan_of = TestAdoptionAndSubmodules.plan_of
+    workers = TestAdoptionAndSubmodules.workers
+    _publish_then_pause_after_t1 = TestAdoptionAndSubmodules._publish_then_pause_after_t1
+    _latest_or_none = TestAdoptionAndSubmodules._latest_or_none
+    key_of = TestAdoptionAndSubmodules.key_of
+    plans_dir_of = TestAdoptionAndSubmodules.plans_dir_of
+    plan_file = TestThreeEight.plan_file
+    git_cut = TestAdoptionAndSubmodules.git_cut
+    you_commit = TestAdoptionAndSubmodules.you_commit
+    you_commit_on = TestAdoptionAndSubmodules.you_commit_on
+    remote = TestAdoptionAndSubmodules.remote
+    superproject = TestAdoptionAndSubmodules.superproject
+    deleted_by_a_waiting_task = TestAdoptionAndSubmodules.deleted_by_a_waiting_task
+    FILEENV = TestAdoptionAndSubmodules.FILEENV
+    ID = TestAdoptionAndSubmodules.ID
+
+    def test_a_kill_right_after_a_commit_still_counts_what_the_task_left_out(self):
+        """A kill, SIGTERM or Ctrl-C between t1's `git commit` and crew's look at what the commit left out.
+        t1 left a file inside a submodule, or a nested repository: either makes it partial, crash or not."""
+        libsrc, _ = self.remote("libsrc", {"f.txt": "one\n"})
+        nested = {"vendor/x/.git/HEAD": "ref: refs/heads/main\n", "vendor/x/.git/objects/.keep": "",
+                  "vendor/x/.git/refs/heads/.keep": "", "vendor/x/a.txt": "nested\n"}
+        for left, root, made, why in (
+                ("inside a submodule", self.superproject(lib=libsrc), {"lib/agent-made.txt": "an agent's work\n"},
+                 "1 new file(s) inside a submodule, which is another repository (lib/agent-made.txt)"),
+                ("a nested repository", self.repo("plain"), nested, "nested git repository vendor/x/")):
+            with self.subTest(left=left):
+                env = {**self.FILEENV, "FAKE_EDIT": json.dumps(made)}
+                r = self.crew("go", "x", "--workdir", str(root), env={**env, "CREW_CRASH_AT": "after-commit"},
+                              check=False)
+                self.assertEqual(r.returncode, -9, r.stdout + r.stderr)
+                n = len(self.workers())
+                r = self.crew("run", "--workdir", str(root), env=env)
+                plan = self.plan_of(root)
+                wt = Path(plan["git"]["worktree"])
+                # 3.9: "recovered its commit", t1 done, t2 run on top of it, the plan done and exit 0
+                self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+                self.assertIn("recovered its commit", r.stdout)
+                self.assertIn(f"not everything was committed: {why}", r.stdout)
+                self.assertEqual([t["status"] for t in plan["tasks"]], ["partial", "skipped"])
+                self.assertEqual(len(self.workers()), n)  # t2 never ran on a partial t1
+                self.assertIn("keeping crew's copy", r.stdout)
+                for f, text in made.items():
+                    self.assertEqual((wt / f).read_text(), text)
+                self.assertEqual(sh(root, "git", "diff", "--name-only", f"main..{plan['git']['branch']}").split(),
+                                 ["t1.txt"])
+
+    def test_what_a_cut_short_adoption_wrote_at_an_ignored_path_is_never_committed(self):
+        """t2 was interrupted. Your commit stops ignoring build/ and adds build/out.txt; crew is killed while git
+        is half-way through bringing it into the copy, and you take the commit back. Under the old rules the
+        merge's build/out.txt is ignored, so the undo left it, and t2's agent then stops ignoring build/ too."""
+        root = self.repo(files={"README.md": "hi\n", ".gitignore": "build/\n"})
+        self._publish_then_pause_after_t1(root)
+        g = self.plan_of(root)["git"]
+        branch, wt, tip = g["branch"], Path(g["worktree"]), g["tip"]
+
+        def change():
+            (root / ".gitignore").write_text("")
+            (root / "build").mkdir()
+            for name in ("build/out.txt", "z1.txt", "z2.txt"):
+                (root / name).write_text("yours\n")
+            sh(root, "git", "add", "-A")
+        self.you_commit_on(root, branch, change)
+        r = self.crew("run", "--workdir", str(root), env=self.git_cut("merge"), check=False)
+        self.assertEqual(r.returncode, -9, r.stdout + r.stderr)
+        self.assertEqual(sh(wt, "git", "status", "--porcelain"), " M .gitignore\n?? build/\n")  # what git had written
+        sh(root, "git", "branch", "-f", branch, tip)  # you take the commit back
+        r = self.crew("run", "--workdir", str(root), env={"FAKE_EDIT": json.dumps({".gitignore": "# none\n"})})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("crew put back what it had written", r.stdout)
+        # 3.9: crew(t2) is [".gitignore", "build/out.txt", "t2.txt"], with your withdrawn file in it
+        self.assertEqual(sh(root, "git", "diff", "--name-only", f"{tip}..{branch}").split(), [".gitignore", "t2.txt"])
+
+    def test_checks_that_did_not_run_before_the_first_task_are_not_run_as_a_baseline_on_its_work(self):
+        root = self.repo()
+        self.set_profile(root, checks={}, setup=[])
+        self.write_cfg({"verify": {"fix_rounds": 0}})
+        self._publish_then_pause_after_t1(root, extra_env={"FAKE_BREAK": "t1"})  # t1's work includes `broken`
+        self.assertNotIn("baseline", self.plan_of(root)["checks"])
+        self.set_profile(root, checks={"nobroken": "test ! -f broken"})  # you add a check while the plan is paused
+        r = self.crew("run", "--workdir", str(root), check=False)
+        # 3.9: the baseline ran on t1's work, "already failing before this plan (not counted)", done and exit 0
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertNotIn("checks (baseline", r.stdout)
+        self.assertNotIn("already failing before this plan", r.stdout)
+        self.assertIn("nothing to compare with", r.stdout)
+        plan = self.plan_of(root)
+        self.assertEqual(plan["checks"]["regressions"], ["nobroken"])
+        self.assertEqual(crew.plan_state(plan), "needs-review")
+
+    def test_an_adoption_an_earlier_crew_cut_short_never_puts_back_a_file_a_task_deleted(self):
+        """crew 3.6 and 3.7 ran git's test alone before the adoption merge, and a file a task deleted passes it
+        (git calls a tracked file that is missing up to date). Killed before git wrote anything, they left your
+        commit fetched into the copy and this journal: `adopting` and `adopting_clear`, nothing else."""
+        root, branch, wt, tip = self.deleted_by_a_waiting_task()
+        mine = self.you_commit(root, branch, {"docs/old.txt": "yours\n", "a.txt": "yours\n"})
+        sh(wt, "git", "fetch", "-q", "--no-tags", "origin", f"+refs/heads/{branch}:refs/remotes/origin/{branch}")
+        pf = self.plan_file()
+        plan = json.loads(pf.read_text())
+        plan["git"].update(adopting=mine, adopting_clear=True)
+        pf.write_text(json.dumps(plan))
+        n = len(self.workers())
+        r = self.crew("run", "--workdir", str(root), check=False)
+        # 3.9: "crew put back what it had written" put docs/old.txt back, then exit 0 with crew(t2) holding
+        # ["D docs/older.txt", "A t2.txt"]: the task's deletion of docs/old.txt was gone without a word
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("deleted there (docs/old.txt)", r.stdout)
+        self.assertFalse((wt / "docs" / "old.txt").exists())
+        self.assertEqual(len(self.workers()), n)
+        sh(wt, "git", "checkout", "--", "docs/old.txt")  # the way out the message names: take your version
+        r = self.crew("run", "--workdir", str(root), check=False)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(sh(root, "git", "show", f"{branch}:docs/old.txt"), "yours\n")
+        self.assertEqual(sh(root, "git", "diff", "--name-status", f"{mine}..{branch}").split("\n")[:2],
+                         ["D\tdocs/older.txt", "A\tt2.txt"])
+
+
+class TestStopsOutputQueue(CrewTest):
+    """A clean that was stopped, plans the queue gave one name twice, and what a stop left behind (3.9 review,
+    stops, output and the queue)."""
+
+    workers = TestThreeEight.workers
+    plan_file = TestThreeEight.plan_file
+    agents_alive = TestThreeEight.agents_alive
+    argv = TestThreeEight.argv
+    patched = TestThreeEight.patched
+
+    def kill_agents(self) -> None:
+        import signal
+        for pid in self.agents_alive():
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+
+    def test_a_clean_stopped_part_way_is_finished_by_the_next_run_not_resumed_in(self):
+        """rmtree takes a folder's files before its subfolders, so Ctrl-C to `crew clean --all` while it removed a
+        paused plan's copy left the copy's .git with tracked files gone around it, and clean had written nothing
+        to the plan. The next `crew run` resumed in that copy: the task's commit (`git add -u`) deleted those
+        files on the crew branch, and the plan was called done."""
+        root = self.repo(files={"README.md": "hi\n", "app.py": "x = 1\n", "src/a.py": "a = 1\n"})
+        self.set_profile(root, setup=[], checks={})
+        self.crew("go", "x", "--workdir", str(root), env={"CREW_CRASH_AT": "before-commit"}, check=False)
+        plan = self.plan_file()
+        wt = Path(json.loads(plan.read_text())["git"]["worktree"])
+        self.assertTrue((wt / ".git").is_dir())  # paused, its copy kept
+        # crew.py is unchanged. Ctrl-C comes once rmtree has removed the files at the top of the copy, which it
+        # does first, and before it reached .git: with setup's node_modules in the copy that moment lasts seconds.
+        cut = """
+            import os, shutil
+            def rmtree(path, *a, **kw):
+                for e in os.scandir(path):
+                    if not e.is_dir(follow_symlinks=False):
+                        os.unlink(e.path)
+                raise KeyboardInterrupt
+            shutil.rmtree = rmtree
+        """
+        r = subprocess.run(self.argv("clean", "--all", around=cut), env=self.env, capture_output=True, text=True,
+                           timeout=60)
+        self.assertEqual(r.returncode, 130, r.stdout + r.stderr)
+        self.assertTrue((wt / ".git" / "HEAD").exists())
+        self.assertFalse((wt / "README.md").exists())
+        r = self.crew("run", str(plan))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        g = json.loads(plan.read_text())["git"]
+        deleted = sh(root, "git", "diff", "--name-only", "--diff-filter=D", g["base"], g["branch"]).split()
+        self.assertEqual(deleted, [])  # 3.9: ['README.md', 'app.py'], in crew(t1)'s commit
+        self.assertEqual(sorted(sh(root, "git", "ls-tree", "-r", "--name-only", g["branch"]).split()),
+                         ["README.md", "app.py", "src/a.py", "t1.txt", "t2.txt"])
+        self.assertFalse(wt.exists())
+
+    def test_guard_a_copy_that_was_being_removed_reruns_the_task_whose_work_was_in_it(self):
+        """`crew clean --all` journals `git.removing` on a paused plan, whose task may still wait to be committed.
+        Where the next run can't finish the removal first, the rebuilt copy must still run that task again:
+        committed into a fresh copy it had nothing to commit and was called done without a commit."""
+        root = self.repo()
+        self.set_profile(root, setup=[], checks={})
+        self.crew("go", "x", "--workdir", str(root), env={"CREW_CRASH_AT": "before-commit"}, check=False)
+        plan = self.plan_file()
+        r = self.crew("clean", "--all", env={"CREW_CRASH_AT": "removing"}, check=False)
+        self.assertEqual(r.returncode, -9)  # journaled, nothing removed yet
+        self.assertTrue(json.loads(plan.read_text())["git"].get("removing"))
+        stuck = "crew.Run.finish_pending_removal = lambda self: None\n"  # the removal isn't finished first
+        r = subprocess.run(self.patched(stuck, "run", str(plan)), env=self.env, capture_output=True, text=True,
+                           timeout=120)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("[t1] its uncommitted work was lost with crew's copy", r.stdout)
+        data = json.loads(plan.read_text())
+        self.assertTrue(all(t.get("commit") for t in data["tasks"]), data["tasks"])
+        self.assertEqual(sorted(sh(root, "git", "ls-tree", "-r", "--name-only", data["git"]["branch"]).split()),
+                         ["README.md", "t1.txt", "t2.txt"])
+
+    def test_two_checkouts_that_share_a_name_only_when_the_queue_runs_get_a_plan_each(self):
+        """x had no `origin` when its item was queued and the same one as y when `queue run` started, so the two
+        items were in two groups. Each picked its plan file before planning and wrote it after: in the same
+        second both got the same file, one plan overwrote the other, one item was left `running`, and the next
+        `queue run` called it done with no work in its checkout."""
+        remote = self.tmp / "remotes" / "owner" / "app.git"
+        remote.parent.mkdir(parents=True)
+        sh(self.tmp, "git", "clone", "-q", "--bare", str(self.repo("seed")), str(remote))
+        x, y = self.tmp / "x", self.tmp / "y"
+        for c in (x, y):
+            sh(self.tmp, "git", "clone", "-q", str(remote), str(c))
+        sh(x, "git", "remote", "remove", "origin")
+        self.crew("queue", "add", "Update the README", "--direct", "--workdir", str(x), "--workdir", str(y))
+        sh(x, "git", "remote", "add", "origin", str(remote))
+        # The two threads start together, so the items are planned in the same second as a rule; here always.
+        same_second = """
+            import time as _time
+            class _Clock:
+                def __getattr__(self, name):
+                    return getattr(_time, name)
+                def strftime(self, fmt, *a):
+                    return "20260101-120000" if fmt == "%Y%m%d-%H%M%S" and not a else _time.strftime(fmt, *a)
+            crew.time = _Clock()
+        """
+        r = subprocess.run(self.patched(same_second, "queue", "run", "--jobs", "2"), env=self.env,
+                           capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)  # 3.9: 1, one item left `running`
+        items = {i["id"]: i for i in json.loads((self.home / "queue.json").read_text())["items"]}
+        self.assertEqual([items["q1"]["status"], items["q2"]["status"]], ["done", "done"])
+        self.assertNotEqual(items["q1"]["plan"], items["q2"]["plan"])
+        for q, c in (("q1", x), ("q2", y)):
+            self.assertEqual(json.loads(Path(items[q]["plan"]).read_text())["workdir"], str(c.resolve()))
+            self.assertEqual(len(sh(c, "git", "branch", "--list", "crew/*").split()), 1, c.name)
+
+    def test_a_queue_item_whose_plan_runs_in_another_crew_is_paused_not_left_running(self):
+        root = self.repo()
+        self.set_profile(root, setup=[], checks={})
+        self.crew("queue", "add", "do it", "--workdir", str(root))
+        self.crew("queue", "run", env={"CREW_CRASH_AT": "before-commit"}, check=False)  # the item has its plan
+        plan = json.loads((self.home / "queue.json").read_text())["items"][0]["plan"]
+        n = len(self.workers())
+        other = subprocess.Popen([sys.executable, str(HERE / "crew.py"), "--config", str(self.cfg), "run", plan],
+                                 env={**self.env, "FAKE_SLEEP": "30"}, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+        try:
+            for _ in range(300):
+                if len(self.workers()) > n:
+                    break
+                time.sleep(0.05)
+            self.assertGreater(len(self.workers()), n)  # `crew run` holds the plan, its agent at t2
+            r = self.crew("queue", "run")
+            self.assertEqual(r.returncode, 1)
+            self.assertIn("already running", r.stdout)
+            self.assertEqual(self.queue_states(), ["paused"])  # 3.9: `running`, with nothing running it
+        finally:
+            other.kill()
+            other.wait()
+            self.kill_agents()
+
+    def queue_states(self) -> list[str]:
+        return [i["status"] for i in json.loads((self.home / "queue.json").read_text())["items"]]
+
+    def test_crew_takes_no_lock_in_your_repo(self):
+        """`git status` in your checkout, when a plan was made, took .git/index.lock to write back the stat data it
+        had refreshed. A SIGTERM to crew alone while git held it (`kill <pid>`, a supervisor) became SystemExit,
+        which subprocess.run answers with SIGKILL: the lock stayed, and your `git add` and `git commit` failed
+        until you deleted it."""
+        root = self.repo()
+        self.set_profile(root, setup=[], checks={})
+        later = time.time() + 5
+        os.utime(root / "README.md", (later, later))  # saved again unchanged: git status would refresh the index
+        index = root / ".git" / "index"
+        before = (index.stat().st_ino, index.read_bytes())
+        for cmd in ("do", "plan"):
+            r = self.crew(cmd, "x", "--workdir", str(root))
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertEqual((index.stat().st_ino, index.read_bytes()), before, cmd)  # 3.9: rewritten under the lock
+        self.assertFalse((root / ".git" / "index.lock").exists())
+
+    def test_a_planner_that_a_killed_crew_left_running_is_stopped_by_the_next_run(self):
+        """Only a plan run recorded its children. The planner of `go`, `plan` and `queue run` was in no pid file: a
+        crew killed with SIGKILL while it planned left the planner at work (in its own session, its time limit gone
+        with crew), and the runs after it neither knew of it nor stopped it."""
+        root = self.repo()
+        self.set_profile(root, setup=[], checks={})
+        first = subprocess.Popen([sys.executable, str(HERE / "crew.py"), "--config", str(self.cfg), "go", "x",
+                                  "--workdir", str(root)], env={**self.env, "FAKE_PLAN_SLEEP": "60"},
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            for _ in range(300):
+                planners = [c for c in self.calls() if c.get("planner")]
+                if planners:
+                    break
+                time.sleep(0.05)
+            planner = planners[0]["pid"]
+            time.sleep(0.3)
+            first.kill()  # SIGKILL: crew can't stop its planner
+            first.wait()
+            os.kill(planner, 0)  # still at work
+            r = self.crew("go", "y", "--workdir", str(root))
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn("left behind by an earlier crew run", r.stdout)  # 3.9: the planner ran on
+            with self.assertRaises(ProcessLookupError):
+                for _ in range(50):
+                    os.kill(planner, 0)
+                    time.sleep(0.1)
+            self.assertEqual(list((self.home / "locks").glob("crew-*.pids")), [])  # nothing left on record
+        finally:
+            if first.poll() is None:
+                first.kill()
+            self.kill_agents()
+
+    def test_a_call_cut_short_by_sigterm_or_a_hang_up_is_logged(self):
+        """call() logged an interrupted call only for Ctrl-C: SIGTERM and a hang-up (closing the terminal) reach it
+        as SystemExit, and the usage the call had burned was never counted in the split."""
+        import signal
+        root = self.repo()
+        self.set_profile(root, setup=[], checks={})
+        usage = self.home / "usage.jsonl"
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            with self.subTest(sig=sig.name):
+                n, logged = len(self.workers()), len(usage.read_text().splitlines()) if usage.exists() else 0
+                run = subprocess.Popen([sys.executable, str(HERE / "crew.py"), "--config", str(self.cfg), "do",
+                                        f"goal {sig.name}", "--workdir", str(root)], env={**self.env, "FAKE_SLEEP": "30"},
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                try:
+                    for _ in range(300):
+                        if len(self.workers()) > n:
+                            break
+                        time.sleep(0.05)
+                    time.sleep(0.5)
+                    run.send_signal(sig)
+                    run.wait(timeout=60)
+                finally:
+                    if run.poll() is None:
+                        run.kill()
+                    self.kill_agents()
+                self.assertEqual(run.returncode, 128 + sig)
+                rows = [json.loads(x) for x in usage.read_text().splitlines()[logged:]] if usage.exists() else []
+                self.assertEqual([(e["task"], e.get("interrupted")) for e in rows], [("t1", True)])  # 3.9: []
+
+
+class TestLookupAndInputsAfterThreeNine(CrewTest):
+    """What the review of 3.9 confirmed about whose plans and profile a checkout gets and what crew reads from
+    its own files. Each test fails on 3.9."""
+
+    workers = TestThreeSeven.workers
+    plan_file = TestThreeSeven.plan_file
+    paused = TestThreeSeven.paused
+    planners = TestThreeThree.planners
+    profile_file = TestLookupOwnershipInputs.profile_file
+    edit_profile = TestLookupOwnershipInputs.edit_profile
+    effective = TestLookupOwnershipInputs.effective
+    branches = TestLookupOwnershipInputs.branches
+    crew_in = TestLookupOwnershipInputs.crew_in
+    patched = TestThreeEight.patched
+
+    def replaced(self, root: Path, origin: str) -> Path:
+        """The folder goes, and an unrelated repository with that `origin` takes its place."""
+        shutil.rmtree(root)
+        new = self.repo(root.name, files={"new.txt": "an unrelated project\n"})
+        sh(new, "git", "remote", "add", "origin", origin)
+        return new
+
+    # ---------------------------------------------------------------- whose plans, whose profile
+
+    def test_a_project_without_a_remote_passes_nothing_to_the_one_with_a_remote_that_replaced_it(self):
+        """Its profile and plans are under the path's name. 3.9 moved them to the new repository's name the
+        first time crew ran there (`_migrate_key` asked nothing of the repository), and took them for its own."""
+        ran = self.tmp / "setup-ran.txt"
+        old = self.repo("site", files={"old.txt": "the first project\n"})
+        self.crew("init", "--workdir", str(old))
+        self.edit_profile(old, setup=[{"run": f"echo ran >> {ran}"}], checks={"first": "test -f old.txt"})
+        plan = self.paused(old)  # t1 done, t2 pending
+        self.assertEqual(ran.read_text(), "ran\n")
+        n0 = len(self.workers())
+        new = self.replaced(old, "git@github.com:acme/second.git")
+        r = self.crew("run", "--workdir", str(new), check=False)
+        # 3.9: exit 0, "moved crew's profile and plans", t2 run, the first project's history on a branch here
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("no plans for", r.stdout)
+        self.assertIn("is not used for it", r.stdout)
+        self.assertNotIn("moved crew's", r.stdout)
+        self.assertEqual(len(self.workers()), n0)
+        self.assertEqual(self.branches(new), ["main"])
+        self.assertEqual(sh(new, "git", "rev-list", "--all", "--count").strip(), "1")
+        self.assertTrue(plan.exists())  # left where it was, and still listed under its own name
+        self.assertIn(str(plan), self.crew("plans", "--all").stdout)
+        self.assertEqual(self.effective(new)["project"]["checks"], {})
+
+        # A plan that never ran, and a new project's first command: 3.9 ran the first project's setup in its copy.
+        ran.unlink()
+        old = self.repo("shop", files={"old.txt": "the first project\n"})
+        self.crew("init", "--workdir", str(old))
+        self.edit_profile(old, setup=[{"run": f"echo ran >> {ran}"}])
+        self.crew("plan", "x", "--workdir", str(old))
+        new = self.replaced(old, "git@github.com:acme/other.git")
+        r = self.crew("do", "second goal", "--workdir", str(new))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("is not used for it", r.stdout)
+        self.assertFalse(ran.exists())
+
+        # The same repository getting a remote still takes its profile and plans along.
+        mine = self.repo("app")
+        self.crew("init", "--workdir", str(mine))
+        self.edit_profile(mine, notes=["mine"])
+        self.crew("plan", "x", "--workdir", str(mine))
+        sh(mine, "git", "remote", "add", "origin", "git@github.com:acme/app.git")
+        self.assertIn("plans/acme__app/", self.crew("run", "--workdir", str(mine), "--dry-run").stdout)
+        self.assertEqual(self.effective(mine)["project"]["notes"], ["mine"])
+
+    def test_a_queue_item_is_not_continued_in_another_repository_that_took_its_folder(self):
+        old = self.repo("site", files={"old.txt": "the first project\n"})
+        sh(old, "git", "remote", "add", "origin", "git@github.com:acme/first.git")
+        self.crew("queue", "add", "first goal", "--workdir", str(old))
+        r = self.crew("queue", "run", env={"CREW_CRASH_AT": "before-commit"}, check=False)
+        self.assertEqual(r.returncode, -9, r.stdout + r.stderr)
+        n0 = len(self.workers())
+        new = self.replaced(old, "git@github.com:acme/second.git")
+        r = self.crew("queue", "run")
+        # 3.9: exit 0 and q1 done: t2 ran in the first project's copy and its branch, the first project's
+        # whole history, was delivered into the repository that is in the folder now
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertEqual(len(self.workers()), n0)
+        self.assertEqual(self.branches(new), ["main"])
+        item = json.loads((self.home / "queue.json").read_text())["items"][0]
+        self.assertEqual(item["status"], "error")
+        self.assertIn("a different project is in", item["result"])
+
+    def test_origin_put_back_after_a_change_keeps_the_profile_edited_in_between(self):
+        """The remote-to-remote form of the 3.7 review's removed-and-added-back finding."""
+        root = self.repo()
+        sh(root, "git", "remote", "add", "origin", "https://github.com/me/proj.git")
+        self.crew("init", "--workdir", str(root))
+        self.edit_profile(root, notes=["edit 1"])
+        sh(root, "git", "remote", "set-url", "origin", "https://github.com/me/proj-renamed.git")
+        self.assertEqual(self.effective(root)["project"]["notes"], ["edit 1"])  # copied to the new name
+        self.edit_profile(root, notes=["edit 2"])  # the profile in effect now, edited under that name
+        sh(root, "git", "remote", "set-url", "origin", "https://github.com/me/proj.git")
+        r = self.crew("config", "--workdir", str(root))
+        self.assertIn("was known to crew as me/proj-renamed", r.stdout)  # 3.9 says nothing ...
+        shown = self.effective(root)["project"]
+        self.assertEqual((shown["name"], shown["notes"]), ("me/proj", ["edit 2"]))  # ... and goes back to edit 1
+        # Back and forth with nothing edited in between changes nothing and says nothing.
+        sh(root, "git", "remote", "set-url", "origin", "https://github.com/me/proj-renamed.git")
+        r = self.crew("config", "--workdir", str(root))
+        self.assertNotIn("was known to crew", r.stdout)
+        self.assertEqual(self.effective(root)["project"]["notes"], ["edit 2"])
+
+    def test_init_force_keeps_the_other_checkouts_of_a_shared_profile_on_record(self):
+        a = self.repo("a")
+        sh(a, "git", "remote", "add", "origin", "https://github.com/me/app.git")
+        b = self.tmp / "b"
+        sh(self.tmp, "git", "clone", "-q", str(a), str(b))
+        sh(b, "git", "remote", "set-url", "origin", "https://github.com/me/app.git")
+        self.crew("init", "--workdir", str(a))
+        path = self.profile_file(a)
+        prof = json.loads(path.read_text())
+        prof["overrides"] = {"verify": {"fix_rounds": 3}}
+        path.write_text(json.dumps(prof))
+        self.crew("config", "--workdir", str(b))  # b is on record as a checkout that uses it
+        for here in (a, b):  # in either one; b last, so that the profile is now b's and a is one of the others
+            self.crew("init", "--force", "--workdir", str(here))  # "rebuilds the profile and keeps your overrides"
+            self.assertEqual(self.effective(here)["config"]["verify"]["fix_rounds"], 3)
+        sh(a, "git", "remote", "set-url", "origin", "https://github.com/me/renamed.git")
+        r = self.crew("config", "--workdir", str(a))
+        self.assertIn("was known to crew as me/app", r.stdout)  # 3.9: no word, and a fresh profile
+        self.assertEqual(self.effective(a)["config"]["verify"]["fix_rounds"], 3)  # 3.9: 1
+
+    # ---------------------------------------------------------------- stopping
+
+    def test_a_queue_run_that_loses_its_reader_as_it_finds_a_moved_plan_keeps_the_items_plan(self):
+        """_where_plan_is said where the plan went inside a `try` that caught OSError, and OutputLost is one: the
+        lost output was swallowed, the item was pointed at a file that doesn't exist, and the next `queue run`
+        planned the goal again beside the paused plan."""
+        root = self.repo()
+        self.crew("queue", "add", "the goal", "--workdir", str(root))
+        r = self.crew("queue", "run", env={"CREW_CRASH_AT": "before-commit"}, check=False)
+        self.assertEqual(r.returncode, -9, r.stdout + r.stderr)
+        sh(root, "git", "remote", "add", "origin", "git@github.com:me/proj.git")
+        self.crew("config", "--workdir", str(root))  # the plan moves to the remote's name
+        sh(root, "git", "remote", "set-url", "origin", "git@github.com:org/proj.git")
+        self.crew("config", "--workdir", str(root))
+        item = json.loads((self.home / "queue.json").read_text())["items"][0]
+        # crew.py is unchanged: its reader leaves just as it says where the plan went.
+        r = subprocess.run(self.patched("""
+            real = crew.log
+            def log(msg):
+                if msg.startswith("note: ") and " is now " in msg:
+                    r, w = os.pipe()
+                    os.close(r)
+                    os.dup2(w, 1)
+                real(msg)
+            crew.log = log
+        """, "queue", "run"), capture_output=True, text=True, env=self.env, timeout=120)
+        self.assertEqual(r.returncode, 141, r.stdout + r.stderr)
+        after = json.loads((self.home / "queue.json").read_text())["items"][0]
+        self.assertEqual((after["status"], after["plan"]), ("paused", item["plan"]))  # 3.9: a path to no file
+        r = self.crew("queue", "run")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(len(self.planners()), 1)  # 3.9: 2, and t1 done a second time
+        self.assertEqual(len(self.workers()), 2)
+        self.assertEqual(len(list((self.home / "plans").glob("*/*.json"))), 1)
+
+    # ---------------------------------------------------------------- what crew reads
+
+    def test_a_timeout_of_no_time_at_all_is_an_error_not_a_done(self):
+        root = self.repo()
+        self.set_profile(root, checks={"nobroken": "test ! -f broken"})
+        self.write_cfg({"verify": {"fix_rounds": 0}})
+        r = self.crew("do", "x", "--workdir", str(root), env={"FAKE_BREAK": "t1"})
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)  # the agent broke the check: needs review
+        for t in (0, -1):
+            self.write_cfg({"verify": {"fix_rounds": 0, "timeout_sec": t}})
+            r = self.crew("do", "x", "--workdir", str(root), env={"FAKE_BREAK": "t1"}, check=False)
+            # 3.9: exit 0 and done. Killed at once before the work and after it, the check counted as one
+            # that already failed, so the check the agent broke was no regression.
+            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+            self.assertIn("verify.timeout_sec must be a positive number", r.stdout)
+        for where in ({"setup": {"timeout_sec": 0}}, {"providers": {"codex": {"timeout_sec": -5}}}):
+            self.write_cfg(where)
+            r = self.crew("usage", check=False)
+            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+            self.assertIn("timeout_sec must be a positive number", r.stdout)
+
+    def test_a_queue_item_with_a_relative_plan_path_is_not_run_where_crew_was_started(self):
+        root = self.repo()
+        self.crew("queue", "add", "the goal", "--workdir", str(root))
+        q = self.home / "queue.json"
+        data = json.loads(q.read_text())
+        data["items"][0]["plan"] = "notes/plan.json"  # edited by hand
+        q.write_text(json.dumps(data))
+        r = self.crew_in(root, "queue", "run")  # started in the user's checkout
+        self.assertNotIn("Traceback", r.stdout + r.stderr)
+        self.assertIn("ignoring 1 malformed item", r.stdout)
+        self.assertEqual(sh(root, "git", "status", "--porcelain", "--untracked-files=all"), "")  # 3.9: notes/plan.json
+        self.assertEqual(self.workers(), [])
+
+    @unittest.skipUnless(hasattr(sys, "set_int_max_str_digits"), "this Python reads integers of any length")
+    def test_a_number_too_long_to_read_names_the_file_it_is_in(self):
+        big = "1" * 5000
+        root = self.repo()
+        self.crew("init", "--workdir", str(root))
+        path = self.profile_file(root)
+        prof = json.loads(path.read_text())
+        prof["overrides"] = {"verify": {"fix_rounds": 7}}
+        path.write_text(json.dumps(prof).replace('"fix_rounds": 7', '"fix_rounds": ' + big))
+        r = self.crew("config", "--workdir", str(root), check=False)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn(f"error: {path}: invalid JSON", r.stdout)  # 3.9: "Exceeds the limit (4300 digits) ...", no file
+        self.cfg.write_text('{"split": {"min_runs": ' + big + "}}")
+        r = self.crew("usage", check=False)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn(f"error: {self.cfg}: invalid JSON", r.stdout)
 
 
 if __name__ == "__main__":
